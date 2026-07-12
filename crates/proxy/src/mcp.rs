@@ -266,7 +266,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "pids",
             "List processes",
-            "List Linux or Windows processes with pagination",
+            "List Linux, Windows, or macOS processes with pagination",
             props(&[
                 ("filter", string_prop("Name or command substring")),
                 ("cursor", string_prop("Exclusive PID cursor")),
@@ -281,7 +281,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "process_info",
             "Process information",
-            "Read bounded Linux or Windows process details",
+            "Read bounded Linux, Windows, or macOS process details",
             props(&[("pid", integer_prop(1, None, "Process ID"))]),
             &["pid"],
             (true, false, true),
@@ -641,7 +641,7 @@ mod tests {
         let processes = tools.iter().find(|tool| tool["name"] == "pids").unwrap();
         assert_eq!(
             processes["description"],
-            "List Linux or Windows processes with pagination"
+            "List Linux, Windows, or macOS processes with pagination"
         );
         let process_info = tools
             .iter()

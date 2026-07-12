@@ -36,7 +36,7 @@ proxy 暴露 16 个工具。修改名称、参数、默认值、上限或结果�
 - Windows/macOS 提供通用文件工具、文件传输和 `exec`；Windows 还提供 `kill` 和 `system_info`。
 - macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
-- `pids`、`process_info` 支持 Linux 和 Windows，在 macOS 返回 `unsupported`。
+- `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。
 - Windows `system_info` 返回主机、系统版本、运行时间、内存和系统盘信息；无 Unix load average 和统一温度接口，分别返回零值和空数组。macOS `system_info` 返回主机、内核、运行时间、内存和系统盘信息，并通过 `getloadavg` 提供真实负载；无统一温度接口，温度返回空数组。
 - 不得为不支持的平台伪造空系统信息；应返回结构化错误。
