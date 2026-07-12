@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remote_ops_protocol::{
     BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_MAX_CONTROL_BYTES, DownloadRequest, FrameType,
@@ -23,6 +23,10 @@ pub fn handle_connection(
     timeout: Duration,
     max_transfer_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let peer = stream
+        .peer_addr()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let mut session = Session::accept(stream, BUILTIN_PSK, timeout, DEFAULT_MAX_CONTROL_BYTES)?;
     loop {
         let frame = match session.receive() {
@@ -34,11 +38,20 @@ pub fn handle_connection(
             return Err(format!("expected request, received {:?}", frame.kind).into());
         }
         let request: RemoteRequest = serde_json::from_slice(&frame.payload)?;
+        let started_at = Instant::now();
+        log_operation_started(&peer, frame.request_id, &request.operation);
         match request.operation.as_str() {
             "upload_file" => {
                 let args: UploadRequest = match serde_json::from_value(request.arguments) {
                     Ok(args) => args,
                     Err(error) => {
+                        log_operation_finished(
+                            &peer,
+                            frame.request_id,
+                            &request.operation,
+                            started_at,
+                            Some(&error.to_string()),
+                        );
                         session.send_json(
                             FrameType::Error,
                             frame.request_id,
@@ -53,17 +66,39 @@ pub fn handle_connection(
                 if let Err(error) =
                     receive_upload(&mut session, frame.request_id, args, max_transfer_bytes)
                 {
+                    log_operation_finished(
+                        &peer,
+                        frame.request_id,
+                        &request.operation,
+                        started_at,
+                        Some(&error.to_string()),
+                    );
                     session.send_json(
                         FrameType::Error,
                         frame.request_id,
                         &RemoteError::from(error),
                     )?;
+                } else {
+                    log_operation_finished(
+                        &peer,
+                        frame.request_id,
+                        &request.operation,
+                        started_at,
+                        None,
+                    );
                 }
             }
             "download_file" => {
                 let args: DownloadRequest = match serde_json::from_value(request.arguments) {
                     Ok(args) => args,
                     Err(error) => {
+                        log_operation_finished(
+                            &peer,
+                            frame.request_id,
+                            &request.operation,
+                            started_at,
+                            Some(&error.to_string()),
+                        );
                         session.send_json(
                             FrameType::Error,
                             frame.request_id,
@@ -78,21 +113,78 @@ pub fn handle_connection(
                 if let Err(error) =
                     send_download(&mut session, frame.request_id, args, max_transfer_bytes)
                 {
+                    log_operation_finished(
+                        &peer,
+                        frame.request_id,
+                        &request.operation,
+                        started_at,
+                        Some(&error.to_string()),
+                    );
                     session.send_json(
                         FrameType::Error,
                         frame.request_id,
                         &RemoteError::from(error),
                     )?;
+                } else {
+                    log_operation_finished(
+                        &peer,
+                        frame.request_id,
+                        &request.operation,
+                        started_at,
+                        None,
+                    );
                 }
             }
             _ => {
                 let response = match dispatch(&request.operation, request.arguments) {
-                    Ok(value) => RemoteResponse::success(value),
-                    Err(error) => RemoteResponse::failure(error.into()),
+                    Ok(value) => {
+                        log_operation_finished(
+                            &peer,
+                            frame.request_id,
+                            &request.operation,
+                            started_at,
+                            None,
+                        );
+                        RemoteResponse::success(value)
+                    }
+                    Err(error) => {
+                        log_operation_finished(
+                            &peer,
+                            frame.request_id,
+                            &request.operation,
+                            started_at,
+                            Some(&error.to_string()),
+                        );
+                        RemoteResponse::failure(error.into())
+                    }
                 };
                 session.send_json(FrameType::Response, frame.request_id, &response)?;
             }
         }
+    }
+}
+
+fn log_operation_started(peer: &str, request_id: u64, operation: &str) {
+    eprintln!(
+        "[operation] peer={peer} request_id={request_id} operation={operation} status=started"
+    );
+}
+
+fn log_operation_finished(
+    peer: &str,
+    request_id: u64,
+    operation: &str,
+    started_at: Instant,
+    error: Option<&str>,
+) {
+    let elapsed_ms = started_at.elapsed().as_millis();
+    match error {
+        Some(error) => eprintln!(
+            "[operation] peer={peer} request_id={request_id} operation={operation} status=failed elapsed_ms={elapsed_ms} error={error}"
+        ),
+        None => eprintln!(
+            "[operation] peer={peer} request_id={request_id} operation={operation} status=succeeded elapsed_ms={elapsed_ms}"
+        ),
     }
 }
 
