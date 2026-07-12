@@ -1,0 +1,621 @@
+use serde_json::Value;
+#[cfg(any(target_os = "linux", unix, windows))]
+use serde_json::json;
+
+use crate::error::{AgentError, AgentResult};
+
+#[cfg(target_os = "linux")]
+pub fn pids(filter: Option<&str>, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
+    use std::fs;
+    if limit == 0 || limit > 1024 {
+        return Err(AgentError::invalid("limit must be in range 1..=1024"));
+    }
+    let mut ids: Vec<u32> = fs::read_dir("/proc")
+        .map_err(|err| AgentError::io("list /proc", err))?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
+        .collect();
+    ids.sort_unstable();
+    let after_pid = match cursor {
+        Some(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| AgentError::invalid("cursor must be a positive PID"))?,
+        None => 0,
+    };
+    let mut processes = Vec::new();
+    let mut more = false;
+    for pid in ids.into_iter().filter(|pid| *pid > after_pid) {
+        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if filter.is_some_and(|needle| !name.contains(needle) && !cmdline.contains(needle)) {
+            continue;
+        }
+        if processes.len() == limit {
+            more = true;
+            break;
+        }
+        processes.push(json!({"pid": pid, "name": name, "cmdline": cmdline}));
+    }
+    let next_cursor = if more {
+        processes
+            .last()
+            .and_then(|value| value["pid"].as_u64())
+            .map(|pid| pid.to_string())
+    } else {
+        None
+    };
+    Ok(json!({"processes": processes, "next_cursor": next_cursor, "truncated": more}))
+}
+
+#[cfg(windows)]
+pub fn pids(filter: Option<&str>, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
+    if limit == 0 || limit > 1024 {
+        return Err(AgentError::invalid("limit must be in range 1..=1024"));
+    }
+    let after_pid = parse_cursor(cursor)?;
+    let mut entries = windows_process_entries()?;
+    entries.sort_unstable_by_key(|entry| entry.pid);
+
+    let mut processes = Vec::new();
+    let mut more = false;
+    for entry in entries.into_iter().filter(|entry| entry.pid > after_pid) {
+        let cmdline = windows_process_command_line(entry.pid).unwrap_or_default();
+        if filter.is_some_and(|needle| !entry.name.contains(needle) && !cmdline.contains(needle)) {
+            continue;
+        }
+        if processes.len() == limit {
+            more = true;
+            break;
+        }
+        processes.push(json!({"pid": entry.pid, "name": entry.name, "cmdline": cmdline}));
+    }
+    let next_cursor = if more {
+        processes
+            .last()
+            .and_then(|value| value["pid"].as_u64())
+            .map(|pid| pid.to_string())
+    } else {
+        None
+    };
+    Ok(json!({"processes": processes, "next_cursor": next_cursor, "truncated": more}))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn pids(_filter: Option<&str>, _cursor: Option<&str>, _limit: usize) -> AgentResult<Value> {
+    Err(AgentError::unsupported("pids requires Linux or Windows"))
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_info(pid: i32) -> AgentResult<Value> {
+    use std::fs;
+    if pid <= 0 {
+        return Err(AgentError::invalid("pid must be greater than zero"));
+    }
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|err| AgentError::io(format!("read process {pid}"), err))?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|err| AgentError::io(format!("read process stat {pid}"), err))?;
+    let value = |key: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}:")))
+            .map(str::trim)
+            .unwrap_or("")
+    };
+    let parse_first = |key: &str| {
+        value(key)
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let name = value("Name");
+    if name.is_empty() {
+        return Err(AgentError::command("process status is missing Name"));
+    }
+    let state = value("State");
+    if state.is_empty() {
+        return Err(AgentError::command("process status is missing State"));
+    }
+    let ppid =
+        parse_first("PPid").ok_or_else(|| AgentError::command("process status PPid is invalid"))?;
+    let uid =
+        parse_first("Uid").ok_or_else(|| AgentError::command("process status Uid is invalid"))?;
+    let rss_bytes = parse_first("VmRSS").map(|v| v * 1024);
+    let virtual_memory_bytes = parse_first("VmSize").map(|v| v * 1024);
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .replace('\0', " ")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| AgentError::command("malformed /proc stat"))?;
+    let start_time_ticks = stat[close + 1..]
+        .split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| AgentError::command("process stat is missing start time"))?;
+    let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clock_ticks <= 0 {
+        return Err(AgentError::command("could not read system clock ticks"));
+    }
+    Ok(
+        json!({"pid": pid, "ppid": ppid, "name": name, "state": state, "cmdline": cmdline, "uid": uid, "resident_bytes": rss_bytes, "virtual_bytes": virtual_memory_bytes, "start_time_ticks": start_time_ticks, "start_time_seconds": start_time_ticks as f64 / clock_ticks as f64}),
+    )
+}
+
+#[cfg(windows)]
+pub fn process_info(pid: i32) -> AgentResult<Value> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+
+    if pid <= 0 {
+        return Err(AgentError::invalid("pid must be greater than zero"));
+    }
+    let pid = pid as u32;
+    let entry = windows_process_entries()?
+        .into_iter()
+        .find(|entry| entry.pid == pid)
+        .ok_or_else(|| AgentError::io(format!("read process {pid}"), not_found_error()))?;
+    let process = open_process_for_query(pid)?;
+    let cmdline = query_process_command_line(process.raw()).unwrap_or_default();
+
+    let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
+    memory.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    if unsafe { K32GetProcessMemoryInfo(process.raw(), &mut memory, memory.cb) } == 0 {
+        return Err(AgentError::io(
+            format!("read process memory {pid}"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let virtual_bytes = process_virtual_bytes(process.raw());
+
+    let mut creation: FILETIME = unsafe { zeroed() };
+    let mut exit: FILETIME = unsafe { zeroed() };
+    let mut kernel: FILETIME = unsafe { zeroed() };
+    let mut user: FILETIME = unsafe { zeroed() };
+    if unsafe {
+        GetProcessTimes(
+            process.raw(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(AgentError::io(
+            format!("read process times {pid}"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let creation_ticks = filetime_ticks(creation);
+    let mut now: FILETIME = unsafe { zeroed() };
+    unsafe { GetSystemTimeAsFileTime(&mut now) };
+    let uptime_ticks = unsafe { GetTickCount64() }.saturating_mul(10_000);
+    let boot_ticks = filetime_ticks(now).saturating_sub(uptime_ticks);
+    let start_time_ticks = creation_ticks.saturating_sub(boot_ticks).min(uptime_ticks);
+
+    Ok(json!({
+        "pid": pid,
+        "ppid": entry.ppid,
+        "name": entry.name,
+        "state": Value::Null,
+        "cmdline": cmdline,
+        "uid": Value::Null,
+        "resident_bytes": memory.WorkingSetSize as u64,
+        "virtual_bytes": virtual_bytes,
+        "start_time_ticks": start_time_ticks,
+        "start_time_seconds": start_time_ticks as f64 / 10_000_000.0
+    }))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn process_info(_pid: i32) -> AgentResult<Value> {
+    Err(AgentError::unsupported(
+        "process_info requires Linux or Windows",
+    ))
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsProcessEntry {
+    pid: u32,
+    ppid: u32,
+    name: String,
+}
+
+#[cfg(windows)]
+fn parse_cursor(cursor: Option<&str>) -> AgentResult<u32> {
+    match cursor {
+        Some(value) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| AgentError::invalid("cursor must be a positive PID")),
+        None => Ok(0),
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_entries() -> AgentResult<Vec<WindowsProcessEntry>> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(AgentError::io(
+            "create process snapshot",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let snapshot = OwnedHandle(snapshot);
+    let mut raw: PROCESSENTRY32W = unsafe { zeroed() };
+    raw.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    if unsafe { Process32FirstW(snapshot.raw(), &mut raw) } == 0 {
+        return Err(AgentError::io(
+            "read process snapshot",
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        if raw.th32ProcessID > 0 {
+            let name_len = raw
+                .szExeFile
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(raw.szExeFile.len());
+            entries.push(WindowsProcessEntry {
+                pid: raw.th32ProcessID,
+                ppid: raw.th32ParentProcessID,
+                name: String::from_utf16_lossy(&raw.szExeFile[..name_len]),
+            });
+        }
+        if unsafe { Process32NextW(snapshot.raw(), &mut raw) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(AgentError::io("read process snapshot", error));
+        }
+    }
+    Ok(entries)
+}
+
+#[cfg(windows)]
+fn windows_process_command_line(pid: u32) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let process = OwnedHandle(handle);
+    query_process_command_line(process.raw()).ok()
+}
+
+#[cfg(windows)]
+fn open_process_for_query(pid: u32) -> AgentResult<OwnedHandle> {
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
+        Err(AgentError::io(
+            format!("open process {pid}"),
+            std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(OwnedHandle(handle))
+    }
+}
+
+#[cfg(windows)]
+fn process_virtual_bytes(process: windows_sys::Win32::Foundation::HANDLE) -> u64 {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+
+    let mut address = 0usize;
+    let mut total = 0u64;
+    loop {
+        let mut region: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
+        if unsafe {
+            VirtualQueryEx(
+                process,
+                address as *const c_void,
+                &mut region,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } == 0
+        {
+            break;
+        }
+        if region.State != MEM_FREE {
+            total = total.saturating_add(region.RegionSize as u64);
+        }
+        let Some(next) = (region.BaseAddress as usize).checked_add(region.RegionSize) else {
+            break;
+        };
+        if next <= address {
+            break;
+        }
+        address = next;
+    }
+    total
+}
+
+#[cfg(windows)]
+fn query_process_command_line(
+    process: windows_sys::Win32::Foundation::HANDLE,
+) -> AgentResult<String> {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
+    use windows_sys::Win32::Foundation::UNICODE_STRING;
+
+    const MAX_COMMAND_LINE_BYTES: u32 = 128 * 1024;
+    let mut required = 0u32;
+    unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessCommandLineInformation,
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        )
+    };
+    if required < size_of::<UNICODE_STRING>() as u32 || required > MAX_COMMAND_LINE_BYTES {
+        return Err(AgentError::command(
+            "process command line length is invalid",
+        ));
+    }
+
+    let word_count = (required as usize).div_ceil(size_of::<usize>());
+    let mut buffer = vec![0usize; word_count];
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessCommandLineInformation,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            required,
+            &mut required,
+        )
+    };
+    if status < 0 {
+        return Err(AgentError::command(format!(
+            "NtQueryInformationProcess failed with NTSTATUS 0x{:08x}",
+            status as u32
+        )));
+    }
+
+    let value = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+    let byte_len = value.Length as usize;
+    let start = buffer.as_ptr() as usize;
+    let end = start + buffer.len() * size_of::<usize>();
+    let text_start = value.Buffer as usize;
+    let text_end = text_start
+        .checked_add(byte_len)
+        .ok_or_else(|| AgentError::command("process command line pointer overflow"))?;
+    if !byte_len.is_multiple_of(2) || text_start < start || text_end > end {
+        return Err(AgentError::command(
+            "process command line buffer is invalid",
+        ));
+    }
+    let wide = unsafe { std::slice::from_raw_parts(value.Buffer, byte_len / 2) };
+    Ok(String::from_utf16_lossy(wide))
+}
+
+#[cfg(windows)]
+fn filetime_ticks(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
+}
+
+#[cfg(windows)]
+fn not_found_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32)
+}
+
+#[cfg(windows)]
+struct OwnedHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl OwnedHandle {
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(unix)]
+pub fn kill(pid: i32, signal: i32) -> AgentResult<Value> {
+    if pid <= 0 {
+        return Err(AgentError::invalid("pid must be greater than zero"));
+    }
+    if !(1..=64).contains(&signal) {
+        return Err(AgentError::invalid("signal must be in range 1..=64"));
+    }
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        Ok(json!({"pid": pid, "signal": signal}))
+    } else {
+        Err(AgentError::io(
+            format!("kill process {pid}"),
+            std::io::Error::last_os_error(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+pub fn kill(pid: i32, signal: i32) -> AgentResult<Value> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    if pid <= 0 {
+        return Err(AgentError::invalid("pid must be greater than zero"));
+    }
+    if !matches!(signal, 9 | 15) {
+        return Err(AgentError::invalid("signal must be 9 or 15 on Windows"));
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid as u32) };
+    if handle.is_null() {
+        return Err(AgentError::io(
+            format!("open process {pid} for termination"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let process = OwnedHandle(handle);
+    if unsafe { TerminateProcess(process.raw(), 1) } == 0 {
+        return Err(AgentError::io(
+            format!("terminate process {pid}"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    Ok(json!({"pid": pid, "signal": signal}))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn kill(_pid: i32, _signal: i32) -> AgentResult<Value> {
+    Err(AgentError::unsupported("kill requires Unix or Windows"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::process::Command;
+    use std::thread;
+    use std::time::Duration;
+
+    use super::{kill, pids, process_info};
+
+    #[test]
+    fn windows_pids_lists_and_filters_current_process() {
+        let pid = std::process::id();
+        let result = pids(None, None, 1024).unwrap();
+        let current = result["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|process| process["pid"] == pid)
+            .expect("current process should be listed");
+        let name = current["name"].as_str().unwrap();
+        assert!(!name.is_empty());
+        assert!(!current["cmdline"].as_str().unwrap().is_empty());
+
+        let filtered = pids(Some(name), None, 1024).unwrap();
+        assert!(
+            filtered["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|process| process["pid"] == pid)
+        );
+    }
+
+    #[test]
+    fn windows_pids_validates_and_paginates() {
+        assert_eq!(pids(None, None, 0).unwrap_err().kind, "invalid_params");
+        assert_eq!(
+            pids(None, Some("not-a-pid"), 1).unwrap_err().kind,
+            "invalid_params"
+        );
+
+        let first = pids(None, None, 1).unwrap();
+        if first["truncated"].as_bool() == Some(true) {
+            let cursor = first["next_cursor"].as_str().unwrap();
+            let first_pid = first["processes"][0]["pid"].as_u64().unwrap();
+            let second = pids(None, Some(cursor), 1).unwrap();
+            let second_pid = second["processes"][0]["pid"].as_u64().unwrap();
+            assert!(second_pid > first_pid);
+        }
+    }
+
+    #[test]
+    fn windows_process_info_reports_current_process() {
+        let pid = std::process::id();
+        let result = process_info(pid as i32).unwrap();
+        assert_eq!(result["pid"], pid);
+        assert!(!result["name"].as_str().unwrap().is_empty());
+        assert!(result["state"].is_null());
+        assert!(result["uid"].is_null());
+        assert!(result["resident_bytes"].as_u64().unwrap() > 0);
+        assert!(result["virtual_bytes"].as_u64().unwrap() > 0);
+        assert!(result["start_time_seconds"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn windows_process_info_rejects_invalid_pid() {
+        assert_eq!(process_info(0).unwrap_err().kind, "invalid_params");
+        assert_eq!(process_info(i32::MAX).unwrap_err().kind, "io");
+    }
+
+    #[test]
+    fn windows_kill_rejects_invalid_arguments() {
+        assert_eq!(kill(0, 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(kill(1, 2).unwrap_err().kind, "invalid_params");
+        assert_eq!(kill(i32::MAX, 15).unwrap_err().kind, "io");
+    }
+
+    #[test]
+    fn windows_kill_terminates_process_for_supported_signals() {
+        for (requested_signal, expected_signal) in [(Some(9), 9), (None, 15)] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tools::process::tests::windows_kill_test_child"])
+                .env("REMOTE_OPS_KILL_TEST_CHILD", "1")
+                .spawn()
+                .unwrap();
+            let pid = child.id() as i32;
+
+            let result = match requested_signal {
+                Some(signal) => kill(pid, signal).unwrap(),
+                None => crate::dispatch("kill", serde_json::json!({"pid": pid})).unwrap(),
+            };
+            assert_eq!(result["pid"], pid);
+            assert_eq!(result["signal"], expected_signal);
+            assert!(!child.wait().unwrap().success());
+        }
+    }
+
+    #[test]
+    fn windows_kill_test_child() {
+        if std::env::var_os("REMOTE_OPS_KILL_TEST_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+}

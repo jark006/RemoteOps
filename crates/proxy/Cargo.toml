@@ -1,0 +1,16 @@
+[package]
+name = "remote-ops-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+remote-ops-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+remote-ops-agent = { path = "../agent" }
+tempfile.workspace = true
