@@ -34,9 +34,9 @@ AI Agent <-- MCP stdio --> remote-ops-proxy
 | `sh_exec` | 支持 | 返回 unsupported | 支持 |
 | `kill` | 支持 | 支持 | 支持 |
 | `pids`、`process_info` | 支持 | 支持 | 返回 unsupported |
-| `system_info` | 支持 | 支持 | 返回 unsupported |
+| `system_info` | 支持 | 支持 | 支持 |
 
-Linux 是首版完整功能目标。Windows 的 `kill` 将 signal 9 和默认值 15 映射为强制终止，不模拟 Unix 信号语义；Windows `exec` 使用 Job Object 约束命令进程树，超时会终止命令及其后代，调用结束后不会保留后台后代进程。Windows 的 `system_info` 提供主机、系统版本、运行时间、内存和系统盘信息；Windows 无 Unix load average 和统一温度接口，对应字段分别返回零值和空数组。
+Linux 是首版完整功能目标。Windows 的 `kill` 将 signal 9 和默认值 15 映射为强制终止，不模拟 Unix 信号语义；Windows `exec` 使用 Job Object 约束命令进程树，超时会终止命令及其后代，调用结束后不会保留后台后代进程。Windows 的 `system_info` 提供主机、系统版本、运行时间、内存和系统盘信息；Windows 无 Unix load average 和统一温度接口，对应字段分别返回零值和空数组。macOS 的 `system_info` 提供主机、内核、运行时间、内存和系统盘信息，并通过 `getloadavg` 返回真实负载；无统一温度接口，温度返回空数组。
 
 ## 构建
 
@@ -125,7 +125,7 @@ proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `t
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
 | `sh_exec` | `command`, `timeout_ms?` | 通过 `/bin/sh -c` 执行，最长 300 秒。 |
 | `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。 |
-| `system_info` | 无 | Linux/Windows 系统、运行时间、内存、系统盘和可用的负载/温度信息。 |
+| `system_info` | 无 | 运行时间、内存、系统盘和可用的负载/温度信息。 |
 | `upload_file` | `local_path`, `remote_path`, `overwrite?` | 从 proxy 所在 PC 上传一个普通文件。 |
 | `download_file` | `remote_path`, `local_path`, `overwrite?` | 下载一个普通文件到 proxy 所在 PC。 |
 | `remote_status` | 无 | 查询当前 `ip`、`port`、`address` 和缓存的 `connected` 状态，不主动连接。 |
