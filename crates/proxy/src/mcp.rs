@@ -308,7 +308,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "sh_exec",
             "Run shell command",
-            "Run a bounded command through /bin/sh",
+            "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows",
             props(&[
                 ("command", string_prop("Shell command")),
                 (
@@ -663,6 +663,11 @@ mod tests {
         assert_eq!(
             kill["inputSchema"]["properties"]["signal"]["description"],
             "Unix signal number; Windows accepts 9 or 15"
+        );
+        let shell = tools.iter().find(|tool| tool["name"] == "sh_exec").unwrap();
+        assert_eq!(
+            shell["description"],
+            "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows"
         );
         let status = tools
             .iter()

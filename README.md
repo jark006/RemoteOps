@@ -31,12 +31,13 @@ AI Agent <-- MCP stdio --> remote-ops-proxy
 | 连接、认证、二进制传输 | 支持 | 支持 | 支持 |
 | 文本、目录、stat、哈希 | 支持 | 支持 | 支持 |
 | `exec` | 支持 | 支持 | 支持 |
-| `sh_exec` | 支持 | 返回 unsupported | 支持 |
+| `sh_exec` | 支持 | 支持⚠️ | 支持 |
 | `kill` | 支持 | 支持 | 支持 |
-| `pids`、`process_info` | 支持 | 支持 | 支持 |
+| `pids` | 支持 | 支持 | 支持 |
+| `process_info` | 支持 | 支持 | 支持 |
 | `system_info` | 支持 | 支持 | 支持 |
 
-Linux 是首版完整功能目标。Windows 的 `kill` 将 signal 9 和默认值 15 映射为强制终止，不模拟 Unix 信号语义；Windows `exec` 使用 Job Object 约束命令进程树，超时会终止命令及其后代，调用结束后不会保留后台后代进程。Windows 的 `system_info` 提供主机、系统版本、运行时间、内存和系统盘信息；Windows 无 Unix load average 和统一温度接口，对应字段分别返回零值和空数组。macOS 的 `system_info` 提供主机、内核、运行时间、内存和系统盘信息，并通过 `getloadavg` 返回真实负载；无统一温度接口，温度返回空数组。
+Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。
 
 ## 构建
 
@@ -51,12 +52,21 @@ target/release/remote-ops-proxy
 target/release/remote-ops-agent
 ```
 
-Linux 可使用 `cargo-zigbuild` 交叉编译：
+可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
 
 ```sh
+# 安装 zigbuild
+winget install zig.zig
+cargo install --locked cargo-zigbuild
+rustup target add armv7-unknown-linux-musleabi
+rustup target add aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl
+rustup target add riscv64gc-unknown-linux-musl
+
 cargo zigbuild -p remote-ops-agent --target armv7-unknown-linux-musleabi --release
 cargo zigbuild -p remote-ops-agent --target aarch64-unknown-linux-musl --release
 cargo zigbuild -p remote-ops-agent --target x86_64-unknown-linux-musl --release
+cargo zigbuild -p remote-ops-agent --target riscv64gc-unknown-linux-musl --release
 ```
 
 ## 启动远端 agent
@@ -123,7 +133,7 @@ proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `t
 | `pids` | `filter?`, `cursor?`, `limit?` | Linux/Windows/macOS 进程分页；不可读取的 Windows/macOS 命令行返回空字符串。 |
 | `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。 |
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
-| `sh_exec` | `command`, `timeout_ms?` | 通过 `/bin/sh -c` 执行，最长 300 秒。 |
+| `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。 |
 | `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。 |
 | `system_info` | 无 | 运行时间、内存、系统盘和可用的负载/温度信息。 |
 | `upload_file` | `local_path`, `remote_path`, `overwrite?` | 从 proxy 所在 PC 上传一个普通文件。 |

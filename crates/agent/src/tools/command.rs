@@ -12,6 +12,9 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 pub const MAX_TIMEOUT_MS: u64 = 300_000;
 pub const OUTPUT_LIMIT: usize = 256 * 1024;
 
+#[cfg(windows)]
+const GIT_BASH_PATH: &str = r"C:\Program Files\Git\bin\bash.exe";
+
 #[cfg(unix)]
 pub fn sh_exec(command: &str, timeout_ms: u64) -> AgentResult<Value> {
     let mut process = Command::new("/bin/sh");
@@ -19,9 +22,36 @@ pub fn sh_exec(command: &str, timeout_ms: u64) -> AgentResult<Value> {
     run(process, timeout_ms)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn sh_exec(command: &str, timeout_ms: u64) -> AgentResult<Value> {
+    match std::fs::metadata(GIT_BASH_PATH) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(AgentError::unsupported(format!(
+                "sh_exec requires Git Bash at {GIT_BASH_PATH}"
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AgentError::unsupported(format!(
+                "sh_exec requires Git Bash at {GIT_BASH_PATH}"
+            )));
+        }
+        Err(error) => return Err(AgentError::io("inspect Git Bash", error)),
+    }
+
+    let mut process = Command::new(GIT_BASH_PATH);
+    process
+        .args(["--noprofile", "--norc", "-c"])
+        .arg(command)
+        .env_remove("BASH_ENV");
+    run(process, timeout_ms)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn sh_exec(_command: &str, _timeout_ms: u64) -> AgentResult<Value> {
-    Err(AgentError::unsupported("sh_exec requires /bin/sh"))
+    Err(AgentError::unsupported(
+        "sh_exec requires /bin/sh or Git Bash on Windows",
+    ))
 }
 
 pub fn exec(
@@ -261,7 +291,7 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        use super::super::exec;
+        use super::super::{GIT_BASH_PATH, exec, sh_exec};
 
         const HELPER_ROLE: &str = "REMOTE_OPS_COMMAND_TEST_ROLE";
         const HELPER_PID_FILE: &str = "REMOTE_OPS_COMMAND_TEST_PID_FILE";
@@ -279,6 +309,29 @@ mod tests {
 
             assert!(result["stdout"].as_str().unwrap().contains("stdout-text"));
             assert!(result["stderr"].as_str().unwrap().contains("stderr-text"));
+            assert_eq!(result["exit_code"], 7);
+            assert_eq!(result["timed_out"], false);
+            assert_eq!(result["stdout_truncated"], false);
+            assert_eq!(result["stderr_truncated"], false);
+        }
+
+        #[test]
+        fn git_bash_executes_shell_command_when_installed() {
+            if !std::path::Path::new(GIT_BASH_PATH).is_file() {
+                let error = sh_exec("exit 0", 10_000).unwrap_err();
+                assert_eq!(error.kind, "unsupported");
+                assert!(error.message.contains(GIT_BASH_PATH));
+                return;
+            }
+
+            let result = sh_exec(
+                "printf 'stdout-中文\n'; printf 'stderr-中文\n' >&2; exit 7",
+                10_000,
+            )
+            .unwrap();
+
+            assert_eq!(result["stdout"], "stdout-中文\n");
+            assert_eq!(result["stderr"], "stderr-中文\n");
             assert_eq!(result["exit_code"], 7);
             assert_eq!(result["timed_out"], false);
             assert_eq!(result["stdout_truncated"], false);

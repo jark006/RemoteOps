@@ -34,7 +34,7 @@ proxy 暴露 16 个工具。修改名称、参数、默认值、上限或结果�
 
 - Linux 提供全部工具。
 - Windows/macOS 提供通用文件工具、文件传输和 `exec`；Windows 还提供 `kill` 和 `system_info`。
-- macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
+- macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell，Git Bash 不存在时返回结构化 unsupported。Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
 - `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。
