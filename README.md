@@ -97,15 +97,26 @@ agent 串行服务一条 proxy 连接。连接断开后会继续等待下一次�
 
 Claude Code、Codex 等 AI Agent 通过 stdio 与 remote-ops-proxy 通信，而 remote-ops-proxy 通过网络与远程 remote-ops-agent 通信。通用 MCP 客户端配置示例：
 
+Claude Code: ~/.claude.json
 ```json
 {
   "mcpServers": {
-    "embedded-board": {
-      "command": "D:\\tools\\remote-ops-proxy.exe",
+    "remote-ops": {
+      "type": "stdio",
+      "command": "remote-ops-proxy.exe",
       "args": []
     }
   }
 }
+```
+
+Codex: ~/.codex/config.toml
+```toml
+[mcp_servers]
+[mcp_servers.remote-ops]
+type = "stdio"
+command = "remote-ops-proxy.exe"
+args = []
 ```
 
 proxy 参数：
