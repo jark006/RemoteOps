@@ -385,7 +385,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "set_remote",
             "Set remote",
-            "Change the remote IPv4 address or port for subsequent calls",
+            "Change the remote IPv4 address, port, or both for subsequent calls; at least one must be provided",
             props(&[
                 (
                     "ip",
@@ -408,15 +408,12 @@ fn tool(
     annotations: (bool, bool, bool),
 ) -> Value {
     let (read_only, destructive, idempotent) = annotations;
-    let mut input_schema = json!({
+    let input_schema = json!({
         "type":"object",
         "properties":properties,
         "required":required,
         "additionalProperties":false
     });
-    if name == "set_remote" {
-        input_schema["anyOf"] = json!([{"required":["ip"]}, {"required":["port"]}]);
-    }
     json!({
         "name": name, "title": title, "description": description,
         "inputSchema": input_schema,
@@ -622,6 +619,11 @@ mod tests {
                 .iter()
                 .all(|tool| tool["inputSchema"]["additionalProperties"] == false)
         );
+        assert!(tools.iter().all(|tool| {
+            ["anyOf", "oneOf", "allOf"]
+                .iter()
+                .all(|keyword| tool["inputSchema"].get(keyword).is_none())
+        }));
         let system = tools
             .iter()
             .find(|tool| tool["name"] == "system_info")
@@ -679,7 +681,13 @@ mod tests {
             .find(|tool| tool["name"] == "set_remote")
             .unwrap();
         assert_eq!(setter["inputSchema"]["properties"]["ip"]["format"], "ipv4");
-        assert_eq!(setter["inputSchema"]["anyOf"].as_array().unwrap().len(), 2);
+        assert_eq!(setter["inputSchema"]["required"], json!([]));
+        assert!(
+            setter["description"]
+                .as_str()
+                .unwrap()
+                .contains("at least one must be provided")
+        );
         assert_eq!(setter["annotations"]["destructiveHint"], true);
     }
 
