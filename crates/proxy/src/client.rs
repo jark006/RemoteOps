@@ -1,13 +1,14 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remote_ops_protocol::{
-    BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_MAX_CONTROL_BYTES, DownloadRequest, FrameType,
-    RemoteError, RemoteRequest, RemoteResponse, Session, TransferEnd, TransferMetadata,
-    UploadRequest,
+    BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_HEALTH_CHECK_AFTER, DEFAULT_HEALTH_CHECK_TIMEOUT,
+    DEFAULT_MAX_CONTROL_BYTES, DEFAULT_TRANSFER_IDLE_TIMEOUT, DownloadRequest, FrameType,
+    INTERNAL_PING_OPERATION, RemoteError, RemoteRequest, RemoteResponse, Session, SessionOptions,
+    TransferEnd, TransferMetadata, UploadRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,8 @@ pub struct RemoteClient {
     max_transfer_bytes: u64,
     session: Option<Session>,
     next_request_id: u64,
+    last_activity: Option<Instant>,
+    health_check_after: Duration,
 }
 
 impl RemoteClient {
@@ -61,6 +64,8 @@ impl RemoteClient {
             max_transfer_bytes,
             session: None,
             next_request_id: 1,
+            last_activity: None,
+            health_check_after: DEFAULT_HEALTH_CHECK_AFTER,
         }
     }
 
@@ -97,13 +102,14 @@ impl RemoteClient {
         if remote != self.remote {
             self.remote = remote;
             self.session = None;
+            self.last_activity = None;
         }
         Ok(self.remote_status())
     }
 
     pub fn call(&mut self, operation: &str, arguments: Value) -> Result<Value, ClientError> {
+        self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
-        self.ensure_connected()?;
         let request = RemoteRequest {
             operation: operation.to_string(),
             arguments,
@@ -115,10 +121,7 @@ impl RemoteClient {
                 .map_err(protocol_error)?;
             receive_remote_response(session, request_id)
         })();
-        if result.is_err() {
-            self.session = None;
-        }
-        result
+        self.finish_operation(result)
     }
 
     pub fn upload(
@@ -153,8 +156,8 @@ impl RemoteClient {
                 format!("file exceeds transfer limit ({})", self.max_transfer_bytes),
             ));
         }
+        self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
-        self.ensure_connected()?;
         let result = (|| {
             let session = self.session.as_mut().expect("connected");
             session
@@ -208,10 +211,7 @@ impl RemoteClient {
                 "destination": remote_path
             }))
         })();
-        if result.is_err() {
-            self.session = None;
-        }
-        result
+        self.finish_operation(result)
     }
 
     pub fn download(
@@ -251,8 +251,8 @@ impl RemoteClient {
                 format!("create temporary file for {local_path}: {error}"),
             )
         })?;
+        self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
-        self.ensure_connected()?;
         let result = (|| {
             let session = self.session.as_mut().expect("connected");
             session
@@ -289,7 +289,9 @@ impl RemoteClient {
             let mut digest = Sha256::new();
             let mut total = 0u64;
             loop {
-                let frame = session.receive().map_err(protocol_error)?;
+                let frame = session
+                    .receive_with_idle_timeout(Some(DEFAULT_TRANSFER_IDLE_TIMEOUT))
+                    .map_err(protocol_error)?;
                 check_request_id(&frame, request_id)?;
                 match frame.kind {
                     FrameType::Chunk => {
@@ -344,25 +346,83 @@ impl RemoteClient {
                 }
             }
         })();
-        if result.is_err() {
+        self.finish_operation(result)
+    }
+
+    fn prepare_connection(&mut self) -> Result<(), ClientError> {
+        self.ensure_connected()?;
+        let needs_health_check = self
+            .last_activity
+            .is_some_and(|last_activity| last_activity.elapsed() >= self.health_check_after);
+        if needs_health_check && self.ping_current_session().is_err() {
             self.session = None;
+            self.last_activity = None;
+            self.ensure_connected()?;
         }
-        result
+        Ok(())
     }
 
     fn ensure_connected(&mut self) -> Result<(), ClientError> {
         if self.session.is_none() {
             self.session = Some(
                 Session::connect(
-                    &self.remote.to_string(),
+                    SocketAddr::V4(self.remote),
                     BUILTIN_PSK,
-                    self.timeout,
+                    SessionOptions::proxy(self.timeout),
                     DEFAULT_MAX_CONTROL_BYTES,
                 )
-                .map_err(protocol_error)?,
+                .map_err(connection_error)?,
             );
+            self.last_activity = Some(Instant::now());
         }
         Ok(())
+    }
+
+    fn ping_current_session(&mut self) -> Result<(), ClientError> {
+        let request_id = self.allocate_request_id()?;
+        let session = self.session.as_mut().expect("connected");
+        session
+            .send_json(
+                FrameType::Request,
+                request_id,
+                &RemoteRequest {
+                    operation: INTERNAL_PING_OPERATION.to_string(),
+                    arguments: Value::Null,
+                },
+            )
+            .map_err(health_check_error)?;
+        let frame = session
+            .receive_with_idle_timeout(Some(DEFAULT_HEALTH_CHECK_TIMEOUT))
+            .map_err(health_check_error)?;
+        check_request_id(&frame, request_id)?;
+        match frame.kind {
+            FrameType::Response => {
+                serde_json::from_slice::<RemoteResponse>(&frame.payload)
+                    .map_err(|error| ClientError::local("protocol", error.to_string()))?;
+            }
+            FrameType::Error => {
+                serde_json::from_slice::<RemoteError>(&frame.payload)
+                    .map_err(|error| ClientError::local("protocol", error.to_string()))?;
+            }
+            _ => {
+                return Err(ClientError::local(
+                    "protocol",
+                    "unexpected health check response frame",
+                ));
+            }
+        }
+        self.last_activity = Some(Instant::now());
+        Ok(())
+    }
+
+    fn finish_operation<T>(&mut self, result: Result<T, ClientError>) -> Result<T, ClientError> {
+        if result.is_ok() {
+            self.last_activity = Some(Instant::now());
+        } else {
+            self.session = None;
+            self.last_activity = None;
+        }
+        result
     }
 
     fn allocate_request_id(&mut self) -> Result<u64, ClientError> {
@@ -442,6 +502,20 @@ fn protocol_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
     ClientError::local(
         "connection_uncertain",
         format!("remote connection failed; request was not replayed: {error}"),
+    )
+}
+
+fn connection_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
+    ClientError::local(
+        "connection_unavailable",
+        format!("could not establish remote connection; request was not sent: {error}"),
+    )
+}
+
+fn health_check_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
+    ClientError::local(
+        "connection_unavailable",
+        format!("health check failed: {error}"),
     )
 }
 
@@ -532,5 +606,94 @@ fn platform_persist_local(temp: NamedTempFile, target: &Path) -> Result<(), Clie
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn accept_session(listener: &TcpListener) -> Session {
+        let (stream, _) = listener.accept().unwrap();
+        Session::accept(
+            stream,
+            BUILTIN_PSK,
+            SessionOptions::agent(),
+            DEFAULT_MAX_CONTROL_BYTES,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_session_is_checked_and_reconnected_before_user_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_session(&listener);
+            let request: RemoteRequest = first.receive_json(FrameType::Request, 1).unwrap();
+            assert_eq!(request.operation, "marker");
+            first
+                .send_json(
+                    FrameType::Response,
+                    1,
+                    &RemoteResponse::success(json!({"connection": 1})),
+                )
+                .unwrap();
+            let ping: RemoteRequest = first.receive_json(FrameType::Request, 2).unwrap();
+            assert_eq!(ping.operation, INTERNAL_PING_OPERATION);
+            drop(first);
+
+            let mut second = accept_session(&listener);
+            let request: RemoteRequest = second.receive_json(FrameType::Request, 3).unwrap();
+            assert_eq!(request.operation, "marker");
+            second
+                .send_json(
+                    FrameType::Response,
+                    3,
+                    &RemoteResponse::success(json!({"connection": 2})),
+                )
+                .unwrap();
+        });
+
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(2), DEFAULT_MAX_TRANSFER_BYTES);
+        assert_eq!(client.call("marker", json!({})).unwrap()["connection"], 1);
+        client.health_check_after = Duration::ZERO;
+        assert_eq!(client.call("marker", json!({})).unwrap()["connection"], 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn user_request_is_not_replayed_after_connection_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut session = accept_session(&listener);
+            let request: RemoteRequest = session.receive_json(FrameType::Request, 1).unwrap();
+            assert_eq!(request.operation, "mutating-operation");
+            drop(session);
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("user request was replayed on a new connection"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                }
+            }
+        });
+
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(2), DEFAULT_MAX_TRANSFER_BYTES);
+        let error = client.call("mutating-operation", json!({})).unwrap_err();
+        assert_eq!(error.kind, "connection_uncertain");
+        assert!(!client.remote_status()["connected"].as_bool().unwrap());
+        server.join().unwrap();
     }
 }

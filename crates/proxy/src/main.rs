@@ -54,7 +54,7 @@ fn parse_args() -> Result<Config, String> {
 }
 
 fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Config, String> {
-    let mut remote = "192.168.43.107:8022".parse().expect("valid default remote");
+    let mut remote = "192.168.43.106:8022".parse().expect("valid default remote");
     let mut timeout_ms = 310_000u64;
     let mut max_transfer_bytes = DEFAULT_MAX_TRANSFER_BYTES;
     let mut args = args.into_iter();
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn remote_defaults_and_can_be_overridden() {
-        assert_eq!(args(&[]).unwrap().remote.to_string(), "192.168.43.107:8022");
+        assert_eq!(args(&[]).unwrap().remote.to_string(), "192.168.43.106:8022");
         assert_eq!(
             args(&["--remote", "127.0.0.1:9000"])
                 .unwrap()

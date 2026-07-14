@@ -18,7 +18,7 @@ AI Agent <-- MCP stdio --> remote-ops-proxy
 - MCP stdio 支持 `initialize`、`ping`、初始化通知、`tools/list` 和 `tools/call`。
 - 保留旧版 12 个工具的名称、参数和结果结构。
 - `upload_file`、`download_file` 直接在 PC 路径和远端路径之间传输任意二进制单文件。
-- proxy 默认使用 `192.168.43.107:8022`，AI Agent 可查询连接状态并在运行时切换远端 IPv4 或端口。
+- proxy 默认使用 `192.168.43.106:8022`，AI Agent 可查询连接状态并在运行时切换远端 IPv4 或端口。
 - 文件按 64 KiB 分块传输，完成后校验总长度和 SHA-256。
 - 上传和下载先写同目录临时文件，校验成功后原子替换；Unix 上保留已有目标文件的 mode 并同步父目录。
 - proxy 与 agent 使用内置固定值 `JARK006_PSK` 建立连接；每个帧都有 HMAC-SHA256 和单调序号保护。
@@ -87,11 +87,10 @@ agent 参数：
 
 ```text
 --listen HOST:PORT           默认 0.0.0.0:8022
---timeout-ms N               socket I/O 超时，默认 30000
 --max-transfer-bytes N       单文件上限，默认 4294967296（4 GiB）
 ```
 
-agent 串行服务一条 proxy 连接。连接断开后会继续等待下一次连接。
+agent 串行服务一条 proxy 连接。认证后的连接不会因为空闲而关闭；连接断开后会继续等待下一次连接。为防止无效连接永久占用唯一服务槽，认证握手限时 10 秒，一个已经开始的帧必须在 30 秒内完成，上传相邻帧最多间隔 60 秒，socket 写入限时 30 秒。agent 和 proxy 都启用 TCP Keepalive，空闲 60 秒后每 10 秒探测一次，失败重试次数采用平台默认值。
 
 ## 配置 MCP proxy
 
@@ -122,12 +121,12 @@ args = []
 proxy 参数：
 
 ```text
---remote IPv4:PORT           可选，默认 192.168.43.107:8022
---timeout-ms N               一次远端操作的 I/O 超时，默认 310000
+--remote IPv4:PORT           可选，默认 192.168.43.106:8022
+--timeout-ms N               等待远端操作响应的 I/O 超时，默认 310000
 --max-transfer-bytes N       单文件上限，默认 4294967296（4 GiB）
 ```
 
-proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `tools/list` 不要求远端在线。断线后的下一次调用会重新连接；已经发出的调用不会自动重放。
+proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `tools/list` 不要求远端在线。TCP 连接和认证握手分别限时 10 秒。缓存连接空闲超过 60 秒后，proxy 会在发送用户请求前执行一次 10 秒超时的内部健康检查；检查失败时先丢弃旧会话并重新连接。健康检查复用现有 Request/Response，不属于 MCP 工具。用户请求一旦开始发送，连接失败只会返回状态不确定错误，绝不会自动重放。
 
 `remote_status` 只报告 proxy 当前是否持有已认证会话，不会主动探测网络；对端静默断开可能要到下一次远端调用时才会发现。`set_remote` 的设置仅在当前 proxy 进程内有效，地址变化时会丢弃旧会话，下一次远端调用再连接新地址。
 

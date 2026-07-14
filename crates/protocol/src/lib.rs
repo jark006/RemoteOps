@@ -1,17 +1,28 @@
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use socket2::{SockRef, TcpKeepalive};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const BUILTIN_PSK: &[u8] = b"JARK006_PSK";
 pub const DEFAULT_MAX_CONTROL_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_HEALTH_CHECK_AFTER: Duration = Duration::from_secs(60);
+pub const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const INTERNAL_PING_OPERATION: &str = "__remote_ops_ping";
 
 const HELLO_MAGIC: &[u8; 4] = b"ROPS";
 const FRAME_HEADER_BYTES: usize = 28;
@@ -161,45 +172,82 @@ pub struct TransferEnd {
     pub sha256: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOptions {
+    pub connect_timeout: Duration,
+    pub handshake_timeout: Duration,
+    pub idle_read_timeout: Option<Duration>,
+    pub frame_timeout: Duration,
+    pub write_timeout: Duration,
+}
+
+impl SessionOptions {
+    pub fn agent() -> Self {
+        Self {
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            idle_read_timeout: None,
+            frame_timeout: DEFAULT_FRAME_TIMEOUT,
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
+        }
+    }
+
+    pub fn proxy(operation_timeout: Duration) -> Self {
+        Self {
+            idle_read_timeout: Some(operation_timeout),
+            ..Self::agent()
+        }
+    }
+}
+
 pub struct Session {
     stream: TcpStream,
     key: [u8; 32],
     send_sequence: u64,
     receive_sequence: u64,
     max_control_bytes: usize,
+    options: SessionOptions,
 }
 
 impl Session {
     pub fn connect(
-        address: &str,
+        address: SocketAddr,
         psk: &[u8],
-        timeout: Duration,
+        options: SessionOptions,
         max_control_bytes: usize,
     ) -> Result<Self, ProtocolError> {
-        let mut stream = TcpStream::connect(address)?;
-        configure_stream(&stream, timeout)?;
+        let mut stream = TcpStream::connect_timeout(&address, options.connect_timeout)?;
+        configure_handshake(&stream, options.handshake_timeout)?;
         let key = client_handshake(&mut stream, psk)?;
-        Ok(Self::new(stream, key, max_control_bytes))
+        configure_established(&stream, options.write_timeout)?;
+        Ok(Self::new(stream, key, max_control_bytes, options))
     }
 
     pub fn accept(
         mut stream: TcpStream,
         psk: &[u8],
-        timeout: Duration,
+        options: SessionOptions,
         max_control_bytes: usize,
     ) -> Result<Self, ProtocolError> {
-        configure_stream(&stream, timeout)?;
+        configure_handshake(&stream, options.handshake_timeout)?;
         let key = server_handshake(&mut stream, psk)?;
-        Ok(Self::new(stream, key, max_control_bytes))
+        configure_established(&stream, options.write_timeout)?;
+        Ok(Self::new(stream, key, max_control_bytes, options))
     }
 
-    fn new(stream: TcpStream, key: [u8; 32], max_control_bytes: usize) -> Self {
+    fn new(
+        stream: TcpStream,
+        key: [u8; 32],
+        max_control_bytes: usize,
+        options: SessionOptions,
+    ) -> Self {
         Self {
             stream,
             key,
             send_sequence: 0,
             receive_sequence: 0,
             max_control_bytes,
+            options,
         }
     }
 
@@ -255,9 +303,12 @@ impl Session {
         let sequence = self.send_sequence;
         let header = make_header(kind, request_id, sequence, payload_len);
         let tag = sign(&self.key, &header, payload);
-        self.stream.write_all(&header)?;
-        self.stream.write_all(&tag)?;
-        self.stream.write_all(payload)?;
+        let deadline = Instant::now() + self.options.write_timeout;
+        write_all_until(&mut self.stream, &header, deadline)?;
+        write_all_until(&mut self.stream, &tag, deadline)?;
+        write_all_until(&mut self.stream, payload, deadline)?;
+        self.stream
+            .set_write_timeout(Some(remaining_until(deadline)?))?;
         self.stream.flush()?;
         self.send_sequence = self
             .send_sequence
@@ -267,8 +318,18 @@ impl Session {
     }
 
     pub fn receive(&mut self) -> Result<Frame, ProtocolError> {
+        self.receive_with_idle_timeout(self.options.idle_read_timeout)
+    }
+
+    pub fn receive_with_idle_timeout(
+        &mut self,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Frame, ProtocolError> {
         let mut header = [0u8; FRAME_HEADER_BYTES];
-        self.stream.read_exact(&mut header)?;
+        self.stream.set_read_timeout(idle_timeout)?;
+        self.stream.read_exact(&mut header[..1])?;
+        let deadline = Instant::now() + self.options.frame_timeout;
+        read_exact_until(&mut self.stream, &mut header[1..], deadline)?;
         if &header[..4] != HELLO_MAGIC || header[4] != PROTOCOL_VERSION || header[6..8] != [0, 0] {
             return Err(ProtocolError::InvalidFrame(
                 "magic or version mismatch".to_string(),
@@ -295,9 +356,9 @@ impl Session {
             ));
         }
         let mut received_tag = [0u8; MAC_BYTES];
-        self.stream.read_exact(&mut received_tag)?;
+        read_exact_until(&mut self.stream, &mut received_tag, deadline)?;
         let mut payload = vec![0u8; payload_len];
-        self.stream.read_exact(&mut payload)?;
+        read_exact_until(&mut self.stream, &mut payload, deadline)?;
         verify(&self.key, &header, &payload, &received_tag)?;
         self.receive_sequence = self
             .receive_sequence
@@ -311,10 +372,66 @@ impl Session {
     }
 }
 
-fn configure_stream(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+fn configure_handshake(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    stream.set_nodelay(true)
+    stream.set_write_timeout(Some(timeout))
+}
+
+fn configure_established(stream: &TcpStream, write_timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(write_timeout))?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(DEFAULT_KEEPALIVE_IDLE)
+        .with_interval(DEFAULT_KEEPALIVE_INTERVAL);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+fn remaining_until(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "frame I/O deadline exceeded"))
+}
+
+fn read_exact_until(
+    stream: &mut TcpStream,
+    mut buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !buffer.is_empty() {
+        stream.set_read_timeout(Some(remaining_until(deadline)?))?;
+        match stream.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed while receiving frame",
+                ));
+            }
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_until(stream: &mut TcpStream, mut buffer: &[u8], deadline: Instant) -> io::Result<()> {
+    while !buffer.is_empty() {
+        stream.set_write_timeout(Some(remaining_until(deadline)?))?;
+        match stream.write(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to make progress while sending frame",
+                ));
+            }
+            Ok(written) => buffer = &buffer[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn make_header(
@@ -464,7 +581,7 @@ mod tests {
             let mut session = Session::accept(
                 stream,
                 b"a sufficiently long psk",
-                Duration::from_secs(2),
+                SessionOptions::agent(),
                 1024,
             )
             .unwrap();
@@ -479,9 +596,9 @@ mod tests {
                 .unwrap();
         });
         let mut client = Session::connect(
-            &address.to_string(),
+            address,
             b"a sufficiently long psk",
-            Duration::from_secs(2),
+            SessionOptions::proxy(Duration::from_secs(2)),
             1024,
         )
         .unwrap();
@@ -537,14 +654,14 @@ mod tests {
             Session::accept(
                 stream,
                 b"server pre-shared key",
-                Duration::from_secs(2),
+                SessionOptions::agent(),
                 1024,
             )
         });
         let client = Session::connect(
-            &address.to_string(),
+            address,
             b"different client key",
-            Duration::from_secs(2),
+            SessionOptions::proxy(Duration::from_secs(2)),
             1024,
         );
         assert!(matches!(client, Err(ProtocolError::Authentication)));
@@ -560,7 +677,7 @@ mod tests {
             let mut session = Session::accept(
                 stream,
                 b"a sufficiently long psk",
-                Duration::from_secs(2),
+                SessionOptions::agent(),
                 1024,
             )
             .unwrap();
@@ -571,9 +688,9 @@ mod tests {
             ));
         });
         let mut client = Session::connect(
-            &address.to_string(),
+            address,
             b"a sufficiently long psk",
-            Duration::from_secs(2),
+            SessionOptions::proxy(Duration::from_secs(2)),
             1024,
         )
         .unwrap();
@@ -596,7 +713,7 @@ mod tests {
             let mut session = Session::accept(
                 stream,
                 b"a sufficiently long psk",
-                Duration::from_secs(2),
+                SessionOptions::agent(),
                 1024,
             )
             .unwrap();
@@ -606,9 +723,9 @@ mod tests {
             ));
         });
         let mut client = Session::connect(
-            &address.to_string(),
+            address,
             b"a sufficiently long psk",
-            Duration::from_secs(2),
+            SessionOptions::proxy(Duration::from_secs(2)),
             1024,
         )
         .unwrap();
@@ -619,5 +736,85 @@ mod tests {
         client.stream.write_all(b"two").unwrap();
         client.stream.flush().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_session_can_idle_past_handshake_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut options = SessionOptions::agent();
+            options.handshake_timeout = Duration::from_millis(50);
+            let mut session =
+                Session::accept(stream, b"a sufficiently long psk", options, 1024).unwrap();
+            let request: RemoteRequest = session.receive_json(FrameType::Request, 1).unwrap();
+            assert_eq!(request.operation, "after-idle");
+        });
+        let mut client = Session::connect(
+            address,
+            b"a sufficiently long psk",
+            SessionOptions::proxy(Duration::from_secs(2)),
+            1024,
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(150));
+        client
+            .send_json(
+                FrameType::Request,
+                1,
+                &RemoteRequest {
+                    operation: "after-idle".into(),
+                    arguments: Value::Null,
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn incomplete_handshake_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut options = SessionOptions::agent();
+            options.handshake_timeout = Duration::from_millis(50);
+            Session::accept(stream, b"a sufficiently long psk", options, 1024)
+        });
+        let _silent_client = TcpStream::connect(address).unwrap();
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(ProtocolError::Io(error))
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn partially_started_frame_has_a_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut options = SessionOptions::agent();
+            options.frame_timeout = Duration::from_millis(50);
+            let mut session =
+                Session::accept(stream, b"a sufficiently long psk", options, 1024).unwrap();
+            session.receive()
+        });
+        let mut client = Session::connect(
+            address,
+            b"a sufficiently long psk",
+            SessionOptions::proxy(Duration::from_secs(2)),
+            1024,
+        )
+        .unwrap();
+        client.stream.write_all(&HELLO_MAGIC[..1]).unwrap();
+        client.stream.flush().unwrap();
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(ProtocolError::Io(error))
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        ));
     }
 }

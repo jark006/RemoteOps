@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use remote_ops_agent::service::handle_connection;
 use remote_ops_protocol::{
-    BUILTIN_PSK, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_MAX_TRANSFER_BYTES, FrameType, RemoteRequest,
-    RemoteResponse, Session,
+    BUILTIN_PSK, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_MAX_TRANSFER_BYTES, FrameType,
+    INTERNAL_PING_OPERATION, PROTOCOL_VERSION, RemoteRequest, RemoteResponse, Session,
+    SessionOptions,
 };
 use remote_ops_proxy::client::RemoteClient;
 use serde_json::{Value, json};
@@ -19,7 +20,7 @@ fn binary_file_round_trip_crosses_multiple_chunks() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, Duration::from_secs(5), DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
     });
 
     let local = tempfile::tempdir().unwrap();
@@ -115,7 +116,7 @@ fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
     assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 16);
     assert_eq!(
         lines[2]["result"]["structuredContent"]["address"],
-        "192.168.43.107:8022"
+        "192.168.43.106:8022"
     );
     assert_eq!(lines[2]["result"]["structuredContent"]["connected"], false);
     assert!(output.stderr.is_empty());
@@ -127,7 +128,7 @@ fn upload_rejection_before_chunks_remains_structured() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, Duration::from_secs(5), 64).unwrap();
+        handle_connection(stream, 64).unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("too-large.bin");
@@ -154,13 +155,49 @@ fn upload_rejection_before_chunks_remains_structured() {
 }
 
 #[test]
+fn agent_answers_internal_health_checks_without_exposing_an_mcp_tool() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+    });
+    {
+        let mut session = Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(2)),
+            DEFAULT_MAX_CONTROL_BYTES,
+        )
+        .unwrap();
+        session
+            .send_json(
+                FrameType::Request,
+                1,
+                &RemoteRequest {
+                    operation: INTERNAL_PING_OPERATION.to_string(),
+                    arguments: Value::Null,
+                },
+            )
+            .unwrap();
+        let response: RemoteResponse = session.receive_json(FrameType::Response, 1).unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            response.result.unwrap()["protocol_version"],
+            PROTOCOL_VERSION
+        );
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn remote_can_switch_between_authenticated_endpoints() {
     fn responder(listener: TcpListener, expected_request_id: u64, marker: &'static str) {
         let (stream, _) = listener.accept().unwrap();
         let mut session = Session::accept(
             stream,
             BUILTIN_PSK,
-            Duration::from_secs(5),
+            SessionOptions::agent(),
             DEFAULT_MAX_CONTROL_BYTES,
         )
         .unwrap();
