@@ -102,7 +102,7 @@ Claude Code: ~/.claude.json
   "mcpServers": {
     "remote-ops": {
       "type": "stdio",
-      "command": "remote-ops-proxy.exe",
+      "command": "remote-ops-proxy",
       "args": []
     }
   }
@@ -114,7 +114,7 @@ Codex: ~/.codex/config.toml
 [mcp_servers]
 [mcp_servers.remote-ops]
 type = "stdio"
-command = "remote-ops-proxy.exe"
+command = "remote-ops-proxy"
 args = []
 ```
 
