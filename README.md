@@ -63,10 +63,10 @@ rustup target add aarch64-unknown-linux-musl
 rustup target add x86_64-unknown-linux-musl
 rustup target add riscv64gc-unknown-linux-musl
 
-cargo zigbuild -p remote-ops-agent --target armv7-unknown-linux-musleabi --release
-cargo zigbuild -p remote-ops-agent --target aarch64-unknown-linux-musl --release
-cargo zigbuild -p remote-ops-agent --target x86_64-unknown-linux-musl --release
-cargo zigbuild -p remote-ops-agent --target riscv64gc-unknown-linux-musl --release
+cargo zigbuild --target armv7-unknown-linux-musleabi --release
+cargo zigbuild --target aarch64-unknown-linux-musl --release
+cargo zigbuild --target x86_64-unknown-linux-musl --release
+cargo zigbuild --target riscv64gc-unknown-linux-musl --release
 ```
 
 ## 启动远端 agent
@@ -169,8 +169,8 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-unknown-linux-musl
-cargo check -p remote-ops-agent --target aarch64-unknown-linux-musl
-cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabi
+cargo check --target aarch64-unknown-linux-musl
+cargo check --target armv7-unknown-linux-musleabi
 ```
 
 测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。
