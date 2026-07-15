@@ -904,13 +904,255 @@ pub fn kill(_pid: i32, _signal: i32) -> AgentResult<Value> {
     Err(AgentError::unsupported("kill requires Unix or Windows"))
 }
 
+#[cfg(target_os = "linux")]
+const LINUX_PKILL_MAX_NAME_BYTES: usize = 15;
+#[cfg(target_os = "macos")]
+const MACOS_PKILL_MAX_NAME_BYTES: usize = 31;
+#[cfg(windows)]
+const WINDOWS_PKILL_MAX_NAME_UNITS: usize = 260;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const PKILL_MAX_TARGETS: usize = 1024;
+
+fn validate_pkill_args(name: &str, signal: i32) -> AgentResult<()> {
+    if name.is_empty() {
+        return Err(AgentError::invalid("name must not be empty"));
+    }
+    if name.contains('\0') {
+        return Err(AgentError::invalid("name must not contain NUL"));
+    }
+    #[cfg(target_os = "linux")]
+    if name.len() > LINUX_PKILL_MAX_NAME_BYTES {
+        return Err(AgentError::invalid(format!(
+            "name must not exceed {LINUX_PKILL_MAX_NAME_BYTES} bytes on Linux"
+        )));
+    }
+    #[cfg(target_os = "macos")]
+    if name.len() > MACOS_PKILL_MAX_NAME_BYTES {
+        return Err(AgentError::invalid(format!(
+            "name must not exceed {MACOS_PKILL_MAX_NAME_BYTES} bytes on macOS"
+        )));
+    }
+    #[cfg(windows)]
+    if name.encode_utf16().count() > WINDOWS_PKILL_MAX_NAME_UNITS {
+        return Err(AgentError::invalid(format!(
+            "name must not exceed {WINDOWS_PKILL_MAX_NAME_UNITS} UTF-16 code units on Windows"
+        )));
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    if name.chars().count() > 260 {
+        return Err(AgentError::invalid("name must not exceed 260 characters"));
+    }
+    #[cfg(windows)]
+    if !matches!(signal, 9 | 15) {
+        return Err(AgentError::invalid("signal must be 9 or 15 on Windows"));
+    }
+    #[cfg(not(windows))]
+    if !(1..=64).contains(&signal) {
+        return Err(AgentError::invalid("signal must be in range 1..=64"));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn push_pkill_match(matched_pids: &mut Vec<i32>, pid: i32) -> AgentResult<()> {
+    if matched_pids.len() == PKILL_MAX_TARGETS {
+        return Err(AgentError::command(format!(
+            "pkill matched more than {PKILL_MAX_TARGETS} processes"
+        )));
+    }
+    matched_pids.push(pid);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn signal_pkill_matches(name: &str, signal: i32, mut matched_pids: Vec<i32>) -> AgentResult<Value> {
+    matched_pids.sort_unstable();
+    matched_pids.dedup();
+
+    let mut signaled_pids = Vec::with_capacity(matched_pids.len());
+    let mut failed_pids = Vec::new();
+    for pid in matched_pids {
+        if kill(pid, signal).is_ok() {
+            signaled_pids.push(pid);
+        } else {
+            failed_pids.push(pid);
+        }
+    }
+    let matched = signaled_pids.len() + failed_pids.len();
+    Ok(json!({
+        "name": name,
+        "signal": signal,
+        "matched": matched,
+        "signaled_pids": signaled_pids,
+        "failed_pids": failed_pids,
+    }))
+}
+
+#[cfg(target_os = "linux")]
+pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
+    use std::fs;
+
+    validate_pkill_args(name, signal)?;
+    let own_pid = std::process::id() as i32;
+    let mut matched_pids = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| AgentError::io("list /proc", error))? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|pid| *pid > 0 && *pid != own_pid)
+        else {
+            continue;
+        };
+        let Ok(mut process_name) = fs::read(entry.path().join("comm")) else {
+            continue;
+        };
+        if process_name.last() == Some(&b'\n') {
+            process_name.pop();
+        }
+        if process_name != name.as_bytes() {
+            continue;
+        }
+        push_pkill_match(&mut matched_pids, pid)?;
+    }
+    signal_pkill_matches(name, signal, matched_pids)
+}
+
+#[cfg(windows)]
+pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
+    validate_pkill_args(name, signal)?;
+    let own_pid = std::process::id();
+    let mut matched_pids = Vec::new();
+    for entry in windows_process_entries()? {
+        if entry.pid == own_pid || entry.name != name {
+            continue;
+        }
+        let pid = i32::try_from(entry.pid)
+            .map_err(|_| AgentError::command(format!("process PID {} is too large", entry.pid)))?;
+        push_pkill_match(&mut matched_pids, pid)?;
+    }
+    signal_pkill_matches(name, signal, matched_pids)
+}
+
+#[cfg(target_os = "macos")]
+pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
+    validate_pkill_args(name, signal)?;
+    let own_pid = std::process::id();
+    let mut matched_pids = Vec::new();
+    for pid in macos_process_ids()?
+        .into_iter()
+        .filter(|pid| *pid != own_pid)
+    {
+        let pid = i32::try_from(pid)
+            .map_err(|_| AgentError::command(format!("process PID {pid} is too large")))?;
+        let Ok(info) = macos_bsd_info(pid) else {
+            continue;
+        };
+        if macos_process_name(&info) == name {
+            push_pkill_match(&mut matched_pids, pid)?;
+        }
+    }
+    signal_pkill_matches(name, signal, matched_pids)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
+    validate_pkill_args(name, signal)?;
+    Err(AgentError::unsupported(
+        "pkill requires Linux, macOS, or Windows",
+    ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_pkill_tests {
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::pkill;
+
+    #[test]
+    fn linux_pkill_validates_arguments_and_reports_no_matches() {
+        assert_eq!(pkill("", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(
+            pkill("1234567890123456", 15).unwrap_err().kind,
+            "invalid_params"
+        );
+        assert_eq!(pkill("has\0nul", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(pkill("valid", 0).unwrap_err().kind, "invalid_params");
+        assert_eq!(pkill("valid", 65).unwrap_err().kind, "invalid_params");
+
+        let result = pkill("rops-no-match", 15).unwrap();
+        assert_eq!(result["matched"], 0);
+        assert_eq!(result["signaled_pids"], serde_json::json!([]));
+        assert_eq!(result["failed_pids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn linux_pkill_exactly_matches_comm_and_defaults_to_sigterm() {
+        let name = format!("rops-pk-{}", std::process::id());
+        let directory = tempfile::tempdir().unwrap();
+        let child_executable = directory.path().join(&name);
+        std::fs::copy(std::env::current_exe().unwrap(), &child_executable).unwrap();
+        let mut child = Command::new(child_executable)
+            .args([
+                "--exact",
+                "tools::process::linux_pkill_tests::linux_pkill_test_child",
+            ])
+            .env("REMOTE_OPS_PKILL_TEST_NAME", &name)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let comm_path = format!("/proc/{pid}/comm");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&comm_path)
+            .ok()
+            .is_none_or(|comm| comm.trim_end() != name)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "test child did not expose the expected comm name"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = crate::dispatch("pkill", serde_json::json!({"name": name})).unwrap();
+        assert_eq!(result["signal"], 15);
+        assert_eq!(result["matched"], 1);
+        assert_eq!(result["signaled_pids"], serde_json::json!([pid]));
+        assert_eq!(result["failed_pids"], serde_json::json!([]));
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn linux_pkill_test_child() {
+        if std::env::var_os("REMOTE_OPS_PKILL_TEST_NAME").is_some() {
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "macos", windows))))]
+mod unsupported_pkill_tests {
+    use super::pkill;
+
+    #[test]
+    fn pkill_is_unsupported_on_other_platforms_after_argument_validation() {
+        assert_eq!(pkill("", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(pkill("remote-ops", 15).unwrap_err().kind, "unsupported");
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::process::Command;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{kill, pids, process_info};
+    use super::{kill, pids, pkill, process_info};
 
     #[test]
     fn windows_pids_lists_and_filters_current_process() {
@@ -1001,8 +1243,63 @@ mod tests {
     }
 
     #[test]
+    fn windows_pkill_validates_arguments_and_reports_no_matches() {
+        assert_eq!(pkill("", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(pkill("has\0nul", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(
+            pkill(&"x".repeat(261), 15).unwrap_err().kind,
+            "invalid_params"
+        );
+        assert_eq!(pkill("valid.exe", 2).unwrap_err().kind, "invalid_params");
+
+        let result = pkill("rops-no-match.exe", 15).unwrap();
+        assert_eq!(result["matched"], 0);
+        assert_eq!(result["signaled_pids"], serde_json::json!([]));
+        assert_eq!(result["failed_pids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn windows_pkill_exactly_matches_executable_name_and_defaults_to_termination() {
+        let name = format!("rops-pk-{}.exe", std::process::id());
+        let directory = tempfile::tempdir().unwrap();
+        let child_executable = directory.path().join(&name);
+        std::fs::copy(std::env::current_exe().unwrap(), &child_executable).unwrap();
+        let mut child = Command::new(child_executable)
+            .args(["--exact", "tools::process::tests::windows_pkill_test_child"])
+            .env("REMOTE_OPS_PKILL_TEST_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_info(pid)
+            .ok()
+            .is_none_or(|info| info["name"] != name)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "test child did not expose the expected executable name"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = crate::dispatch("pkill", serde_json::json!({"name": name})).unwrap();
+        assert_eq!(result["signal"], 15);
+        assert_eq!(result["matched"], 1);
+        assert_eq!(result["signaled_pids"], serde_json::json!([pid]));
+        assert_eq!(result["failed_pids"], serde_json::json!([]));
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
     fn windows_kill_test_child() {
         if std::env::var_os("REMOTE_OPS_KILL_TEST_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn windows_pkill_test_child() {
+        if std::env::var_os("REMOTE_OPS_PKILL_TEST_CHILD").is_some() {
             thread::sleep(Duration::from_secs(30));
         }
     }
@@ -1010,7 +1307,11 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod macos_tests {
-    use super::{pids, process_info};
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{pids, pkill, process_info};
 
     #[test]
     fn macos_pids_lists_and_filters_current_process() {
@@ -1071,5 +1372,64 @@ mod macos_tests {
     fn macos_process_info_rejects_invalid_pid() {
         assert_eq!(process_info(0).unwrap_err().kind, "invalid_params");
         assert_eq!(process_info(i32::MAX).unwrap_err().kind, "io");
+    }
+
+    #[test]
+    fn macos_pkill_validates_arguments_and_reports_no_matches() {
+        assert_eq!(pkill("", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(pkill("has\0nul", 15).unwrap_err().kind, "invalid_params");
+        assert_eq!(
+            pkill(&"x".repeat(32), 15).unwrap_err().kind,
+            "invalid_params"
+        );
+        assert_eq!(pkill("valid", 0).unwrap_err().kind, "invalid_params");
+        assert_eq!(pkill("valid", 65).unwrap_err().kind, "invalid_params");
+
+        let result = pkill("rops-no-match", 15).unwrap();
+        assert_eq!(result["matched"], 0);
+        assert_eq!(result["signaled_pids"], serde_json::json!([]));
+        assert_eq!(result["failed_pids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn macos_pkill_exactly_matches_process_name_and_defaults_to_sigterm() {
+        let name = format!("rops-pk-{}", std::process::id());
+        let directory = tempfile::tempdir().unwrap();
+        let child_executable = directory.path().join(&name);
+        std::fs::copy(std::env::current_exe().unwrap(), &child_executable).unwrap();
+        let mut child = Command::new(child_executable)
+            .args([
+                "--exact",
+                "tools::process::macos_tests::macos_pkill_test_child",
+            ])
+            .env("REMOTE_OPS_PKILL_TEST_CHILD", "1")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_info(pid)
+            .ok()
+            .is_none_or(|info| info["name"] != name)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "test child did not expose the expected process name"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = crate::dispatch("pkill", serde_json::json!({"name": name})).unwrap();
+        assert_eq!(result["signal"], 15);
+        assert_eq!(result["matched"], 1);
+        assert_eq!(result["signaled_pids"], serde_json::json!([pid]));
+        assert_eq!(result["failed_pids"], serde_json::json!([]));
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn macos_pkill_test_child() {
+        if std::env::var_os("REMOTE_OPS_PKILL_TEST_CHILD").is_some() {
+            thread::sleep(Duration::from_secs(30));
+        }
     }
 }

@@ -33,6 +33,7 @@ AI Agent <-- MCP stdio --> remote-ops-proxy
 | `exec` | 支持 | 支持 | 支持 |
 | `sh_exec` | 支持 | 支持⚠️ | 支持 |
 | `kill` | 支持 | 支持 | 支持 |
+| `pkill` | 支持 | 支持 | 支持 |
 | `pids` | 支持 | 支持 | 支持 |
 | `process_info` | 支持 | 支持 | 支持 |
 | `system_info` | 支持 | 支持 | 支持 |
@@ -143,6 +144,7 @@ proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `t
 | `pids` | `filter?`, `cursor?`, `limit?` | Linux/Windows/macOS 进程分页；不可读取的 Windows/macOS 命令行返回空字符串。 |
 | `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。 |
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
+| `pkill` | `name`, `signal?` | 按平台进程名完整匹配并排除 agent 自身，默认 signal 15；Linux/macOS 名称分别最多 15/31 字节，Windows 最多 260 个 UTF-16 单元且 signal 仅接受 9/15。匹配超过 1024 个进程时不执行，返回 `matched`、`signaled_pids` 和 `failed_pids`。 |
 | `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。 |
 | `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。 |
 | `system_info` | 无 | 运行时间、内存、系统盘和可用的负载/温度信息。 |

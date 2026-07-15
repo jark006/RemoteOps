@@ -47,6 +47,10 @@ pub fn dispatch(operation: &str, arguments: Value) -> AgentResult<Value> {
             let args: KillArgs = decode(arguments)?;
             tools::process::kill(args.pid, args.signal)
         }
+        "pkill" => {
+            let args: PkillArgs = decode(arguments)?;
+            tools::process::pkill(&args.name, args.signal)
+        }
         "sh_exec" => {
             let args: ShArgs = decode(arguments)?;
             tools::command::sh_exec(&args.command, args.timeout_ms)
@@ -169,6 +173,14 @@ struct PidArgs {
 #[serde(deny_unknown_fields)]
 struct KillArgs {
     pid: i32,
+    #[serde(default = "default_signal")]
+    signal: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PkillArgs {
+    name: String,
     #[serde(default = "default_signal")]
     signal: i32,
 }

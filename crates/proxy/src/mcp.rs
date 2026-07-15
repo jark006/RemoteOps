@@ -83,6 +83,9 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
         "remote_status" => decode_transfer::<EmptyArgs>(&arguments).map(|_| client.remote_status()),
         "set_remote" => decode_transfer::<SetRemoteArgs>(&arguments)
             .and_then(|args| client.set_remote(args.ip, args.port)),
+        "pkill" => decode_transfer::<PkillArgs>(&arguments)
+            .and_then(validate_pkill_args)
+            .and_then(|_| client.call(name, arguments)),
         _ => client.call(name, arguments),
     };
     match result {
@@ -130,6 +133,12 @@ fn default_true() -> bool {
     true
 }
 
+fn default_signal() -> i32 {
+    15
+}
+
+const PKILL_MAX_NAME_CHARS: usize = 260;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UploadArgs {
@@ -159,6 +168,35 @@ struct SetRemoteArgs {
     port: Option<u16>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PkillArgs {
+    name: String,
+    #[serde(default = "default_signal")]
+    signal: i32,
+}
+
+fn validate_pkill_args(args: PkillArgs) -> Result<(), ClientError> {
+    let message = if args.name.is_empty() {
+        Some("name must not be empty")
+    } else if args.name.chars().count() > PKILL_MAX_NAME_CHARS {
+        Some("name must not exceed 260 characters")
+    } else if args.name.contains('\0') {
+        Some("name must not contain NUL")
+    } else if !(1..=64).contains(&args.signal) {
+        Some("signal must be in range 1..=64")
+    } else {
+        None
+    };
+    match message {
+        Some(message) => Err(ClientError {
+            kind: "invalid_params".to_string(),
+            message: message.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
 pub fn tool_names() -> &'static [&'static str] {
     &[
         "read_text",
@@ -170,6 +208,7 @@ pub fn tool_names() -> &'static [&'static str] {
         "pids",
         "process_info",
         "kill",
+        "pkill",
         "sh_exec",
         "exec",
         "system_info",
@@ -303,6 +342,28 @@ pub fn tool_definitions() -> Vec<Value> {
                 ),
             ]),
             &["pid"],
+            (false, true, false),
+        ),
+        tool(
+            "pkill",
+            "Terminate processes by name",
+            "Terminate Linux, Windows, or macOS processes whose platform name exactly matches",
+            props(&[
+                (
+                    "name",
+                    json!({"type":"string","minLength":1,"maxLength":260,"description":"Exact platform process name; Linux allows 15 bytes, macOS 31 bytes, and Windows 260 UTF-16 code units"}),
+                ),
+                (
+                    "signal",
+                    integer_prop_default(
+                        1,
+                        Some(64),
+                        15,
+                        "Unix signal number; Windows accepts 9 or 15",
+                    ),
+                ),
+            ]),
+            &["name"],
             (false, true, false),
         ),
         tool(
@@ -541,6 +602,16 @@ fn output_schema(name: &str) -> Value {
             json!({"pid":{"type":"integer","minimum":1},"signal":{"type":"integer","minimum":1,"maximum":64}}),
             &["pid", "signal"],
         ),
+        "pkill" => strict_output(
+            json!({
+                "name":{"type":"string","maxLength":260},
+                "signal":{"type":"integer","minimum":1,"maximum":64},
+                "matched":{"type":"integer","minimum":0,"maximum":1024},
+                "signaled_pids":{"type":"array","maxItems":1024,"items":{"type":"integer","minimum":1}},
+                "failed_pids":{"type":"array","maxItems":1024,"items":{"type":"integer","minimum":1}}
+            }),
+            &["name", "signal", "matched", "signaled_pids", "failed_pids"],
+        ),
         "sh_exec" | "exec" => strict_output(
             json!({
                 "stdout":{"type":"string"},"stderr":{"type":"string"},"exit_code":{"type":["integer","null"]},
@@ -606,7 +677,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         assert_eq!(
             tools
                 .iter()
@@ -666,6 +737,17 @@ mod tests {
             kill["inputSchema"]["properties"]["signal"]["description"],
             "Unix signal number; Windows accepts 9 or 15"
         );
+        let pkill = tools.iter().find(|tool| tool["name"] == "pkill").unwrap();
+        assert_eq!(
+            pkill["description"],
+            "Terminate Linux, Windows, or macOS processes whose platform name exactly matches"
+        );
+        assert_eq!(pkill["inputSchema"]["properties"]["name"]["maxLength"], 260);
+        assert_eq!(
+            pkill["inputSchema"]["properties"]["signal"]["description"],
+            "Unix signal number; Windows accepts 9 or 15"
+        );
+        assert_eq!(pkill["annotations"]["destructiveHint"], true);
         let shell = tools.iter().find(|tool| tool["name"] == "sh_exec").unwrap();
         assert_eq!(
             shell["description"],
@@ -728,6 +810,31 @@ mod tests {
             let response = call_tool(
                 json!(4),
                 Some(&json!({"name":"set_remote","arguments":arguments})),
+                &mut client,
+            );
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    #[test]
+    fn pkill_arguments_are_validated_before_connecting() {
+        let mut client = RemoteClient::new(
+            "127.0.0.1:1".parse().unwrap(),
+            std::time::Duration::from_millis(10),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        for arguments in [
+            json!({}),
+            json!({"name":""}),
+            json!({"name":"x".repeat(261)}),
+            json!({"name":"has\u{0}nul"}),
+            json!({"name":"valid","signal":0}),
+            json!({"name":"valid","signal":65}),
+            json!({"name":"valid","extra":true}),
+        ] {
+            let response = call_tool(
+                json!(1),
+                Some(&json!({"name":"pkill","arguments":arguments})),
                 &mut client,
             );
             assert_eq!(response["error"]["code"], -32602);

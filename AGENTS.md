@@ -21,9 +21,10 @@
 
 ## 工具契约
 
-proxy 暴露 16 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
+proxy 暴露 17 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
 
 - 兼容工具：`read_text`、`tail_text`、`write_text`、`ls`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
+- 进程工具：`pkill`。
 - 传输工具：`upload_file`、`download_file`。
 - proxy 本地管理工具：`remote_status`、`set_remote`。前者被动查询当前地址和缓存连接状态；后者可单独设置 IPv4 或端口，配置仅在当前进程内生效。
 - `upload_file` 的 `local_path` 和 `download_file` 的 `local_path` 均属于 proxy 所在 PC。
@@ -38,6 +39,7 @@ proxy 暴露 16 个工具。修改名称、参数、默认值、上限或结果�
 - macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell，Git Bash 不存在时返回结构化 unsupported。Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
 - `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
+- `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。
 - Windows `system_info` 返回主机、系统版本、运行时间、内存和系统盘信息；无 Unix load average 和统一温度接口，分别返回零值和空数组。macOS `system_info` 返回主机、内核、运行时间、内存和系统盘信息，并通过 `getloadavg` 提供真实负载；无统一温度接口，温度返回空数组。
 - 不得为不支持的平台伪造空系统信息；应返回结构化错误。
