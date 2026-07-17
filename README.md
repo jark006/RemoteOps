@@ -56,15 +56,17 @@ target/release/remote-ops-agent
 可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
 
 ```sh
-# 安装 zigbuild
+# 安装 zigbuild  Win / Ubuntu
 winget install zig.zig
+sudo snap install zig --classic --beta
+
 cargo install --locked cargo-zigbuild
-rustup target add armv7-unknown-linux-musleabi
+rustup target add armv7-unknown-linux-musleabihf
 rustup target add aarch64-unknown-linux-musl
 rustup target add x86_64-unknown-linux-musl
 rustup target add riscv64gc-unknown-linux-musl
 
-cargo zigbuild --target armv7-unknown-linux-musleabi --release
+cargo zigbuild --target armv7-unknown-linux-musleabihf --release
 cargo zigbuild --target aarch64-unknown-linux-musl --release
 cargo zigbuild --target x86_64-unknown-linux-musl --release
 cargo zigbuild --target riscv64gc-unknown-linux-musl --release
