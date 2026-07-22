@@ -21,6 +21,8 @@ remote filesystem / process / shell
 
 到 [Release](https://github.com/jark006/RemoteOps/releases) 里下载最新的 PC 端 `remote-ops-proxy` 可执行文件，再丢到环境变量的某个目录里。再下载被控端的 `remote-ops-agent` 可执行文件，丢到开发板或需要被控制的系统。
 
+⚠️ 这些可执行文件都带了目标平台的名称后缀，要么重命名将其移除，要么在下面配置的时候使用完整文件名。
+
 ## 🤖 启动被控端 agent
 
 在被控端 Ubuntu 或 嵌入式 Linux 执行：
