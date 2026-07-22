@@ -1,4 +1,4 @@
-# RemoteOps
+# 🛰️ RemoteOps
 
 RemoteOps 是一个面向远程系统维护和嵌入式 Linux 开发的 MCP 工具。
 在 PC 端部署 `remote-ops-proxy` 并配置 MCP，远端设备部署 `remote-ops-agent`，则 PC 端的 Claude Code / Codex 即可远程控制远端设备。
@@ -17,11 +17,11 @@ remote-ops-agent
 remote filesystem / process / shell
 ```
 
-## 快速上手
+## 🚀 快速上手
 
 到 [Release](https://github.com/jark006/RemoteOps/releases) 里下载最新的 PC 端 `remote-ops-proxy` 可执行文件，再丢到环境变量的某个目录里。再下载被控端的 `remote-ops-agent` 可执行文件，丢到开发板或需要被控制的系统。
 
-## 启动被控端 agent
+## 🤖 启动被控端 agent
 
 在被控端 Ubuntu 或 嵌入式 Linux 执行：
 
@@ -39,7 +39,7 @@ nohup ./remote-ops-agent --listen 0.0.0.0:8022 > /dev/null 2>&1 &
 .\remote-ops-agent.exe --listen 0.0.0.0:8022
 ```
 
-## 配置 MCP proxy
+## 🔧 配置 MCP proxy
 
 通用 MCP 客户端配置示例如下，可以直接把以下内容丢给AI让他自己配置，然后重启 Claude Code 或 Codex 即可生效：
 
@@ -73,7 +73,7 @@ proxy 参数：
 --max-transfer-bytes N       单文件上限，默认 4294967296（4 GiB）
 ```
 
-## MCP 工具
+## 🛠️ MCP 工具
 
 | 工具 | 主要参数 | 说明 |
 | --- | --- | --- |
@@ -99,7 +99,7 @@ proxy 参数：
 
 ⚠️ 被控端 Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。
 
-## 传输协议和安全边界
+## 🔒 传输协议和安全边界
 
 - TCP 握手使用双方随机 nonce 和内置值 `JARK006_PSK` 派生会话密钥。
 - 帧头、请求 ID、序号和 payload 均受 HMAC 保护，用于避免本地网络中的误连接和传输损坏。
@@ -109,7 +109,7 @@ proxy 参数：
 
 ---
 
-## 构建
+## 🏗️ 构建
 
 ```sh
 cargo build --release --workspace
@@ -145,7 +145,7 @@ cargo zigbuild --target x86_64-unknown-linux-musl --release
 cargo zigbuild --target riscv64gc-unknown-linux-musl --release
 ```
 
-## 验证
+## ✅ 验证
 
 ```sh
 cargo fmt --all -- --check
