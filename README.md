@@ -1,103 +1,47 @@
 # RemoteOps
 
-RemoteOps 是一个面向远程系统维护和嵌入式 Linux 开发的 MCP 工具。服务分为 PC 端 proxy 和远端 agent。
+RemoteOps 是一个面向远程系统维护和嵌入式 Linux 开发的 MCP 工具。
+在 PC 端部署 `remote-ops-proxy` 并配置 MCP，远端设备部署 `remote-ops-agent`，则 PC 端的 Claude Code / Codex 即可远程控制远端设备。
 
 ```text
-AI Agent <-- MCP stdio --> remote-ops-proxy
-                              |
-                              | authenticated TCP + binary frames
-                              v
-                       remote-ops-agent
-                              |
-                              v
-                    remote filesystem / process / shell
+Claude Code / Codex
+       v
+   MCP stdio
+       v
+remote-ops-proxy
+       ^
+       |
+       v
+remote-ops-agent
+       v
+remote filesystem / process / shell
 ```
 
-## 功能
+## 快速上手
 
-- MCP stdio 支持 `initialize`、`ping`、初始化通知、`tools/list` 和 `tools/call`。
-- 保留旧版 12 个工具的名称、参数和结果结构。
-- `upload_file`、`download_file` 直接在 PC 路径和远端路径之间传输任意二进制单文件。
-- proxy 默认使用 `192.168.43.106:8022`，AI Agent 可查询连接状态并在运行时切换远端 IPv4 或端口。
-- 文件按 64 KiB 分块传输，完成后校验总长度和 SHA-256。
-- 上传和下载先写同目录临时文件，校验成功后原子替换；Unix 上保留已有目标文件的 mode 并同步父目录。
-- proxy 与 agent 使用内置固定值 `JARK006_PSK` 建立连接；每个帧都有 HMAC-SHA256 和单调序号保护。
-- 工具请求不会在连接状态不确定时自动重放，避免重复执行命令或破坏性操作。
+到 [Release](https://github.com/jark006/RemoteOps/releases) 里下载最新的 PC 端 `remote-ops-proxy` 可执行文件，再丢到环境变量的某个目录里。再下载被控端的 `remote-ops-agent` 可执行文件，丢到开发板或需要被控制的系统。
 
-## 平台支持
+## 启动被控端 agent
 
-| 能力 | Linux | Windows | macOS |
-| --- | --- | --- | --- |
-| 连接、认证、二进制传输 | 支持 | 支持 | 支持 |
-| 文本、目录、stat、哈希 | 支持 | 支持 | 支持 |
-| `exec` | 支持 | 支持 | 支持 |
-| `sh_exec` | 支持 | 支持⚠️ | 支持 |
-| `kill` | 支持 | 支持 | 支持 |
-| `pkill` | 支持 | 支持 | 支持 |
-| `pids` | 支持 | 支持 | 支持 |
-| `process_info` | 支持 | 支持 | 支持 |
-| `system_info` | 支持 | 支持 | 支持 |
-
-Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。
-
-## 构建
+在被控端 Ubuntu 或 嵌入式 Linux 执行：
 
 ```sh
-cargo build --release --workspace
+# 启动进程到后台 默认监听 0.0.0.0:8022
+nohup ./remote-ops-agent > /dev/null 2>&1 &
+
+# 也可以指定监听IP及端口
+nohup ./remote-ops-agent --listen 0.0.0.0:8022 > /dev/null 2>&1 &
 ```
 
-本机产物位于：
-
-```text
-target/release/remote-ops-proxy
-target/release/remote-ops-agent
-```
-
-可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
-
-```sh
-# 安装 zigbuild  Win / Ubuntu
-winget install zig.zig
-sudo snap install zig --classic --beta
-
-cargo install --locked cargo-zigbuild
-rustup target add armv7-unknown-linux-musleabihf
-rustup target add aarch64-unknown-linux-musl
-rustup target add x86_64-unknown-linux-musl
-rustup target add riscv64gc-unknown-linux-musl
-
-cargo zigbuild --target armv7-unknown-linux-musleabihf --release
-cargo zigbuild --target aarch64-unknown-linux-musl --release
-cargo zigbuild --target x86_64-unknown-linux-musl --release
-cargo zigbuild --target riscv64gc-unknown-linux-musl --release
-```
-
-## 启动远端 agent
-
-Linux/macOS：
-
-```sh
-./remote-ops-agent --listen 0.0.0.0:8022
-```
-
-Windows PowerShell：
+如果被控端是 Windows 则执行：
 
 ```powershell
 .\remote-ops-agent.exe --listen 0.0.0.0:8022
 ```
 
-agent 参数：
-
-```text
---listen HOST:PORT           默认 0.0.0.0:8022
---max-transfer-bytes N       单文件上限，默认 4294967296（4 GiB）
-```
-
-agent 串行服务一条 proxy 连接。认证后的连接不会因为空闲而关闭；连接断开后会继续等待下一次连接。为防止无效连接永久占用唯一服务槽，认证握手限时 10 秒，一个已经开始的帧必须在 30 秒内完成，上传相邻帧最多间隔 60 秒，socket 写入限时 30 秒。agent 和 proxy 都启用 TCP Keepalive，空闲 60 秒后每 10 秒探测一次，失败重试次数采用平台默认值。
-
 ## 配置 MCP proxy
 
-Claude Code、Codex 等 AI Agent 通过 stdio 与 remote-ops-proxy 通信，而 remote-ops-proxy 通过网络与远程 remote-ops-agent 通信。通用 MCP 客户端配置示例：
+通用 MCP 客户端配置示例如下，可以直接把以下内容丢给AI让他自己配置，然后重启 Claude Code 或 Codex 即可生效：
 
 Claude Code: ~/.claude.json
 ```json
@@ -124,14 +68,10 @@ args = []
 proxy 参数：
 
 ```text
---remote IPv4:PORT           可选，默认 192.168.43.106:8022
+--remote IPv4:PORT           可选，默认 192.168.43.106:8022，也可随时在对话中叫 AI 设定 remote-ops 的受控端 IP
 --timeout-ms N               等待远端操作响应的 I/O 超时，默认 310000
 --max-transfer-bytes N       单文件上限，默认 4294967296（4 GiB）
 ```
-
-proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `tools/list` 不要求远端在线。TCP 连接和认证握手分别限时 10 秒。缓存连接空闲超过 60 秒后，proxy 会在发送用户请求前执行一次 10 秒超时的内部健康检查；检查失败时先丢弃旧会话并重新连接。健康检查复用现有 Request/Response，不属于 MCP 工具。用户请求一旦开始发送，连接失败只会返回状态不确定错误，绝不会自动重放。
-
-`remote_status` 只报告 proxy 当前是否持有已认证会话，不会主动探测网络；对端静默断开可能要到下一次远端调用时才会发现。`set_remote` 的设置仅在当前 proxy 进程内有效，地址变化时会丢弃旧会话，下一次远端调用再连接新地址。
 
 ## MCP 工具
 
@@ -157,6 +97,8 @@ proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `t
 
 `overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
 
+⚠️ 被控端 Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。
+
 ## 传输协议和安全边界
 
 - TCP 握手使用双方随机 nonce 和内置值 `JARK006_PSK` 派生会话密钥。
@@ -164,6 +106,44 @@ proxy 会在首次远端工具调用时建立连接，因此 `initialize` 和 `t
 - 控制帧最大 2 MiB，二进制 chunk 固定上限 64 KiB。
 - 此协议不加密内容。网络观察者仍可看到路径、命令和文件内容。
 - 固定连接值不是安全凭据，无法隔离能够读取程序或源码的参与者。agent 提供远程 shell 级权限，只能部署在本地可信网络中，不要直接暴露到互联网。
+
+---
+
+## 构建
+
+```sh
+cargo build --release --workspace
+```
+
+本机产物位于：
+
+```text
+target/release/remote-ops-proxy
+target/release/remote-ops-agent
+```
+
+可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
+
+```sh
+# 在 Win 端开发时安装 zigbuild
+winget install zig.zig
+
+# 在 Ubuntu 端开发时安装 zigbuild 
+sudo snap install zig --classic --beta
+
+# 安装所需工具链
+cargo install --locked cargo-zigbuild
+rustup target add armv7-unknown-linux-musleabihf
+rustup target add aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl
+rustup target add riscv64gc-unknown-linux-musl
+
+# 交叉编译
+cargo zigbuild --target armv7-unknown-linux-musleabihf --release
+cargo zigbuild --target aarch64-unknown-linux-musl --release
+cargo zigbuild --target x86_64-unknown-linux-musl --release
+cargo zigbuild --target riscv64gc-unknown-linux-musl --release
+```
 
 ## 验证
 
