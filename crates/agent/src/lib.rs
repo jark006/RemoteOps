@@ -15,6 +15,15 @@ pub fn dispatch(operation: &str, arguments: Value) -> AgentResult<Value> {
             let args: ReadTextArgs = decode(arguments)?;
             tools::files::read_text(&args.path, args.offset, args.max_bytes)
         }
+        "read_file_lines" => {
+            let args: ReadFileLinesArgs = decode(arguments)?;
+            tools::files::read_file_lines(
+                &args.path,
+                args.start_line,
+                args.end_line,
+                args.max_bytes,
+            )
+        }
         "tail_text" => {
             let args: TailTextArgs = decode(arguments)?;
             tools::files::tail_text(&args.path, args.lines, args.max_bytes)
@@ -27,9 +36,27 @@ pub fn dispatch(operation: &str, arguments: Value) -> AgentResult<Value> {
             let args: ApplyPatchArgs = decode(arguments)?;
             tools::files::apply_patch(&args.path, &args.patch, args.expected_sha256.as_deref())
         }
-        "ls" => {
-            let args: ListArgs = decode(arguments)?;
-            tools::files::list_dir(&args.path, args.cursor.as_deref(), args.limit)
+        "list_files" => {
+            let args: ListFilesArgs = decode(arguments)?;
+            tools::files::list_files(
+                &args.path,
+                args.cursor.as_deref(),
+                args.limit,
+                args.recursive,
+                args.pattern.as_deref(),
+                args.max_depth,
+            )
+        }
+        "grep" => {
+            let args: GrepArgs = decode(arguments)?;
+            tools::files::grep(
+                &args.path,
+                &args.pattern,
+                args.glob.as_deref(),
+                args.case_sensitive,
+                args.max_results,
+                args.max_file_bytes,
+            )
         }
         "stat" => {
             let args: PathArgs = decode(arguments)?;
@@ -89,11 +116,26 @@ fn default_read_bytes() -> usize {
 fn default_tail_bytes() -> usize {
     256 * 1024
 }
+fn default_line_bytes() -> usize {
+    256 * 1024
+}
 fn default_lines() -> usize {
     100
 }
 fn default_list_limit() -> usize {
     200
+}
+fn default_list_depth() -> usize {
+    16
+}
+fn default_grep_results() -> usize {
+    200
+}
+fn default_grep_file_bytes() -> u64 {
+    1024 * 1024
+}
+fn default_true() -> bool {
+    true
 }
 fn default_pid_limit() -> usize {
     1024
@@ -116,6 +158,21 @@ struct ReadTextArgs {
     offset: u64,
     #[serde(default = "default_read_bytes")]
     max_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadFileLinesArgs {
+    path: String,
+    #[serde(default = "default_start_line")]
+    start_line: u64,
+    end_line: Option<u64>,
+    #[serde(default = "default_line_bytes")]
+    max_bytes: usize,
+}
+
+fn default_start_line() -> u64 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -145,11 +202,30 @@ struct ApplyPatchArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListArgs {
+struct ListFilesArgs {
     path: String,
     cursor: Option<String>,
     #[serde(default = "default_list_limit")]
     limit: usize,
+    #[serde(default)]
+    recursive: bool,
+    pattern: Option<String>,
+    #[serde(default = "default_list_depth")]
+    max_depth: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrepArgs {
+    path: String,
+    pattern: String,
+    glob: Option<String>,
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    #[serde(default = "default_grep_results")]
+    max_results: usize,
+    #[serde(default = "default_grep_file_bytes")]
+    max_file_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -250,5 +326,37 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
+    }
+
+    #[test]
+    fn dispatches_new_file_discovery_tools_and_rejects_old_ls_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.rs");
+        std::fs::write(&path, "one\nneedle\nthree\n").unwrap();
+
+        let lines = dispatch(
+            "read_file_lines",
+            json!({"path": path, "start_line": 2, "end_line": 2}),
+        )
+        .unwrap();
+        assert_eq!(lines["text"], "needle\n");
+
+        let search = dispatch(
+            "grep",
+            json!({"path": directory.path(), "pattern": "needle"}),
+        )
+        .unwrap();
+        assert_eq!(search["matches"].as_array().unwrap().len(), 1);
+
+        let listing = dispatch(
+            "list_files",
+            json!({"path": directory.path(), "pattern": "*.rs"}),
+        )
+        .unwrap();
+        assert_eq!(listing["entries"][0]["name"], "source.rs");
+
+        let error = dispatch("ls", json!({"path": directory.path()})).unwrap_err();
+        assert_eq!(error.kind, "invalid_params");
+        assert!(error.message.contains("unknown operation"));
     }
 }

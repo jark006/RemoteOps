@@ -21,15 +21,18 @@
 
 ## 工具契约
 
-proxy 暴露 18 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
+proxy 暴露 20 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
 
-- 兼容工具：`read_text`、`tail_text`、`write_text`、`apply_patch`、`ls`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
+- 兼容工具：`read_text`、`read_file_lines`、`tail_text`、`write_text`、`apply_patch`、`list_files`、`grep`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
 - 进程工具：`pkill`。
 - 传输工具：`upload_file`、`download_file`。
 - proxy 本地管理工具：`remote_status`、`set_remote`。前者被动查询当前地址和缓存连接状态；后者可单独设置 IPv4 或端口，配置仅在当前进程内生效。
 - `upload_file` 的 `local_path` 和 `download_file` 的 `local_path` 均属于 proxy 所在 PC。
 - 单文件默认上限 4 GiB，chunk 上限 64 KiB；控制帧上限 2 MiB。
 - `apply_patch` 仅更新一个已存在的普通 UTF-8 文本文件，补丁路径必须与请求路径完全一致；补丁最大 256 KiB，目标文件最大 16 MiB，最多 128 个 hunk，不支持创建、删除、重命名或无上下文纯插入。旧侧上下文必须唯一匹配，可用 `expected_sha256` 检测冲突；整个补丁成功前不得修改目标，并保留 BOM、原有行尾和末尾换行状态。
+- `read_file_lines` 使用 1-based inclusive 行号，`start_line` 默认 1，未提供 `end_line` 时默认读取 200 行；单次最多 10,000 行、返回 1 MiB，并将为定位起始行而扫描的内容限制为 64 MiB。只接受非符号链接的普通文件，请求范围必须是 UTF-8。
+- `list_files` 对目录项排序并分页，`limit` 默认 200、最大 1,000；`recursive` 默认 false，递归时 `name` 为相对请求目录的 `/` 分隔路径，`max_depth` 默认 16、最大 64。可用最大 1 KiB 的 `pattern` glob 过滤相对路径；符号链接可列出但不遍历，单次最多扫描 100,000 个目录项、输出 1 MiB。
+- `grep` 对单个普通文件或目录树中的普通 UTF-8 文件执行逐行 Rust 正则搜索，大小写敏感默认开启，可用最大 1 KiB 的 `glob` 过滤相对路径。正则最大 4 KiB，结果默认 200 条、最多 1,000 条，单文件默认扫描 1 MiB、最多 16 MiB，单次总计最多枚举 100,000 个目录项、递归 64 层、扫描 10,000 个文件或 64 MiB、输出 1 MiB；匹配文本最多保留 1 KiB。目录搜索不跟随符号链接，并跳过 `.git`、`.hg`、`.svn`、`.next`、`node_modules`、`target`、`dist`、`build`。
 - 文件传输必须校验长度和 SHA-256，成功前使用同目录临时文件，失败时不得留下目标半文件。
 - 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒。
 

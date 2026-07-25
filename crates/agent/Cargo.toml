@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+globset.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
+regex.workspace = true
 remote-ops-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true

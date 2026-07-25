@@ -65,6 +65,63 @@ fn binary_file_round_trip_crosses_multiple_chunks() {
 }
 
 #[test]
+fn file_discovery_tools_cross_the_remote_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+    });
+    let remote = tempfile::tempdir().unwrap();
+    fs::create_dir_all(remote.path().join("src/nested")).unwrap();
+    fs::write(
+        remote.path().join("src/main.rs"),
+        "first\nremote needle\nthird\n",
+    )
+    .unwrap();
+    fs::write(remote.path().join("src/nested/lib.rs"), "no match\n").unwrap();
+
+    {
+        let mut client = RemoteClient::new(
+            address.to_string().parse().unwrap(),
+            Duration::from_secs(5),
+            DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let lines = client
+            .call(
+                "read_file_lines",
+                json!({
+                    "path": remote.path().join("src/main.rs"),
+                    "start_line": 2,
+                    "end_line": 2
+                }),
+            )
+            .unwrap();
+        assert_eq!(lines["text"], "remote needle\n");
+
+        let search = client
+            .call(
+                "grep",
+                json!({"path":remote.path(),"pattern":"needle","glob":"*.rs"}),
+            )
+            .unwrap();
+        assert_eq!(search["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(search["matches"][0]["path"], "src/main.rs");
+
+        let listing = client
+            .call(
+                "list_files",
+                json!({"path":remote.path(),"recursive":true,"pattern":"*.rs"}),
+            )
+            .unwrap();
+        assert_eq!(listing["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(listing["entries"][0]["name"], "src/main.rs");
+        assert_eq!(listing["entries"][1]["name"], "src/nested/lib.rs");
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_remote-ops-proxy"))
         .args(["--timeout-ms", "100"])
@@ -113,7 +170,7 @@ fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
         .collect();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 18);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 20);
     assert_eq!(
         lines[2]["result"]["structuredContent"]["address"],
         "192.168.43.106:8022"

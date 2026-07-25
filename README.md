@@ -88,10 +88,12 @@ proxy 参数：
 | 工具 | 主要参数 | 说明 |
 | --- | --- | --- |
 | `read_text` | `path`, `offset?`, `max_bytes?` | 有界读取远端文本，最大 1 MiB。 |
+| `read_file_lines` | `path`, `start_line?`, `end_line?`, `max_bytes?` | 按 1-based inclusive 行号读取 UTF-8 文本；默认从第 1 行读取 200 行，最多 10,000 行或返回 1 MiB。 |
 | `tail_text` | `path`, `lines?`, `max_bytes?` | 有界读取文件尾，最多 10,000 行或 1 MiB。 |
 | `write_text` | `path`, `content` | 原子写入远端文本。 |
 | `apply_patch` | `path`, `patch`, `expected_sha256?` | 对单个远端 UTF-8 文本文件原子应用上下文补丁。 |
-| `ls` | `path`, `cursor?`, `limit?` | 排序并分页列出远端目录。 |
+| `list_files` | `path`, `cursor?`, `limit?`, `recursive?`, `pattern?`, `max_depth?` | 排序、过滤并分页列出远端目录；可递归返回相对路径。 |
+| `grep` | `path`, `pattern`, `glob?`, `case_sensitive?`, `max_results?`, `max_file_bytes?` | 对远端普通 UTF-8 文件执行有界逐行 Rust 正则搜索。 |
 | `stat` | `path` | 不跟随符号链接读取元数据。 |
 | `file_hash` | `path`, `max_bytes?` | 计算最大 64 MiB 文件的 SHA-256。 |
 | `pids` | `filter?`, `cursor?`, `limit?` | Linux/Windows/macOS 进程分页；不可读取的 Windows/macOS 命令行返回空字符串。 |
@@ -107,6 +109,12 @@ proxy 参数：
 | `set_remote` | `ip?`, `port?` | 动态设置远端 IPv4 或端口；至少提供一项，未提供部分保持不变。 |
 
 `overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
+
+`read_file_lines` 未提供 `end_line` 时读取从 `start_line` 开始的 200 行；为定位行号最多扫描 64 MiB。达到 `max_bytes` 时不会返回半行，`next_line` 指向下一次应读取的行。
+
+`list_files` 的 `limit` 默认 200、最大 1,000，`recursive` 默认 `false`，`max_depth` 默认 16、最大 64。递归结果的 `name` 使用相对请求目录的 `/` 分隔路径；`pattern` 是最大 1 KiB 的 glob。符号链接会列出但不会遍历，单次最多扫描 100,000 个目录项并输出 1 MiB。
+
+`grep` 的正则最大 4 KiB，结果默认 200 条、最多 1,000 条；`case_sensitive` 默认 `true`，`max_file_bytes` 默认 1 MiB、最大 16 MiB。单次最多枚举 100,000 个目录项、递归 64 层、扫描 10,000 个文件或 64 MiB 并输出 1 MiB，单条匹配文本最多 1 KiB。目录搜索不跟随符号链接，并跳过 `.git`、`.hg`、`.svn`、`.next`、`node_modules`、`target`、`dist`、`build`；`glob` 最大 1 KiB，匹配相对路径。
 
 `apply_patch` 只支持更新已存在的普通文件，`patch` 最大 256 KiB，目标文件最大 16 MiB，每次最多 128 个 hunk。补丁中的路径必须与 `path` 完全一致；每个旧文本片段必须唯一匹配，否则不修改文件。可传入当前文件的 `expected_sha256` 防止覆盖并发修改。格式如下：
 
@@ -154,8 +162,13 @@ target/release/remote-ops-agent
 # 在 Win 端开发时安装 zig
 winget install zig.zig
 
-# 在 Ubuntu 端开发时安装 zig
+# 在 Mac 端开发时安装 zig
+brew install zig
+
+# 在 Linux 端开发时安装 zig (根据发行版选择)
 sudo snap install zig --classic --beta
+pacman -S zig
+dnf install zig
 
 # 安装 zigbuild 及相关工具链
 cargo install --locked cargo-zigbuild

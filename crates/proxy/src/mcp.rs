@@ -1,3 +1,5 @@
+use globset::Glob;
+use regex::RegexBuilder;
 use remote_ops_protocol::{
     APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
 };
@@ -91,6 +93,15 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
         "apply_patch" => decode_transfer::<ApplyPatchArgs>(&arguments)
             .and_then(validate_apply_patch_args)
             .and_then(|_| client.call(name, arguments)),
+        "read_file_lines" => decode_transfer::<ReadFileLinesArgs>(&arguments)
+            .and_then(validate_read_file_lines_args)
+            .and_then(|_| client.call(name, arguments)),
+        "grep" => decode_transfer::<GrepArgs>(&arguments)
+            .and_then(validate_grep_args)
+            .and_then(|_| client.call(name, arguments)),
+        "list_files" => decode_transfer::<ListFilesArgs>(&arguments)
+            .and_then(validate_list_files_args)
+            .and_then(|_| client.call(name, arguments)),
         _ => client.call(name, arguments),
     };
     match result {
@@ -107,7 +118,7 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
 }
 
 fn successful_tool_result(name: &str, value: Value) -> Value {
-    if matches!(name, "read_text" | "tail_text") {
+    if matches!(name, "read_text" | "read_file_lines" | "tail_text") {
         let text = value
             .get("text")
             .and_then(Value::as_str)
@@ -143,6 +154,13 @@ fn default_signal() -> i32 {
 }
 
 const PKILL_MAX_NAME_CHARS: usize = 260;
+const READ_FILE_LINES_MAX_BYTES: usize = 1024 * 1024;
+const READ_FILE_LINES_MAX_LINES: u64 = 10_000;
+const GREP_MAX_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_GLOB_BYTES: usize = 1024;
+const GREP_MAX_RESULTS: usize = 1000;
+const GREP_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const LIST_FILES_MAX_DEPTH: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +207,69 @@ struct ApplyPatchArgs {
     expected_sha256: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadFileLinesArgs {
+    path: String,
+    #[serde(default = "default_start_line")]
+    start_line: u64,
+    end_line: Option<u64>,
+    #[serde(default = "default_line_bytes")]
+    max_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrepArgs {
+    path: String,
+    pattern: String,
+    glob: Option<String>,
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    #[serde(default = "default_grep_results")]
+    max_results: usize,
+    #[serde(default = "default_grep_file_bytes")]
+    max_file_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListFilesArgs {
+    path: String,
+    cursor: Option<String>,
+    #[serde(default = "default_list_limit")]
+    limit: usize,
+    #[serde(default)]
+    recursive: bool,
+    pattern: Option<String>,
+    #[serde(default = "default_list_depth")]
+    max_depth: usize,
+}
+
+fn default_start_line() -> u64 {
+    1
+}
+
+fn default_line_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_grep_results() -> usize {
+    200
+}
+
+fn default_grep_file_bytes() -> u64 {
+    1024 * 1024
+}
+
+fn default_list_limit() -> usize {
+    200
+}
+
+fn default_list_depth() -> usize {
+    16
+}
+
 fn validate_apply_patch_args(args: ApplyPatchArgs) -> Result<(), ClientError> {
     let message = if args.path.is_empty() {
         Some("path must not be empty")
@@ -231,6 +312,113 @@ fn valid_patch_envelope(path: &str, patch: &str) -> bool {
         && (1..=APPLY_PATCH_MAX_HUNKS).contains(&hunks)
 }
 
+fn validate_read_file_lines_args(args: ReadFileLinesArgs) -> Result<(), ClientError> {
+    validate_remote_path(&args.path)?;
+    if args.start_line == 0 {
+        return invalid_params("start_line must be at least 1");
+    }
+    if let Some(end_line) = args.end_line {
+        if end_line < args.start_line {
+            return invalid_params("end_line must be greater than or equal to start_line");
+        }
+        if end_line - args.start_line >= READ_FILE_LINES_MAX_LINES {
+            return invalid_params(format!(
+                "line range must not exceed {READ_FILE_LINES_MAX_LINES} lines"
+            ));
+        }
+    }
+    if args.max_bytes > READ_FILE_LINES_MAX_BYTES {
+        return invalid_params(format!(
+            "max_bytes must be in range 0..={READ_FILE_LINES_MAX_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_grep_args(args: GrepArgs) -> Result<(), ClientError> {
+    validate_remote_path(&args.path)?;
+    if args.pattern.is_empty() {
+        return invalid_params("pattern must not be empty");
+    }
+    if args.pattern.len() > GREP_MAX_PATTERN_BYTES {
+        return invalid_params(format!("pattern exceeds {GREP_MAX_PATTERN_BYTES} bytes"));
+    }
+    RegexBuilder::new(&args.pattern)
+        .case_insensitive(!args.case_sensitive)
+        .build()
+        .map_err(|error| ClientError {
+            kind: "invalid_params".to_string(),
+            message: format!("invalid regex pattern: {error}"),
+        })?;
+    validate_glob(args.glob.as_deref())?;
+    if args.max_results == 0 || args.max_results > GREP_MAX_RESULTS {
+        return invalid_params(format!(
+            "max_results must be in range 1..={GREP_MAX_RESULTS}"
+        ));
+    }
+    if args.max_file_bytes == 0 || args.max_file_bytes > GREP_MAX_FILE_BYTES {
+        return invalid_params(format!(
+            "max_file_bytes must be in range 1..={GREP_MAX_FILE_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_list_files_args(args: ListFilesArgs) -> Result<(), ClientError> {
+    validate_remote_path(&args.path)?;
+    if args
+        .cursor
+        .as_ref()
+        .is_some_and(|value| value.contains('\0'))
+    {
+        return invalid_params("cursor must not contain NUL");
+    }
+    if args.limit == 0 || args.limit > 1000 {
+        return invalid_params("limit must be in range 1..=1000");
+    }
+    if args.max_depth == 0 || args.max_depth > LIST_FILES_MAX_DEPTH {
+        return invalid_params(format!(
+            "max_depth must be in range 1..={LIST_FILES_MAX_DEPTH}"
+        ));
+    }
+    validate_glob(args.pattern.as_deref())?;
+    let _ = args.recursive;
+    Ok(())
+}
+
+fn validate_remote_path(path: &str) -> Result<(), ClientError> {
+    if path.is_empty() {
+        invalid_params("path must not be empty")
+    } else if path.contains('\0') {
+        invalid_params("path must not contain NUL")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_glob(pattern: Option<&str>) -> Result<(), ClientError> {
+    let Some(pattern) = pattern else {
+        return Ok(());
+    };
+    if pattern.is_empty() {
+        return invalid_params("glob pattern must not be empty");
+    }
+    if pattern.len() > MAX_GLOB_BYTES {
+        return invalid_params(format!("glob pattern exceeds {MAX_GLOB_BYTES} bytes"));
+    }
+    Glob::new(pattern).map(|_| ()).map_err(|error| ClientError {
+        kind: "invalid_params".to_string(),
+        message: format!("invalid glob pattern: {error}"),
+    })
+}
+
+fn invalid_params<T>(message: impl Into<String>) -> Result<T, ClientError> {
+    Err(ClientError {
+        kind: "invalid_params".to_string(),
+        message: message.into(),
+    })
+}
+
 fn validate_pkill_args(args: PkillArgs) -> Result<(), ClientError> {
     let message = if args.name.is_empty() {
         Some("name must not be empty")
@@ -255,10 +443,12 @@ fn validate_pkill_args(args: PkillArgs) -> Result<(), ClientError> {
 pub fn tool_names() -> &'static [&'static str] {
     &[
         "read_text",
+        "read_file_lines",
         "tail_text",
         "write_text",
         "apply_patch",
-        "ls",
+        "list_files",
+        "grep",
         "stat",
         "file_hash",
         "pids",
@@ -287,6 +477,32 @@ pub fn tool_definitions() -> Vec<Value> {
                 (
                     "max_bytes",
                     integer_prop_default(0, Some(1_048_576), 1_048_576, "Maximum bytes"),
+                ),
+            ]),
+            &["path"],
+            (true, false, true),
+        ),
+        tool(
+            "read_file_lines",
+            "Read file lines",
+            "Read a bounded 1-based line range from a remote UTF-8 text file",
+            props(&[
+                ("path", string_prop("Remote file path")),
+                (
+                    "start_line",
+                    integer_prop_default(1, None, 1, "First line, inclusive"),
+                ),
+                (
+                    "end_line",
+                    integer_prop(
+                        1,
+                        None,
+                        "Last line, inclusive; defaults to 200 lines from start_line",
+                    ),
+                ),
+                (
+                    "max_bytes",
+                    integer_prop_default(0, Some(1_048_576), 262_144, "Maximum returned bytes"),
                 ),
             ]),
             &["path"],
@@ -345,18 +561,72 @@ pub fn tool_definitions() -> Vec<Value> {
             (false, true, true),
         ),
         tool(
-            "ls",
-            "List directory",
-            "List a remote directory with pagination",
+            "list_files",
+            "List files",
+            "List, filter, and optionally recurse through a remote directory with pagination",
             props(&[
                 ("path", string_prop("Remote directory path")),
-                ("cursor", string_prop("Exclusive name cursor")),
+                (
+                    "cursor",
+                    string_prop("Exclusive relative-path cursor from a previous response"),
+                ),
                 (
                     "limit",
                     integer_prop_default(1, Some(1000), 200, "Maximum entries"),
                 ),
+                ("recursive", json!({"type":"boolean","default":false})),
+                (
+                    "pattern",
+                    json!({"type":"string","minLength":1,"maxLength":MAX_GLOB_BYTES,"description":"Optional glob matched against relative paths"}),
+                ),
+                (
+                    "max_depth",
+                    integer_prop_default(
+                        1,
+                        Some(LIST_FILES_MAX_DEPTH as u64),
+                        16,
+                        "Maximum recursive depth; ignored when recursive is false",
+                    ),
+                ),
             ]),
             &["path"],
+            (true, false, true),
+        ),
+        tool(
+            "grep",
+            "Search text",
+            "Search regular UTF-8 files with a Rust regular expression",
+            props(&[
+                ("path", string_prop("Remote file or directory path")),
+                (
+                    "pattern",
+                    json!({"type":"string","minLength":1,"maxLength":GREP_MAX_PATTERN_BYTES,"description":"Rust regular expression matched against each line"}),
+                ),
+                (
+                    "glob",
+                    json!({"type":"string","minLength":1,"maxLength":MAX_GLOB_BYTES,"description":"Optional glob matched against relative file paths"}),
+                ),
+                ("case_sensitive", json!({"type":"boolean","default":true})),
+                (
+                    "max_results",
+                    integer_prop_default(
+                        1,
+                        Some(GREP_MAX_RESULTS as u64),
+                        200,
+                        "Maximum matching lines",
+                    ),
+                ),
+                (
+                    "max_file_bytes",
+                    integer_prop_default(
+                        1,
+                        Some(GREP_MAX_FILE_BYTES),
+                        1_048_576,
+                        "Maximum bytes scanned per file",
+                    ),
+                ),
+            ]),
+            &["path", "pattern"],
             (true, false, true),
         ),
         tool(
@@ -602,6 +872,24 @@ fn output_schema(name: &str) -> Value {
             }),
             &["offset", "bytes_read", "next_offset", "truncated"],
         ),
+        "read_file_lines" => strict_output(
+            json!({
+                "start_line":{"type":"integer","minimum":1},
+                "end_line":{"type":"integer","minimum":1},
+                "lines_returned":{"type":"integer","minimum":0,"maximum":READ_FILE_LINES_MAX_LINES},
+                "bytes_returned":{"type":"integer","minimum":0,"maximum":READ_FILE_LINES_MAX_BYTES},
+                "next_line":{"type":["integer","null"],"minimum":1},
+                "truncated":{"type":"boolean"}
+            }),
+            &[
+                "start_line",
+                "end_line",
+                "lines_returned",
+                "bytes_returned",
+                "next_line",
+                "truncated",
+            ],
+        ),
         "tail_text" => strict_output(
             json!({
                 "bytes_scanned":{"type":"integer","minimum":0},
@@ -630,7 +918,7 @@ fn output_schema(name: &str) -> Value {
                 "sha256_after",
             ],
         ),
-        "ls" => strict_output(
+        "list_files" => strict_output(
             json!({
                 "entries":{"type":"array","items":{
                     "type":"object",
@@ -641,6 +929,33 @@ fn output_schema(name: &str) -> Value {
                 "truncated":{"type":"boolean"}
             }),
             &["entries", "next_cursor", "truncated"],
+        ),
+        "grep" => strict_output(
+            json!({
+                "matches":{"type":"array","maxItems":GREP_MAX_RESULTS,"items":{
+                    "type":"object",
+                    "properties":{
+                        "path":{"type":"string"},
+                        "line":{"type":"integer","minimum":1},
+                        "column":{"type":"integer","minimum":1},
+                        "text":{"type":"string"},
+                        "text_truncated":{"type":"boolean"}
+                    },
+                    "required":["path","line","column","text","text_truncated"],
+                    "additionalProperties":false
+                }},
+                "files_scanned":{"type":"integer","minimum":0,"maximum":10000},
+                "files_skipped":{"type":"integer","minimum":0},
+                "bytes_scanned":{"type":"integer","minimum":0,"maximum":67108864},
+                "truncated":{"type":"boolean"}
+            }),
+            &[
+                "matches",
+                "files_scanned",
+                "files_skipped",
+                "bytes_scanned",
+                "truncated",
+            ],
         ),
         "stat" => strict_output(
             json!({
@@ -772,7 +1087,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 20);
         assert_eq!(
             tools
                 .iter()
@@ -886,6 +1201,33 @@ mod tests {
             APPLY_PATCH_MAX_HUNKS
         );
         assert_eq!(patch["annotations"]["idempotentHint"], true);
+        assert!(!tools.iter().any(|tool| tool["name"] == "ls"));
+        let line_reader = tools
+            .iter()
+            .find(|tool| tool["name"] == "read_file_lines")
+            .unwrap();
+        assert_eq!(
+            line_reader["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            READ_FILE_LINES_MAX_BYTES
+        );
+        let listing = tools
+            .iter()
+            .find(|tool| tool["name"] == "list_files")
+            .unwrap();
+        assert_eq!(
+            listing["inputSchema"]["properties"]["recursive"]["default"],
+            false
+        );
+        assert_eq!(
+            listing["inputSchema"]["properties"]["max_depth"]["maximum"],
+            LIST_FILES_MAX_DEPTH
+        );
+        let grep = tools.iter().find(|tool| tool["name"] == "grep").unwrap();
+        assert_eq!(
+            grep["inputSchema"]["properties"]["max_results"]["maximum"],
+            GREP_MAX_RESULTS
+        );
+        assert_eq!(grep["annotations"]["readOnlyHint"], true);
     }
 
     #[test]
@@ -980,6 +1322,38 @@ mod tests {
                 &mut client,
             );
             assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    #[test]
+    fn file_discovery_arguments_are_validated_before_connecting() {
+        let mut client = RemoteClient::new(
+            "127.0.0.1:1".parse().unwrap(),
+            std::time::Duration::from_millis(10),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let invalid_calls = [
+            json!({"name":"read_file_lines","arguments":{"path":"","start_line":1}}),
+            json!({"name":"read_file_lines","arguments":{"path":"file","start_line":0}}),
+            json!({"name":"read_file_lines","arguments":{"path":"file","start_line":2,"end_line":1}}),
+            json!({"name":"read_file_lines","arguments":{"path":"file","max_bytes":READ_FILE_LINES_MAX_BYTES + 1}}),
+            json!({"name":"grep","arguments":{"path":".","pattern":""}}),
+            json!({"name":"grep","arguments":{"path":".","pattern":"["}}),
+            json!({"name":"grep","arguments":{"path":".","pattern":"x","glob":"["}}),
+            json!({"name":"grep","arguments":{"path":".","pattern":"x","max_results":0}}),
+            json!({"name":"list_files","arguments":{"path":"","recursive":true}}),
+            json!({"name":"list_files","arguments":{"path":".","limit":0}}),
+            json!({"name":"list_files","arguments":{"path":".","pattern":"["}}),
+            json!({"name":"list_files","arguments":{"path":".","max_depth":0}}),
+            json!({"name":"ls","arguments":{"path":"."}}),
+        ];
+        for params in invalid_calls {
+            let response = call_tool(
+                json!(1),
+                Some(&json!({"name":params["name"],"arguments":params["arguments"]})),
+                &mut client,
+            );
+            assert_eq!(response["error"]["code"], -32602, "{params}");
         }
     }
 }

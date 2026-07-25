@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use globset::{Glob, GlobMatcher};
+use regex::RegexBuilder;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -13,8 +15,26 @@ use remote_ops_protocol::{
 use crate::error::{AgentError, AgentResult};
 
 pub const READ_TEXT_MAX_BYTES: usize = 1024 * 1024;
+pub const READ_FILE_LINES_MAX_BYTES: usize = 1024 * 1024;
+pub const READ_FILE_LINES_MAX_LINES: u64 = 10_000;
+pub const READ_FILE_LINES_DEFAULT_LINES: u64 = 200;
 pub const TAIL_TEXT_MAX_BYTES: usize = 1024 * 1024;
 pub const FILE_HASH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const GREP_MAX_PATTERN_BYTES: usize = 4 * 1024;
+pub const GREP_MAX_GLOB_BYTES: usize = 1024;
+pub const GREP_MAX_RESULTS: usize = 1000;
+pub const GREP_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const LIST_FILES_MAX_DEPTH: usize = 64;
+
+const READ_FILE_LINES_MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+const GREP_MAX_SCANNED_FILES: usize = 10_000;
+const GREP_MAX_SCANNED_ENTRIES: usize = 100_000;
+const GREP_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const GREP_MAX_DEPTH: usize = 64;
+const GREP_MAX_TEXT_BYTES: usize = 1024;
+const GREP_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const LIST_FILES_MAX_SCANNED_ENTRIES: usize = 100_000;
+const LIST_FILES_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 pub fn read_text(path: &str, offset: u64, max_bytes: usize) -> AgentResult<Value> {
     if max_bytes > READ_TEXT_MAX_BYTES {
@@ -45,6 +65,118 @@ pub fn read_text(path: &str, offset: u64, max_bytes: usize) -> AgentResult<Value
     Ok(json!({
         "text": text,
         "metadata": {"offset": offset, "bytes_read": bytes.len(), "next_offset": next_offset, "truncated": truncated}
+    }))
+}
+
+pub fn read_file_lines(
+    path: &str,
+    start_line: u64,
+    end_line: Option<u64>,
+    max_bytes: usize,
+) -> AgentResult<Value> {
+    validate_path(path)?;
+    if start_line == 0 {
+        return Err(AgentError::invalid("start_line must be at least 1"));
+    }
+    let end_line = end_line.unwrap_or_else(|| {
+        start_line
+            .saturating_add(READ_FILE_LINES_DEFAULT_LINES)
+            .saturating_sub(1)
+    });
+    if end_line < start_line {
+        return Err(AgentError::invalid(
+            "end_line must be greater than or equal to start_line",
+        ));
+    }
+    if end_line - start_line >= READ_FILE_LINES_MAX_LINES {
+        return Err(AgentError::invalid(format!(
+            "line range must not exceed {READ_FILE_LINES_MAX_LINES} lines"
+        )));
+    }
+    if max_bytes > READ_FILE_LINES_MAX_BYTES {
+        return Err(AgentError::invalid(format!(
+            "max_bytes must be in range 0..={READ_FILE_LINES_MAX_BYTES}"
+        )));
+    }
+
+    let target = Path::new(path);
+    let metadata =
+        fs::symlink_metadata(target).map_err(|err| AgentError::io(format!("stat {path}"), err))?;
+    if !metadata.file_type().is_file() {
+        return Err(AgentError::invalid(
+            "path must be a regular file and not a symlink",
+        ));
+    }
+    let file = File::open(target).map_err(|err| AgentError::io(format!("open {path}"), err))?;
+    let size = file
+        .metadata()
+        .map_err(|err| AgentError::io(format!("stat {path}"), err))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut current_line = 1u64;
+    let mut bytes_scanned = 0u64;
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    let mut line = Vec::new();
+    let mut lines_returned = 0u64;
+    let mut next_line = None;
+    let mut truncated = false;
+
+    loop {
+        let remaining_scan = READ_FILE_LINES_MAX_SCAN_BYTES
+            .saturating_add(1)
+            .saturating_sub(bytes_scanned);
+        if remaining_scan == 0 {
+            return Err(AgentError::invalid(format!(
+                "line scan exceeds {READ_FILE_LINES_MAX_SCAN_BYTES} bytes"
+            )));
+        }
+        line.clear();
+        let read = (&mut reader)
+            .take(remaining_scan)
+            .read_until(b'\n', &mut line)
+            .map_err(|err| AgentError::io(format!("read {path}"), err))?;
+        if read == 0 {
+            break;
+        }
+        bytes_scanned += read as u64;
+        if bytes_scanned > READ_FILE_LINES_MAX_SCAN_BYTES {
+            return Err(AgentError::invalid(format!(
+                "line scan exceeds {READ_FILE_LINES_MAX_SCAN_BYTES} bytes"
+            )));
+        }
+
+        if current_line >= start_line {
+            if output.len().saturating_add(line.len()) > max_bytes {
+                truncated = true;
+                next_line = Some(current_line);
+                break;
+            }
+            output.extend_from_slice(&line);
+            lines_returned += 1;
+        }
+        if current_line == end_line {
+            if bytes_scanned < size {
+                truncated = true;
+                next_line = current_line.checked_add(1);
+            }
+            break;
+        }
+        current_line = current_line.saturating_add(1);
+    }
+
+    let bytes_returned = output.len();
+    let text = String::from_utf8(output)
+        .map_err(|_| AgentError::invalid("requested lines must contain valid UTF-8 text"))?;
+    Ok(json!({
+        "text": text,
+        "metadata": {
+            "start_line": start_line,
+            "end_line": end_line,
+            "lines_returned": lines_returned,
+            "bytes_returned": bytes_returned,
+            "next_line": next_line,
+            "truncated": truncated
+        }
     }))
 }
 
@@ -433,37 +565,183 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-pub fn list_dir(path: &str, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
+pub fn grep(
+    path: &str,
+    pattern: &str,
+    glob: Option<&str>,
+    case_sensitive: bool,
+    max_results: usize,
+    max_file_bytes: u64,
+) -> AgentResult<Value> {
+    validate_path(path)?;
+    if pattern.is_empty() {
+        return Err(AgentError::invalid("pattern must not be empty"));
+    }
+    if pattern.len() > GREP_MAX_PATTERN_BYTES {
+        return Err(AgentError::invalid(format!(
+            "pattern exceeds {GREP_MAX_PATTERN_BYTES} bytes"
+        )));
+    }
+    if max_results == 0 || max_results > GREP_MAX_RESULTS {
+        return Err(AgentError::invalid(format!(
+            "max_results must be in range 1..={GREP_MAX_RESULTS}"
+        )));
+    }
+    if max_file_bytes == 0 || max_file_bytes > GREP_MAX_FILE_BYTES {
+        return Err(AgentError::invalid(format!(
+            "max_file_bytes must be in range 1..={GREP_MAX_FILE_BYTES}"
+        )));
+    }
+    let regex = RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|err| AgentError::invalid(format!("invalid regex pattern: {err}")))?;
+    let glob = compile_glob(glob)?;
+    let root = Path::new(path);
+    let (files, traversal_truncated) = collect_grep_files(root, glob.as_ref())?;
+    let mut matches = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut files_skipped = 0usize;
+    let mut bytes_scanned = 0u64;
+    let mut output_bytes = 256usize;
+    let mut truncated = traversal_truncated;
+
+    'files: for candidate in files {
+        let metadata = fs::symlink_metadata(&candidate.path)
+            .map_err(|err| AgentError::io(format!("stat {}", candidate.path.display()), err))?;
+        if !metadata.file_type().is_file() || metadata.len() > max_file_bytes {
+            files_skipped += 1;
+            continue;
+        }
+        if bytes_scanned.saturating_add(metadata.len()) > GREP_MAX_TOTAL_BYTES {
+            truncated = true;
+            break;
+        }
+        let mut bytes = Vec::with_capacity((metadata.len() as usize).min(8192));
+        File::open(&candidate.path)
+            .and_then(|file| {
+                file.take(max_file_bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|err| AgentError::io(format!("read {}", candidate.path.display()), err))?;
+        if bytes.len() as u64 > max_file_bytes {
+            files_skipped += 1;
+            continue;
+        }
+        files_scanned += 1;
+        bytes_scanned += bytes.len() as u64;
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            files_skipped += 1;
+            continue;
+        };
+
+        for (line_index, line) in text.lines().enumerate() {
+            let Some(found) = regex.find(line) else {
+                continue;
+            };
+            if matches.len() == max_results {
+                truncated = true;
+                break 'files;
+            }
+            let (display_text, text_truncated) = truncate_utf8(line, GREP_MAX_TEXT_BYTES);
+            let matched_line = json!({
+                "path": candidate.relative_path,
+                "line": line_index + 1,
+                "column": found.start() + 1,
+                "text": display_text,
+                "text_truncated": text_truncated
+            });
+            let encoded_bytes = serde_json::to_vec(&matched_line)
+                .map_err(|err| AgentError::command(format!("encode grep result: {err}")))?
+                .len()
+                .saturating_add(1);
+            if output_bytes.saturating_add(encoded_bytes) > GREP_MAX_OUTPUT_BYTES {
+                truncated = true;
+                break 'files;
+            }
+            output_bytes += encoded_bytes;
+            matches.push(matched_line);
+        }
+    }
+
+    Ok(json!({
+        "matches": matches,
+        "files_scanned": files_scanned,
+        "files_skipped": files_skipped,
+        "bytes_scanned": bytes_scanned,
+        "truncated": truncated
+    }))
+}
+
+pub fn list_files(
+    path: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    recursive: bool,
+    pattern: Option<&str>,
+    max_depth: usize,
+) -> AgentResult<Value> {
+    validate_path(path)?;
     if limit == 0 || limit > 1000 {
         return Err(AgentError::invalid("limit must be in range 1..=1000"));
     }
-    let mut entries = fs::read_dir(path)
-        .map_err(|err| AgentError::io(format!("list {path}"), err))?
-        .map(|entry| entry.map_err(|err| AgentError::io(format!("list {path}"), err)))
-        .collect::<AgentResult<Vec<_>>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    if max_depth == 0 || max_depth > LIST_FILES_MAX_DEPTH {
+        return Err(AgentError::invalid(format!(
+            "max_depth must be in range 1..={LIST_FILES_MAX_DEPTH}"
+        )));
+    }
+    if cursor.is_some_and(|value| value.contains('\0')) {
+        return Err(AgentError::invalid("cursor must not contain NUL"));
+    }
+    let matcher = compile_glob(pattern)?;
+    let root = Path::new(path);
+    let metadata =
+        fs::symlink_metadata(root).map_err(|err| AgentError::io(format!("stat {path}"), err))?;
+    if !metadata.file_type().is_dir() {
+        return Err(AgentError::invalid(
+            "path must be a directory and not a symlink",
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut scanned = 0usize;
+    collect_list_entries(
+        root,
+        root,
+        1,
+        recursive,
+        max_depth,
+        matcher.as_ref(),
+        &mut scanned,
+        &mut entries,
+    )?;
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
     let filtered: Vec<_> = entries
         .into_iter()
         .filter(|entry| {
             cursor
-                .map(|value| entry.file_name().to_string_lossy().as_ref() > value)
+                .map(|value| entry.name.as_str() > value)
                 .unwrap_or(true)
         })
         .collect();
-    let truncated = filtered.len() > limit;
-    let page = filtered
-        .into_iter()
-        .take(limit)
-        .map(|entry| {
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|err| AgentError::io(format!("stat {}", entry.path().display()), err))?;
-            Ok(json!({
-                "name": entry.file_name().to_string_lossy(),
-                "kind": file_kind(&metadata),
-                "size": metadata.len()
-            }))
-        })
-        .collect::<AgentResult<Vec<_>>>()?;
+    let total = filtered.len();
+    let mut output_bytes = 128usize;
+    let mut page = Vec::new();
+    for entry in filtered {
+        if page.len() == limit {
+            break;
+        }
+        let listed_entry = json!({"name": entry.name, "kind": entry.kind, "size": entry.size});
+        let encoded_bytes = serde_json::to_vec(&listed_entry)
+            .map_err(|err| AgentError::command(format!("encode list result: {err}")))?
+            .len()
+            .saturating_add(1);
+        if output_bytes.saturating_add(encoded_bytes) > LIST_FILES_MAX_OUTPUT_BYTES {
+            break;
+        }
+        output_bytes += encoded_bytes;
+        page.push(listed_entry);
+    }
+    let truncated = page.len() < total;
     let next_cursor = if truncated {
         page.last()
             .and_then(|entry| entry["name"].as_str())
@@ -472,6 +750,237 @@ pub fn list_dir(path: &str, cursor: Option<&str>, limit: usize) -> AgentResult<V
         None
     };
     Ok(json!({"entries": page, "next_cursor": next_cursor, "truncated": truncated}))
+}
+
+struct GrepCandidate {
+    path: PathBuf,
+    relative_path: String,
+}
+
+struct ListEntry {
+    name: String,
+    kind: &'static str,
+    size: u64,
+}
+
+fn collect_grep_files(
+    root: &Path,
+    matcher: Option<&GlobMatcher>,
+) -> AgentResult<(Vec<GrepCandidate>, bool)> {
+    let metadata = fs::symlink_metadata(root)
+        .map_err(|err| AgentError::io(format!("stat {}", root.display()), err))?;
+    if metadata.file_type().is_file() {
+        let relative_path = root
+            .file_name()
+            .unwrap_or(root.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        if matcher.is_none_or(|value| value.is_match(&relative_path)) {
+            return Ok((
+                vec![GrepCandidate {
+                    path: root.to_path_buf(),
+                    relative_path,
+                }],
+                false,
+            ));
+        }
+        return Ok((Vec::new(), false));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(AgentError::invalid(
+            "path must be a regular file or directory and not a symlink",
+        ));
+    }
+    let mut files = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut scanned_entries = 0usize;
+    let truncated = collect_grep_directory(
+        root,
+        root,
+        0,
+        matcher,
+        &mut scanned_entries,
+        &mut scanned_files,
+        &mut files,
+    )?;
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok((files, truncated))
+}
+
+fn collect_grep_directory(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    matcher: Option<&GlobMatcher>,
+    scanned_entries: &mut usize,
+    scanned_files: &mut usize,
+    files: &mut Vec<GrepCandidate>,
+) -> AgentResult<bool> {
+    let remaining_entries = GREP_MAX_SCANNED_ENTRIES.saturating_sub(*scanned_entries);
+    let (directory_entries, directory_truncated) =
+        sorted_directory_entries(directory, remaining_entries)?;
+    *scanned_entries += directory_entries.len();
+    let mut truncated = directory_truncated;
+    for entry in directory_entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| AgentError::io(format!("stat {}", path.display()), err))?;
+        if metadata.file_type().is_dir() {
+            if !is_ignored_search_directory(&entry.file_name()) {
+                if depth == GREP_MAX_DEPTH {
+                    truncated = true;
+                } else if collect_grep_directory(
+                    root,
+                    &path,
+                    depth + 1,
+                    matcher,
+                    scanned_entries,
+                    scanned_files,
+                    files,
+                )? {
+                    return Ok(true);
+                }
+            }
+        } else if metadata.file_type().is_file() {
+            if *scanned_files == GREP_MAX_SCANNED_FILES {
+                return Ok(true);
+            }
+            *scanned_files += 1;
+            let relative_path = relative_display_path(root, &path);
+            if matcher.is_none_or(|value| value.is_match(&relative_path)) {
+                files.push(GrepCandidate {
+                    path,
+                    relative_path,
+                });
+            }
+        }
+    }
+    Ok(truncated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_list_entries(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    recursive: bool,
+    max_depth: usize,
+    matcher: Option<&GlobMatcher>,
+    scanned: &mut usize,
+    entries: &mut Vec<ListEntry>,
+) -> AgentResult<()> {
+    let remaining_entries = LIST_FILES_MAX_SCANNED_ENTRIES.saturating_sub(*scanned);
+    let (directory_entries, directory_truncated) =
+        sorted_directory_entries(directory, remaining_entries)?;
+    if directory_truncated {
+        return Err(AgentError::invalid(format!(
+            "directory traversal exceeds {LIST_FILES_MAX_SCANNED_ENTRIES} entries"
+        )));
+    }
+    *scanned += directory_entries.len();
+    for entry in directory_entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|err| AgentError::io(format!("stat {}", path.display()), err))?;
+        let name = relative_display_path(root, &path);
+        if matcher.is_none_or(|value| value.is_match(&name)) {
+            entries.push(ListEntry {
+                name,
+                kind: file_kind(&metadata),
+                size: metadata.len(),
+            });
+        }
+        if recursive && depth < max_depth && metadata.file_type().is_dir() {
+            collect_list_entries(
+                root,
+                &path,
+                depth + 1,
+                recursive,
+                max_depth,
+                matcher,
+                scanned,
+                entries,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn sorted_directory_entries(path: &Path, limit: usize) -> AgentResult<(Vec<fs::DirEntry>, bool)> {
+    let mut entries = Vec::with_capacity(limit.min(1024));
+    let directory = fs::read_dir(path)
+        .map_err(|err| AgentError::io(format!("list {}", path.display()), err))?;
+    let mut truncated = false;
+    for entry in directory {
+        if entries.len() == limit {
+            truncated = true;
+            break;
+        }
+        entries.push(entry.map_err(|err| AgentError::io(format!("list {}", path.display()), err))?);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok((entries, truncated))
+}
+
+fn compile_glob(pattern: Option<&str>) -> AgentResult<Option<GlobMatcher>> {
+    let Some(pattern) = pattern else {
+        return Ok(None);
+    };
+    if pattern.is_empty() {
+        return Err(AgentError::invalid("glob pattern must not be empty"));
+    }
+    if pattern.len() > GREP_MAX_GLOB_BYTES {
+        return Err(AgentError::invalid(format!(
+            "glob pattern exceeds {GREP_MAX_GLOB_BYTES} bytes"
+        )));
+    }
+    Glob::new(pattern)
+        .map(|glob| Some(glob.compile_matcher()))
+        .map_err(|err| AgentError::invalid(format!("invalid glob pattern: {err}")))
+}
+
+fn relative_display_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn is_ignored_search_directory(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    [
+        ".git",
+        ".hg",
+        ".svn",
+        ".next",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+    ]
+    .iter()
+    .any(|ignored| name.eq_ignore_ascii_case(ignored))
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> (&str, bool) {
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&value[..end], true)
+}
+
+fn validate_path(path: &str) -> AgentResult<()> {
+    if path.is_empty() {
+        return Err(AgentError::invalid("path must not be empty"));
+    }
+    if path.contains('\0') {
+        return Err(AgentError::invalid("path must not contain NUL"));
+    }
+    Ok(())
 }
 
 pub fn stat(path: &str) -> AgentResult<Value> {
@@ -680,6 +1189,141 @@ mod tests {
 
     fn update_patch(path: &str, hunks: &str) -> String {
         format!("*** Begin Patch\n*** Update File: {path}\n{hunks}*** End Patch")
+    }
+
+    #[test]
+    fn reads_utf8_line_ranges_without_splitting_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unicode.txt");
+        fs::write(&path, "one\n二\nthree\nfour").unwrap();
+
+        let result = read_file_lines(&path.to_string_lossy(), 2, Some(3), 1024).unwrap();
+
+        assert_eq!(result["text"], "二\nthree\n");
+        assert_eq!(result["metadata"]["lines_returned"], 2);
+        assert_eq!(result["metadata"]["next_line"], 4);
+        assert_eq!(result["metadata"]["truncated"], true);
+    }
+
+    #[test]
+    fn line_reader_stops_before_exceeding_output_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded.txt");
+        fs::write(&path, "short\na line that does not fit\nlast\n").unwrap();
+
+        let result = read_file_lines(&path.to_string_lossy(), 1, Some(3), 8).unwrap();
+
+        assert_eq!(result["text"], "short\n");
+        assert_eq!(result["metadata"]["lines_returned"], 1);
+        assert_eq!(result["metadata"]["next_line"], 2);
+        assert_eq!(result["metadata"]["truncated"], true);
+    }
+
+    #[test]
+    fn grep_filters_paths_and_skips_generated_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("src");
+        let generated = directory.path().join("node_modules");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&generated).unwrap();
+        fs::write(
+            source.join("main.rs"),
+            "fn main() {}\nneedle here\nNEEDLE again\n",
+        )
+        .unwrap();
+        fs::write(source.join("notes.txt"), "needle in excluded file\n").unwrap();
+        fs::write(generated.join("ignored.rs"), "needle in generated file\n").unwrap();
+
+        let result = grep(
+            &directory.path().to_string_lossy(),
+            "needle",
+            Some("src/*.rs"),
+            false,
+            10,
+            1024,
+        )
+        .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|item| item["path"] == "src/main.rs"));
+        assert_eq!(matches[0]["line"], 2);
+        assert_eq!(matches[1]["line"], 3);
+        assert_eq!(result["files_scanned"], 1);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn grep_reports_result_limit_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("many.txt");
+        fs::write(&path, "match\nmatch\nmatch\n").unwrap();
+
+        let result = grep(&path.to_string_lossy(), "match", None, true, 2, 1024).unwrap();
+
+        assert_eq!(result["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn list_files_recurses_filters_and_paginates_relative_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src/nested")).unwrap();
+        fs::write(directory.path().join("root.txt"), "root").unwrap();
+        fs::write(directory.path().join("src/lib.rs"), "lib").unwrap();
+        fs::write(directory.path().join("src/nested/mod.rs"), "mod").unwrap();
+
+        let first = list_files(
+            &directory.path().to_string_lossy(),
+            None,
+            1,
+            true,
+            Some("*.rs"),
+            3,
+        )
+        .unwrap();
+        assert_eq!(first["entries"][0]["name"], "src/lib.rs");
+        assert_eq!(first["next_cursor"], "src/lib.rs");
+        assert_eq!(first["truncated"], true);
+
+        let second = list_files(
+            &directory.path().to_string_lossy(),
+            Some("src/lib.rs"),
+            10,
+            true,
+            Some("*.rs"),
+            3,
+        )
+        .unwrap();
+        assert_eq!(second["entries"][0]["name"], "src/nested/mod.rs");
+        assert_eq!(second["truncated"], false);
+    }
+
+    #[test]
+    fn list_files_respects_maximum_depth() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("one/two")).unwrap();
+        fs::write(directory.path().join("one/top.txt"), "top").unwrap();
+        fs::write(directory.path().join("one/two/deep.txt"), "deep").unwrap();
+
+        let result = list_files(
+            &directory.path().to_string_lossy(),
+            None,
+            100,
+            true,
+            None,
+            2,
+        )
+        .unwrap();
+        let names = result["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"one/top.txt"));
+        assert!(!names.contains(&"one/two/deep.txt"));
     }
 
     #[test]
