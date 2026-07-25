@@ -192,7 +192,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-unknown-linux-musl
 cargo check --target aarch64-unknown-linux-musl
-cargo check --target armv7-unknown-linux-musleabi
+cargo check --target armv7-unknown-linux-musleabihf
 ```
 
 测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。

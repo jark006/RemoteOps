@@ -65,7 +65,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-unknown-linux-musl
 cargo check -p remote-ops-agent --target aarch64-unknown-linux-musl
-cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabi
+cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabihf
 ```
 
 涉及发布产物时，再执行对应目标的 release build 或 `cargo zigbuild`。
