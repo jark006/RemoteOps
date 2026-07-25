@@ -80,7 +80,7 @@ proxy 参数：
 
 > 用户： 使用 remote-ops 连接到 192.168.43.106 看看远端设备状况。
 
-> AI：好的。。。
+> 用户： 新增XX功能/优化XX相关逻辑/优化XX的性能，你要自行完成代码编辑、编译，通过 remote-ops 连接到 192.168.43.106 目标平台进行部署、运行及调试。
 
 
 ## 🛠️ MCP 工具
@@ -135,13 +135,13 @@ target/release/remote-ops-agent
 可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
 
 ```sh
-# 在 Win 端开发时安装 zigbuild
+# 在 Win 端开发时安装 zig
 winget install zig.zig
 
-# 在 Ubuntu 端开发时安装 zigbuild 
+# 在 Ubuntu 端开发时安装 zig
 sudo snap install zig --classic --beta
 
-# 安装所需工具链
+# 安装 zigbuild 及相关工具链
 cargo install --locked cargo-zigbuild
 rustup target add armv7-unknown-linux-musleabihf
 rustup target add aarch64-unknown-linux-musl
