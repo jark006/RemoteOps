@@ -23,6 +23,10 @@ pub fn dispatch(operation: &str, arguments: Value) -> AgentResult<Value> {
             let args: WriteTextArgs = decode(arguments)?;
             tools::files::write_text(&args.path, &args.content)
         }
+        "apply_patch" => {
+            let args: ApplyPatchArgs = decode(arguments)?;
+            tools::files::apply_patch(&args.path, &args.patch, args.expected_sha256.as_deref())
+        }
         "ls" => {
             let args: ListArgs = decode(arguments)?;
             tools::files::list_dir(&args.path, args.cursor.as_deref(), args.limit)
@@ -133,6 +137,14 @@ struct WriteTextArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ApplyPatchArgs {
+    path: String,
+    patch: String,
+    expected_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListArgs {
     path: String,
     cursor: Option<String>,
@@ -228,5 +240,15 @@ mod tests {
         dispatch("write_text", json!({"path": path, "content": "hello"})).unwrap();
         let result = dispatch("read_text", json!({"path": path})).unwrap();
         assert_eq!(result["text"], "hello");
+    }
+
+    #[test]
+    fn apply_patch_rejects_unknown_arguments() {
+        let error = dispatch(
+            "apply_patch",
+            json!({"path":"file.txt","patch":"invalid","extra":true}),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, "invalid_params");
     }
 }

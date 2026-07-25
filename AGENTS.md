@@ -21,14 +21,15 @@
 
 ## 工具契约
 
-proxy 暴露 17 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
+proxy 暴露 18 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
 
-- 兼容工具：`read_text`、`tail_text`、`write_text`、`ls`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
+- 兼容工具：`read_text`、`tail_text`、`write_text`、`apply_patch`、`ls`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
 - 进程工具：`pkill`。
 - 传输工具：`upload_file`、`download_file`。
 - proxy 本地管理工具：`remote_status`、`set_remote`。前者被动查询当前地址和缓存连接状态；后者可单独设置 IPv4 或端口，配置仅在当前进程内生效。
 - `upload_file` 的 `local_path` 和 `download_file` 的 `local_path` 均属于 proxy 所在 PC。
 - 单文件默认上限 4 GiB，chunk 上限 64 KiB；控制帧上限 2 MiB。
+- `apply_patch` 仅更新一个已存在的普通 UTF-8 文本文件，补丁路径必须与请求路径完全一致；补丁最大 256 KiB，目标文件最大 16 MiB，最多 128 个 hunk，不支持创建、删除、重命名或无上下文纯插入。旧侧上下文必须唯一匹配，可用 `expected_sha256` 检测冲突；整个补丁成功前不得修改目标，并保留 BOM、原有行尾和末尾换行状态。
 - 文件传输必须校验长度和 SHA-256，成功前使用同目录临时文件，失败时不得留下目标半文件。
 - 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒。
 

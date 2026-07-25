@@ -113,7 +113,7 @@ fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
         .collect();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 17);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 18);
     assert_eq!(
         lines[2]["result"]["structuredContent"]["address"],
         "192.168.43.106:8022"
@@ -185,6 +185,63 @@ fn agent_answers_internal_health_checks_without_exposing_an_mcp_tool() {
         assert_eq!(
             response.result.unwrap()["protocol_version"],
             PROTOCOL_VERSION
+        );
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn context_checked_patch_is_applied_over_the_remote_protocol() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("remote.txt");
+    let path_string = path.to_string_lossy().into_owned();
+    fs::write(&path, "name = old\nenabled = true\n").unwrap();
+
+    {
+        let mut client = RemoteClient::new(
+            address.to_string().parse().unwrap(),
+            Duration::from_secs(5),
+            DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let before = client
+            .call("file_hash", json!({"path": path_string}))
+            .unwrap()["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {path_string}\n@@\n-name = old\n+name = new\n enabled = true\n*** End Patch"
+        );
+        let result = client
+            .call(
+                "apply_patch",
+                json!({"path":path_string,"patch":patch,"expected_sha256":before}),
+            )
+            .unwrap();
+        assert_eq!(result["hunks_applied"], 1);
+        assert_eq!(result["sha256_before"], before);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = new\nenabled = true\n"
+        );
+
+        let stale = client
+            .call(
+                "apply_patch",
+                json!({"path":path_string,"patch":patch,"expected_sha256":before}),
+            )
+            .unwrap_err();
+        assert_eq!(stale.kind, "invalid_params");
+        assert!(stale.message.contains("does not match"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "name = new\nenabled = true\n"
         );
     }
     server.join().unwrap();

@@ -90,6 +90,7 @@ proxy 参数：
 | `read_text` | `path`, `offset?`, `max_bytes?` | 有界读取远端文本，最大 1 MiB。 |
 | `tail_text` | `path`, `lines?`, `max_bytes?` | 有界读取文件尾，最多 10,000 行或 1 MiB。 |
 | `write_text` | `path`, `content` | 原子写入远端文本。 |
+| `apply_patch` | `path`, `patch`, `expected_sha256?` | 对单个远端 UTF-8 文本文件原子应用上下文补丁。 |
 | `ls` | `path`, `cursor?`, `limit?` | 排序并分页列出远端目录。 |
 | `stat` | `path` | 不跟随符号链接读取元数据。 |
 | `file_hash` | `path`, `max_bytes?` | 计算最大 64 MiB 文件的 SHA-256。 |
@@ -107,10 +108,25 @@ proxy 参数：
 
 `overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
 
+`apply_patch` 只支持更新已存在的普通文件，`patch` 最大 256 KiB，目标文件最大 16 MiB，每次最多 128 个 hunk。补丁中的路径必须与 `path` 完全一致；每个旧文本片段必须唯一匹配，否则不修改文件。可传入当前文件的 `expected_sha256` 防止覆盖并发修改。格式如下：
+
+```text
+*** Begin Patch
+*** Update File: /etc/example.conf
+@@
+-old value
++new value
+ unchanged context
+*** End Patch
+```
+
+补丁保留 UTF-8 BOM、原有行尾和末尾换行状态；新增行沿用文件现有的 LF 或 CRLF。首版不支持创建、删除或重命名文件，也不支持无上下文的纯插入 hunk。
+
 ⚠️ 被控端 Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。
 
 ## 🔒 传输协议和安全边界
 
+- 当前远端协议版本为 2；proxy 与 agent 版本不一致时握手失败，不进行兼容降级。
 - TCP 握手使用双方随机 nonce 和内置值 `JARK006_PSK` 派生会话密钥。
 - 帧头、请求 ID、序号和 payload 均受 HMAC 保护，用于避免本地网络中的误连接和传输损坏。
 - 控制帧最大 2 MiB，二进制 chunk 固定上限 64 KiB。

@@ -1,4 +1,6 @@
-use remote_ops_protocol::PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION;
+use remote_ops_protocol::{
+    APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::net::Ipv4Addr;
@@ -85,6 +87,9 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
             .and_then(|args| client.set_remote(args.ip, args.port)),
         "pkill" => decode_transfer::<PkillArgs>(&arguments)
             .and_then(validate_pkill_args)
+            .and_then(|_| client.call(name, arguments)),
+        "apply_patch" => decode_transfer::<ApplyPatchArgs>(&arguments)
+            .and_then(validate_apply_patch_args)
             .and_then(|_| client.call(name, arguments)),
         _ => client.call(name, arguments),
     };
@@ -176,6 +181,56 @@ struct PkillArgs {
     signal: i32,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyPatchArgs {
+    path: String,
+    patch: String,
+    expected_sha256: Option<String>,
+}
+
+fn validate_apply_patch_args(args: ApplyPatchArgs) -> Result<(), ClientError> {
+    let message = if args.path.is_empty() {
+        Some("path must not be empty")
+    } else if args.path.contains('\0') {
+        Some("path must not contain NUL")
+    } else if args.patch.is_empty() {
+        Some("patch must not be empty")
+    } else if args.patch.len() > APPLY_PATCH_MAX_PATCH_BYTES {
+        Some("patch exceeds 262144 bytes")
+    } else if !valid_patch_envelope(&args.path, &args.patch) {
+        Some("patch must contain matching Begin/Update/End markers and 1..=128 hunks")
+    } else if args.expected_sha256.as_ref().is_some_and(|expected| {
+        expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        Some("expected_sha256 must contain exactly 64 hexadecimal characters")
+    } else {
+        None
+    };
+    match message {
+        Some(message) => Err(ClientError {
+            kind: "invalid_params".to_string(),
+            message: message.to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn valid_patch_envelope(path: &str, patch: &str) -> bool {
+    let lines: Vec<&str> = patch
+        .lines()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let declared_path = lines
+        .get(1)
+        .and_then(|line| line.strip_prefix("*** Update File: "));
+    let hunks = lines.iter().filter(|line| **line == "@@").count();
+    lines.first() == Some(&"*** Begin Patch")
+        && lines.last() == Some(&"*** End Patch")
+        && declared_path == Some(path)
+        && (1..=APPLY_PATCH_MAX_HUNKS).contains(&hunks)
+}
+
 fn validate_pkill_args(args: PkillArgs) -> Result<(), ClientError> {
     let message = if args.name.is_empty() {
         Some("name must not be empty")
@@ -202,6 +257,7 @@ pub fn tool_names() -> &'static [&'static str] {
         "read_text",
         "tail_text",
         "write_text",
+        "apply_patch",
         "ls",
         "stat",
         "file_hash",
@@ -263,6 +319,29 @@ pub fn tool_definitions() -> Vec<Value> {
                 ("content", string_prop("Text content")),
             ]),
             &["path", "content"],
+            (false, true, true),
+        ),
+        tool(
+            "apply_patch",
+            "Apply text patch",
+            "Atomically apply a context-checked patch to one remote UTF-8 text file",
+            props(&[
+                ("path", string_prop("Remote file path")),
+                (
+                    "patch",
+                    json!({
+                        "type":"string",
+                        "minLength":1,
+                        "maxLength":APPLY_PATCH_MAX_PATCH_BYTES,
+                        "description":"Patch format: *** Begin Patch\\n*** Update File: PATH\\n@@\\n-old\\n+new\\n unchanged context\\n*** End Patch"
+                    }),
+                ),
+                (
+                    "expected_sha256",
+                    json!({"type":"string","pattern":"^[0-9A-Fa-f]{64}$","description":"Optional SHA-256 required to match the current file"}),
+                ),
+            ]),
+            &["path", "patch"],
             (false, true, true),
         ),
         tool(
@@ -535,6 +614,22 @@ fn output_schema(name: &str) -> Value {
             json!({"bytes_written":{"type":"integer","minimum":0}}),
             &["bytes_written"],
         ),
+        "apply_patch" => strict_output(
+            json!({
+                "bytes_before":{"type":"integer","minimum":0},
+                "bytes_after":{"type":"integer","minimum":0},
+                "hunks_applied":{"type":"integer","minimum":1,"maximum":APPLY_PATCH_MAX_HUNKS},
+                "sha256_before":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                "sha256_after":{"type":"string","pattern":"^[0-9a-f]{64}$"}
+            }),
+            &[
+                "bytes_before",
+                "bytes_after",
+                "hunks_applied",
+                "sha256_before",
+                "sha256_after",
+            ],
+        ),
         "ls" => strict_output(
             json!({
                 "entries":{"type":"array","items":{
@@ -677,7 +772,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         assert_eq!(
             tools
                 .iter()
@@ -771,6 +866,26 @@ mod tests {
                 .contains("at least one must be provided")
         );
         assert_eq!(setter["annotations"]["destructiveHint"], true);
+        let patch = tools
+            .iter()
+            .find(|tool| tool["name"] == "apply_patch")
+            .unwrap();
+        assert_eq!(
+            patch["inputSchema"]["properties"]["patch"]["maxLength"],
+            APPLY_PATCH_MAX_PATCH_BYTES
+        );
+        assert!(
+            patch["inputSchema"]["properties"]["patch"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("*** Update File: PATH")
+        );
+        assert_eq!(patch["inputSchema"]["required"], json!(["path", "patch"]));
+        assert_eq!(
+            patch["outputSchema"]["properties"]["hunks_applied"]["maximum"],
+            APPLY_PATCH_MAX_HUNKS
+        );
+        assert_eq!(patch["annotations"]["idempotentHint"], true);
     }
 
     #[test]
@@ -835,6 +950,33 @@ mod tests {
             let response = call_tool(
                 json!(1),
                 Some(&json!({"name":"pkill","arguments":arguments})),
+                &mut client,
+            );
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    #[test]
+    fn apply_patch_arguments_are_validated_before_connecting() {
+        let mut client = RemoteClient::new(
+            "127.0.0.1:1".parse().unwrap(),
+            std::time::Duration::from_millis(10),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        for arguments in [
+            json!({}),
+            json!({"path":"","patch":"x"}),
+            json!({"path":"has\u{0}nul","patch":"x"}),
+            json!({"path":"file.txt","patch":""}),
+            json!({"path":"file.txt","patch":"invalid"}),
+            json!({"path":"file.txt","patch":"*** Begin Patch\n*** Update File: other.txt\n@@\n-old\n+new\n*** End Patch"}),
+            json!({"path":"file.txt","patch":"x".repeat(APPLY_PATCH_MAX_PATCH_BYTES + 1)}),
+            json!({"path":"file.txt","patch":"x","expected_sha256":"invalid"}),
+            json!({"path":"file.txt","patch":"x","extra":true}),
+        ] {
+            let response = call_tool(
+                json!(1),
+                Some(&json!({"name":"apply_patch","arguments":arguments})),
                 &mut client,
             );
             assert_eq!(response["error"]["code"], -32602);

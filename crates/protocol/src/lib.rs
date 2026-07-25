@@ -8,11 +8,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const BUILTIN_PSK: &[u8] = b"JARK006_PSK";
 pub const DEFAULT_MAX_CONTROL_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const APPLY_PATCH_MAX_PATCH_BYTES: usize = 256 * 1024;
+pub const APPLY_PATCH_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const APPLY_PATCH_MAX_HUNKS: usize = 128;
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
@@ -569,7 +572,7 @@ fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     #[test]
@@ -666,6 +669,33 @@ mod tests {
         );
         assert!(matches!(client, Err(ProtocolError::Authentication)));
         assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn mismatched_protocol_version_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            Session::accept(
+                stream,
+                b"a sufficiently long psk",
+                SessionOptions::agent(),
+                1024,
+            )
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(HELLO_MAGIC).unwrap();
+        stream
+            .write_all(&[PROTOCOL_VERSION.wrapping_sub(1)])
+            .unwrap();
+        stream.write_all(&[0; 32]).unwrap();
+        stream.flush().unwrap();
+
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(ProtocolError::Authentication)
+        ));
     }
 
     #[test]
