@@ -1,5 +1,5 @@
 use std::env;
-use std::net::TcpListener;
+use std::net::{IpAddr, SocketAddr, TcpListener};
 
 use remote_ops_agent::service::handle_connection;
 use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
@@ -18,7 +18,11 @@ fn main() {
         eprintln!("failed to listen on {}: {error}", config.listen);
         std::process::exit(1);
     });
-    eprintln!("remote-ops-agent listening on {}", config.listen);
+    let local_addr = listener.local_addr().unwrap_or_else(|error| {
+        eprintln!("failed to determine listening address: {error}");
+        std::process::exit(1);
+    });
+    print_listening_addresses(local_addr);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -29,6 +33,49 @@ fn main() {
             Err(error) => eprintln!("accept failed: {error}"),
         }
     }
+}
+
+fn print_listening_addresses(bind_addr: SocketAddr) {
+    let interface_ips = if bind_addr.ip().is_unspecified() {
+        match if_addrs::get_if_addrs() {
+            Ok(interfaces) => interfaces
+                .into_iter()
+                .map(|interface| interface.ip())
+                .collect(),
+            Err(error) => {
+                eprintln!("failed to enumerate local IP addresses: {error}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let addresses = listening_addresses(bind_addr, interface_ips);
+    for address in addresses {
+        eprintln!("remote-ops-agent listening on {address}");
+    }
+}
+
+fn listening_addresses<I>(bind_addr: SocketAddr, interface_ips: I) -> Vec<SocketAddr>
+where
+    I: IntoIterator<Item = IpAddr>,
+{
+    if !bind_addr.ip().is_unspecified() {
+        return vec![bind_addr];
+    }
+
+    let is_ipv4 = bind_addr.ip().is_ipv4();
+    let mut addresses: Vec<_> = interface_ips
+        .into_iter()
+        .filter(|ip| ip.is_ipv4() == is_ipv4 && !ip.is_unspecified() && !ip.is_loopback())
+        .map(|ip| SocketAddr::new(ip, bind_addr.port()))
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() {
+        addresses.push(bind_addr);
+    }
+    addresses
 }
 
 fn parse_args() -> Result<Config, String> {
@@ -94,5 +141,33 @@ mod tests {
     #[test]
     fn legacy_timeout_argument_is_rejected() {
         assert!(args(&["--timeout-ms", "1000"]).is_err());
+    }
+
+    #[test]
+    fn explicit_listen_address_is_preserved() {
+        let address: SocketAddr = "127.0.0.1:8022".parse().unwrap();
+        assert_eq!(
+            listening_addresses(address, ["192.168.1.10".parse().unwrap()]),
+            vec![address]
+        );
+    }
+
+    #[test]
+    fn wildcard_listen_address_expands_to_matching_interface_ips() {
+        let address: SocketAddr = "0.0.0.0:8022".parse().unwrap();
+        let interfaces = [
+            "192.168.1.10".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "192.168.1.10".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ];
+        let expected = vec!["192.168.1.10:8022".parse().unwrap()];
+        assert_eq!(listening_addresses(address, interfaces), expected);
+    }
+
+    #[test]
+    fn wildcard_listen_address_has_a_fallback_when_enumeration_is_empty() {
+        let address: SocketAddr = "0.0.0.0:8022".parse().unwrap();
+        assert_eq!(listening_addresses(address, []), vec![address]);
     }
 }
