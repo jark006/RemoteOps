@@ -2,8 +2,12 @@ use globset::Glob;
 use regex::RegexBuilder;
 use remote_ops_protocol::{
     APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, DEFAULT_PROCESS_JOB_TIMEOUT_MS,
-    DEFAULT_PROCESS_OUTPUT_BYTES, DEFAULT_PROCESS_WAIT_MS, MAX_PROCESS_JOB_TIMEOUT_MS,
-    MAX_PROCESS_OUTPUT_BYTES, MAX_PROCESS_WAIT_MS, PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
+    DEFAULT_PROCESS_OUTPUT_BYTES, DEFAULT_PROCESS_WAIT_MS, DEFAULT_REBOOT_DELAY_MS,
+    DEFAULT_REMOTE_PROBE_TIMEOUT_MS, DEFAULT_WAIT_REMOTE_POLL_MS, DEFAULT_WAIT_REMOTE_TIMEOUT_MS,
+    MAX_PROCESS_JOB_TIMEOUT_MS, MAX_PROCESS_OUTPUT_BYTES, MAX_PROCESS_WAIT_MS, MAX_REBOOT_DELAY_MS,
+    MAX_REMOTE_PROBE_TIMEOUT_MS, MAX_WAIT_REMOTE_POLL_MS, MAX_WAIT_REMOTE_TIMEOUT_MS,
+    MIN_REBOOT_DELAY_MS, MIN_REMOTE_PROBE_TIMEOUT_MS, MIN_WAIT_REMOTE_POLL_MS,
+    PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -90,6 +94,35 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
         "remote_status" => decode_transfer::<EmptyArgs>(&arguments).map(|_| client.remote_status()),
         "set_remote" => decode_transfer::<SetRemoteArgs>(&arguments)
             .and_then(|args| client.set_remote(args.ip, args.port)),
+        "agent_info" => {
+            decode_transfer::<EmptyArgs>(&arguments).and_then(|_| client.call(name, arguments))
+        }
+        "remote_probe" => decode_transfer::<RemoteProbeArgs>(&arguments)
+            .and_then(validate_remote_probe_args)
+            .map(|args| client.remote_probe(args.timeout_ms)),
+        "wait_remote" => decode_transfer::<WaitRemoteArgs>(&arguments)
+            .and_then(validate_wait_remote_args)
+            .map(|args| {
+                client.wait_remote(
+                    args.wait_for.as_deref(),
+                    args.timeout_ms,
+                    args.poll_interval_ms,
+                    args.probe_timeout_ms,
+                )
+            }),
+        "reboot" => decode_transfer::<RebootArgs>(&arguments)
+            .and_then(validate_reboot_args)
+            .and_then(|args| client.reboot(args.delay_ms)),
+        "agent_update" => decode_transfer::<AgentUpdateArgs>(&arguments)
+            .and_then(validate_agent_update_args)
+            .and_then(|args| {
+                client.agent_update(
+                    &args.local_path,
+                    args.timeout_ms,
+                    args.poll_interval_ms,
+                    args.probe_timeout_ms,
+                )
+            }),
         "pkill" => decode_transfer::<PkillArgs>(&arguments)
             .and_then(validate_pkill_args)
             .and_then(|_| client.call(name, arguments)),
@@ -207,6 +240,44 @@ struct EmptyArgs {}
 struct SetRemoteArgs {
     ip: Option<Ipv4Addr>,
     port: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteProbeArgs {
+    #[serde(default = "default_remote_probe_timeout")]
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitRemoteArgs {
+    wait_for: Option<String>,
+    #[serde(default = "default_wait_remote_timeout")]
+    timeout_ms: u64,
+    #[serde(default = "default_wait_remote_poll")]
+    poll_interval_ms: u64,
+    #[serde(default = "default_remote_probe_timeout")]
+    probe_timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RebootArgs {
+    #[serde(default = "default_reboot_delay")]
+    delay_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentUpdateArgs {
+    local_path: String,
+    #[serde(default = "default_wait_remote_timeout")]
+    timeout_ms: u64,
+    #[serde(default = "default_wait_remote_poll")]
+    poll_interval_ms: u64,
+    #[serde(default = "default_remote_probe_timeout")]
+    probe_timeout_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +416,95 @@ fn default_process_output_bytes() -> usize {
 
 fn default_process_wait() -> u64 {
     DEFAULT_PROCESS_WAIT_MS
+}
+
+fn default_remote_probe_timeout() -> u64 {
+    DEFAULT_REMOTE_PROBE_TIMEOUT_MS
+}
+
+fn default_wait_remote_timeout() -> u64 {
+    DEFAULT_WAIT_REMOTE_TIMEOUT_MS
+}
+
+fn default_wait_remote_poll() -> u64 {
+    DEFAULT_WAIT_REMOTE_POLL_MS
+}
+
+fn default_reboot_delay() -> u64 {
+    DEFAULT_REBOOT_DELAY_MS
+}
+
+fn validate_remote_probe_args(args: RemoteProbeArgs) -> Result<RemoteProbeArgs, ClientError> {
+    validate_probe_timeout(args.timeout_ms)?;
+    Ok(args)
+}
+
+fn validate_wait_remote_args(args: WaitRemoteArgs) -> Result<WaitRemoteArgs, ClientError> {
+    if args
+        .wait_for
+        .as_deref()
+        .is_some_and(|wait_for| !matches!(wait_for, "online" | "offline" | "offline_then_online"))
+    {
+        return invalid_params("wait_for must be one of online, offline, or offline_then_online");
+    }
+    validate_wait_settings(
+        args.timeout_ms,
+        args.poll_interval_ms,
+        args.probe_timeout_ms,
+    )?;
+    Ok(args)
+}
+
+fn validate_reboot_args(args: RebootArgs) -> Result<RebootArgs, ClientError> {
+    if !(MIN_REBOOT_DELAY_MS..=MAX_REBOOT_DELAY_MS).contains(&args.delay_ms) {
+        return invalid_params(format!(
+            "delay_ms must be in range {MIN_REBOOT_DELAY_MS}..={MAX_REBOOT_DELAY_MS}"
+        ));
+    }
+    Ok(args)
+}
+
+fn validate_agent_update_args(args: AgentUpdateArgs) -> Result<AgentUpdateArgs, ClientError> {
+    if args.local_path.is_empty() {
+        return invalid_params("local_path must not be empty");
+    }
+    if args.local_path.contains('\0') {
+        return invalid_params("local_path must not contain NUL");
+    }
+    validate_wait_settings(
+        args.timeout_ms,
+        args.poll_interval_ms,
+        args.probe_timeout_ms,
+    )?;
+    Ok(args)
+}
+
+fn validate_wait_settings(
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+    probe_timeout_ms: u64,
+) -> Result<(), ClientError> {
+    if timeout_ms == 0 || timeout_ms > MAX_WAIT_REMOTE_TIMEOUT_MS {
+        return invalid_params(format!(
+            "timeout_ms must be in range 1..={MAX_WAIT_REMOTE_TIMEOUT_MS}"
+        ));
+    }
+    if !(MIN_WAIT_REMOTE_POLL_MS..=MAX_WAIT_REMOTE_POLL_MS).contains(&poll_interval_ms) {
+        return invalid_params(format!(
+            "poll_interval_ms must be in range {MIN_WAIT_REMOTE_POLL_MS}..={MAX_WAIT_REMOTE_POLL_MS}"
+        ));
+    }
+    validate_probe_timeout(probe_timeout_ms)
+}
+
+fn validate_probe_timeout(timeout_ms: u64) -> Result<(), ClientError> {
+    if !(MIN_REMOTE_PROBE_TIMEOUT_MS..=MAX_REMOTE_PROBE_TIMEOUT_MS).contains(&timeout_ms) {
+        invalid_params(format!(
+            "probe timeout must be in range {MIN_REMOTE_PROBE_TIMEOUT_MS}..={MAX_REMOTE_PROBE_TIMEOUT_MS}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_apply_patch_args(args: ApplyPatchArgs) -> Result<(), ClientError> {
@@ -618,6 +778,11 @@ pub fn tool_names() -> &'static [&'static str] {
         "download_file",
         "remote_status",
         "set_remote",
+        "agent_info",
+        "remote_probe",
+        "wait_remote",
+        "reboot",
+        "agent_update",
     ]
 }
 
@@ -1060,6 +1225,130 @@ pub fn tool_definitions() -> Vec<Value> {
             &[],
             (false, true, true),
         ),
+        tool(
+            "agent_info",
+            "Agent information",
+            "Read the remote Agent version, build, runtime identity, capabilities, and limits",
+            props(&[]),
+            &[],
+            (true, false, true),
+        ),
+        tool(
+            "remote_probe",
+            "Probe remote",
+            "Actively connect or health-check the configured remote and return latency and Agent information",
+            props(&[(
+                "timeout_ms",
+                integer_prop_default(
+                    MIN_REMOTE_PROBE_TIMEOUT_MS,
+                    Some(MAX_REMOTE_PROBE_TIMEOUT_MS),
+                    DEFAULT_REMOTE_PROBE_TIMEOUT_MS,
+                    "Maximum time for this active probe",
+                ),
+            )]),
+            &[],
+            (true, false, true),
+        ),
+        tool(
+            "wait_remote",
+            "Wait for remote",
+            "Wait for the remote to become offline, online, or cycle offline then online with a healthy Agent",
+            props(&[
+                (
+                    "wait_for",
+                    json!({
+                        "type":"string",
+                        "enum":["online","offline","offline_then_online"],
+                        "description":"Condition to wait for; defaults to offline_then_online while rebooting/updating, otherwise online"
+                    }),
+                ),
+                (
+                    "timeout_ms",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_WAIT_REMOTE_TIMEOUT_MS),
+                        DEFAULT_WAIT_REMOTE_TIMEOUT_MS,
+                        "Overall bounded wait time",
+                    ),
+                ),
+                (
+                    "poll_interval_ms",
+                    integer_prop_default(
+                        MIN_WAIT_REMOTE_POLL_MS,
+                        Some(MAX_WAIT_REMOTE_POLL_MS),
+                        DEFAULT_WAIT_REMOTE_POLL_MS,
+                        "Delay between probes",
+                    ),
+                ),
+                (
+                    "probe_timeout_ms",
+                    integer_prop_default(
+                        MIN_REMOTE_PROBE_TIMEOUT_MS,
+                        Some(MAX_REMOTE_PROBE_TIMEOUT_MS),
+                        DEFAULT_REMOTE_PROBE_TIMEOUT_MS,
+                        "Maximum time for each active probe",
+                    ),
+                ),
+            ]),
+            &[],
+            (true, false, true),
+        ),
+        tool(
+            "reboot",
+            "Reboot remote",
+            "Request a delayed device reboot with expected-disconnect lifecycle semantics",
+            props(&[(
+                "delay_ms",
+                integer_prop_default(
+                    MIN_REBOOT_DELAY_MS,
+                    Some(MAX_REBOOT_DELAY_MS),
+                    DEFAULT_REBOOT_DELAY_MS,
+                    "Delay before the Agent triggers the reboot",
+                ),
+            )]),
+            &[],
+            (false, true, false),
+        ),
+        tool(
+            "agent_update",
+            "Update Agent",
+            "Stage, verify, atomically replace, restart, and verify the remote Agent with automatic rollback",
+            props(&[
+                (
+                    "local_path",
+                    string_prop("Candidate Agent binary on the proxy PC"),
+                ),
+                (
+                    "timeout_ms",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_WAIT_REMOTE_TIMEOUT_MS),
+                        DEFAULT_WAIT_REMOTE_TIMEOUT_MS,
+                        "Maximum time to wait for restart or rollback",
+                    ),
+                ),
+                (
+                    "poll_interval_ms",
+                    integer_prop_default(
+                        MIN_WAIT_REMOTE_POLL_MS,
+                        Some(MAX_WAIT_REMOTE_POLL_MS),
+                        DEFAULT_WAIT_REMOTE_POLL_MS,
+                        "Delay between restart probes",
+                    ),
+                ),
+                (
+                    "probe_timeout_ms",
+                    integer_prop_default(
+                        MIN_REMOTE_PROBE_TIMEOUT_MS,
+                        Some(MAX_REMOTE_PROBE_TIMEOUT_MS),
+                        DEFAULT_REMOTE_PROBE_TIMEOUT_MS,
+                        "Maximum time for each restart probe",
+                    ),
+                ),
+            ]),
+            &["local_path"],
+            (false, true, false),
+        ),
     ]
 }
 
@@ -1082,7 +1371,7 @@ fn tool(
         "name": name, "title": title, "description": description,
         "inputSchema": input_schema,
         "outputSchema": output_schema(name),
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start")}
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start" | "reboot" | "agent_update")}
     })
 }
 
@@ -1344,6 +1633,92 @@ fn output_schema(name: &str) -> Value {
                 "temperatures",
             ],
         ),
+        "agent_info" => agent_info_output_schema(),
+        "remote_probe" => remote_probe_output_schema(),
+        "wait_remote" => strict_output(
+            json!({
+                "address":{"type":"string"},
+                "wait_for":{"type":"string","enum":["online","offline","offline_then_online"]},
+                "reached":{"type":"boolean"},
+                "timed_out":{"type":"boolean"},
+                "observed_offline":{"type":"boolean"},
+                "attempts":{"type":"integer","minimum":0},
+                "elapsed_ms":{"type":"integer","minimum":0},
+                "connected":{"type":"boolean"},
+                "connection_state":{"type":"string","enum":["cached","disconnected"]},
+                "lifecycle_state":{"type":"string","enum":["ready","rebooting","updating"]},
+                "last_probe":{"type":["object","null"]},
+                "agent_info":{"type":["object","null"]}
+            }),
+            &[
+                "address",
+                "wait_for",
+                "reached",
+                "timed_out",
+                "observed_offline",
+                "attempts",
+                "elapsed_ms",
+                "connected",
+                "connection_state",
+                "lifecycle_state",
+                "last_probe",
+                "agent_info",
+            ],
+        ),
+        "reboot" => strict_output(
+            json!({
+                "accepted":{"type":"boolean","const":true},
+                "acknowledged":{"type":"boolean"},
+                "disconnect_observed":{"type":"boolean"},
+                "requested_at_ms":{"type":"integer","minimum":0},
+                "delay_ms":{"type":"integer","minimum":MIN_REBOOT_DELAY_MS,"maximum":MAX_REBOOT_DELAY_MS},
+                "previous_instance_id":{"type":["string","null"]},
+                "lifecycle_state":{"type":"string","const":"rebooting"},
+                "agent_response":{"type":["object","null"]}
+            }),
+            &[
+                "accepted",
+                "acknowledged",
+                "disconnect_observed",
+                "requested_at_ms",
+                "delay_ms",
+                "previous_instance_id",
+                "lifecycle_state",
+                "agent_response",
+            ],
+        ),
+        "agent_update" => strict_output(
+            json!({
+                "status":{"type":"string","enum":["updated","rolled_back","timed_out","unconfirmed"]},
+                "updated":{"type":"boolean"},
+                "rolled_back":{"type":"boolean"},
+                "timed_out":{"type":"boolean"},
+                "restart_acknowledged":{"type":"boolean"},
+                "previous_agent":{"type":"object"},
+                "candidate":{"type":["object","null"]},
+                "current_agent":{"type":["object","null"]},
+                "staging_path":{"type":"string"},
+                "bytes_transferred":{"type":"integer","minimum":0},
+                "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                "wait":{"type":"object"},
+                "elapsed_ms":{"type":"integer","minimum":0}
+            }),
+            &[
+                "status",
+                "updated",
+                "rolled_back",
+                "timed_out",
+                "restart_acknowledged",
+                "previous_agent",
+                "candidate",
+                "current_agent",
+                "staging_path",
+                "bytes_transferred",
+                "sha256",
+                "wait",
+                "elapsed_ms",
+            ],
+        ),
         "upload_file" | "download_file" => strict_output(
             json!({
                 "bytes_transferred":{"type":"integer","minimum":0},
@@ -1356,12 +1731,164 @@ fn output_schema(name: &str) -> Value {
                 "ip":{"type":"string","description":"Configured remote IPv4 address"},
                 "port":{"type":"integer","minimum":1,"maximum":65535},
                 "address":{"type":"string","description":"Configured remote IPv4:PORT"},
-                "connected":{"type":"boolean","description":"Whether the proxy holds an authenticated session; no active probe is performed"}
+                "connected":{"type":"boolean","description":"Whether the proxy holds an authenticated session; no active probe is performed"},
+                "connection_state":{"type":"string","enum":["cached","disconnected"]},
+                "lifecycle_state":{"type":"string","enum":["ready","rebooting","updating"]},
+                "last_success_at_ms":{"type":["integer","null"],"minimum":0},
+                "last_error":{"type":["object","null"]},
+                "last_probe":{"type":["object","null"]},
+                "agent_info":{"type":["object","null"]}
             }),
-            &["ip", "port", "address", "connected"],
+            &[
+                "ip",
+                "port",
+                "address",
+                "connected",
+                "connection_state",
+                "lifecycle_state",
+                "last_success_at_ms",
+                "last_error",
+                "last_probe",
+                "agent_info",
+            ],
         ),
         _ => json!({"type":"object"}),
     }
+}
+
+fn agent_info_output_schema() -> Value {
+    strict_output(
+        json!({
+            "name":{"type":"string","const":"remote-ops-agent"},
+            "version":{"type":"string"},
+            "protocol_version":{"type":"integer","minimum":1},
+            "build":{
+                "type":"object",
+                "properties":{
+                    "target":{"type":"string"},
+                    "profile":{"type":"string"},
+                    "git_revision":{"type":"string"}
+                },
+                "required":["target","profile","git_revision"],
+                "additionalProperties":false
+            },
+            "runtime":{
+                "type":"object",
+                "properties":{
+                    "instance_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},
+                    "pid":{"type":"integer","minimum":1},
+                    "started_at_ms":{"type":"integer","minimum":0},
+                    "uptime_ms":{"type":"integer","minimum":0}
+                },
+                "required":["instance_id","pid","started_at_ms","uptime_ms"],
+                "additionalProperties":false
+            },
+            "platform":{
+                "type":"object",
+                "properties":{
+                    "os":{"type":"string"},
+                    "arch":{"type":"string"},
+                    "family":{"type":"string"}
+                },
+                "required":["os","arch","family"],
+                "additionalProperties":false
+            },
+            "supported_operations":{"type":"array","items":{"type":"string"}},
+            "capabilities":{
+                "type":"object",
+                "properties":{
+                    "background_processes":{"type":"boolean"},
+                    "incremental_output":{"type":"boolean"},
+                    "active_probe":{"type":"boolean"},
+                    "wait_remote":{"type":"boolean"},
+                    "reboot":{"type":"boolean"},
+                    "self_update":{"type":"boolean"}
+                },
+                "required":[
+                    "background_processes","incremental_output","active_probe","wait_remote",
+                    "reboot","self_update"
+                ],
+                "additionalProperties":false
+            },
+            "limits":{
+                "type":"object",
+                "properties":{
+                    "max_control_bytes":{"type":"integer","minimum":1},
+                    "chunk_bytes":{"type":"integer","minimum":1},
+                    "max_transfer_bytes":{"type":"integer","minimum":1},
+                    "max_process_jobs":{"type":"integer","minimum":1},
+                    "default_process_timeout_ms":{"type":"integer","minimum":1},
+                    "max_process_timeout_ms":{"type":"integer","minimum":1},
+                    "process_output_buffer_bytes":{"type":"integer","minimum":1},
+                    "default_process_output_bytes":{"type":"integer","minimum":1},
+                    "max_process_output_bytes":{"type":"integer","minimum":1},
+                    "default_process_wait_ms":{"type":"integer","minimum":0},
+                    "max_process_wait_ms":{"type":"integer","minimum":0},
+                    "apply_patch_max_patch_bytes":{"type":"integer","minimum":1},
+                    "apply_patch_max_file_bytes":{"type":"integer","minimum":1},
+                    "apply_patch_max_hunks":{"type":"integer","minimum":1}
+                },
+                "required":[
+                    "max_control_bytes","chunk_bytes","max_transfer_bytes","max_process_jobs",
+                    "default_process_timeout_ms","max_process_timeout_ms",
+                    "process_output_buffer_bytes","default_process_output_bytes",
+                    "max_process_output_bytes","default_process_wait_ms","max_process_wait_ms",
+                    "apply_patch_max_patch_bytes","apply_patch_max_file_bytes",
+                    "apply_patch_max_hunks"
+                ],
+                "additionalProperties":false
+            },
+            "update":{
+                "type":"object",
+                "properties":{
+                    "executable_path":{"type":["string","null"]},
+                    "staging_path":{"type":["string","null"]},
+                    "self_check_timeout_ms":{"type":"integer","minimum":1}
+                },
+                "required":["executable_path","staging_path","self_check_timeout_ms"],
+                "additionalProperties":false
+            }
+        }),
+        &[
+            "name",
+            "version",
+            "protocol_version",
+            "build",
+            "runtime",
+            "platform",
+            "supported_operations",
+            "capabilities",
+            "limits",
+            "update",
+        ],
+    )
+}
+
+fn remote_probe_output_schema() -> Value {
+    strict_output(
+        json!({
+            "address":{"type":"string"},
+            "reachable":{"type":"boolean"},
+            "connected":{"type":"boolean"},
+            "connection_reused":{"type":"boolean"},
+            "latency_ms":{"type":"integer","minimum":0},
+            "probed_at_ms":{"type":"integer","minimum":0},
+            "lifecycle_state":{"type":"string","enum":["ready","rebooting","updating"]},
+            "agent_info":{"type":["object","null"]},
+            "error":{"type":["object","null"]}
+        }),
+        &[
+            "address",
+            "reachable",
+            "connected",
+            "connection_reused",
+            "latency_ms",
+            "probed_at_ms",
+            "lifecycle_state",
+            "agent_info",
+            "error",
+        ],
+    )
 }
 
 fn process_status_output(extra: Value, extra_required: &[&str]) -> Value {
@@ -1412,7 +1939,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 30);
         assert_eq!(
             tools
                 .iter()

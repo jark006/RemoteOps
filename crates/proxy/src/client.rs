@@ -2,13 +2,14 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use remote_ops_protocol::{
-    BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_HEALTH_CHECK_AFTER, DEFAULT_HEALTH_CHECK_TIMEOUT,
-    DEFAULT_MAX_CONTROL_BYTES, DEFAULT_TRANSFER_IDLE_TIMEOUT, DownloadRequest, FrameType,
-    INTERNAL_PING_OPERATION, RemoteError, RemoteRequest, RemoteResponse, Session, SessionOptions,
-    TransferEnd, TransferMetadata, UploadRequest,
+    BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_CONNECT_TIMEOUT, DEFAULT_HEALTH_CHECK_AFTER,
+    DEFAULT_HEALTH_CHECK_TIMEOUT, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_TRANSFER_IDLE_TIMEOUT,
+    DownloadRequest, FrameType, INTERNAL_PING_OPERATION, RemoteError, RemoteRequest,
+    RemoteResponse, Session, SessionOptions, TransferEnd, TransferMetadata, UploadRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -46,6 +47,39 @@ impl From<RemoteError> for ClientError {
     }
 }
 
+#[derive(Debug, Clone)]
+enum LifecycleState {
+    Ready,
+    Rebooting {
+        previous_instance_id: Option<String>,
+    },
+    Updating {
+        previous_instance_id: Option<String>,
+    },
+}
+
+impl LifecycleState {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Rebooting { .. } => "rebooting",
+            Self::Updating { .. } => "updating",
+        }
+    }
+
+    fn previous_instance_id(&self) -> Option<&str> {
+        match self {
+            Self::Ready => None,
+            Self::Rebooting {
+                previous_instance_id,
+            }
+            | Self::Updating {
+                previous_instance_id,
+            } => previous_instance_id.as_deref(),
+        }
+    }
+}
+
 pub struct RemoteClient {
     remote: SocketAddrV4,
     timeout: Duration,
@@ -54,6 +88,11 @@ pub struct RemoteClient {
     next_request_id: u64,
     last_activity: Option<Instant>,
     health_check_after: Duration,
+    last_success_at_ms: Option<u64>,
+    last_error: Option<Value>,
+    last_probe: Option<Value>,
+    last_agent_info: Option<Value>,
+    lifecycle_state: LifecycleState,
 }
 
 impl RemoteClient {
@@ -66,6 +105,11 @@ impl RemoteClient {
             next_request_id: 1,
             last_activity: None,
             health_check_after: DEFAULT_HEALTH_CHECK_AFTER,
+            last_success_at_ms: None,
+            last_error: None,
+            last_probe: None,
+            last_agent_info: None,
+            lifecycle_state: LifecycleState::Ready,
         }
     }
 
@@ -75,6 +119,12 @@ impl RemoteClient {
             "port": self.remote.port(),
             "address": self.remote.to_string(),
             "connected": self.session.is_some(),
+            "connection_state": if self.session.is_some() { "cached" } else { "disconnected" },
+            "lifecycle_state": self.lifecycle_state.name(),
+            "last_success_at_ms": self.last_success_at_ms,
+            "last_error": self.last_error,
+            "last_probe": self.last_probe,
+            "agent_info": self.last_agent_info,
         })
     }
 
@@ -103,6 +153,11 @@ impl RemoteClient {
             self.remote = remote;
             self.session = None;
             self.last_activity = None;
+            self.last_success_at_ms = None;
+            self.last_error = None;
+            self.last_probe = None;
+            self.last_agent_info = None;
+            self.lifecycle_state = LifecycleState::Ready;
         }
         Ok(self.remote_status())
     }
@@ -121,7 +176,243 @@ impl RemoteClient {
                 .map_err(protocol_error)?;
             receive_remote_response(session, request_id)
         })();
-        self.finish_operation(result)
+        let result = self.finish_operation(result);
+        if operation == "agent_info"
+            && let Ok(agent_info) = &result
+        {
+            self.last_agent_info = Some(agent_info.clone());
+        }
+        result
+    }
+
+    pub fn remote_probe(&mut self, timeout_ms: u64) -> Value {
+        self.probe(Duration::from_millis(timeout_ms))
+    }
+
+    pub fn wait_remote(
+        &mut self,
+        wait_for: Option<&str>,
+        timeout_ms: u64,
+        poll_interval_ms: u64,
+        probe_timeout_ms: u64,
+    ) -> Value {
+        let effective_wait = wait_for.unwrap_or(match self.lifecycle_state {
+            LifecycleState::Ready => "online",
+            LifecycleState::Rebooting { .. } | LifecycleState::Updating { .. } => {
+                "offline_then_online"
+            }
+        });
+        let previous_instance_id = self
+            .lifecycle_state
+            .previous_instance_id()
+            .map(str::to_string);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(timeout_ms);
+        let mut attempts = 0u64;
+        let mut observed_offline = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempt_timeout = Duration::from_millis(probe_timeout_ms).min(remaining);
+            if attempt_timeout.is_zero() {
+                return self.wait_remote_result(
+                    effective_wait,
+                    false,
+                    true,
+                    observed_offline,
+                    attempts,
+                    started,
+                );
+            }
+            attempts += 1;
+            let probe = self.probe(attempt_timeout);
+            let reachable = probe["reachable"].as_bool().unwrap_or(false);
+            if !reachable {
+                observed_offline = true;
+            }
+            let current_instance_id = probe["agent_info"]["runtime"]["instance_id"].as_str();
+            let instance_changed = previous_instance_id
+                .as_deref()
+                .zip(current_instance_id)
+                .is_some_and(|(previous, current)| previous != current);
+            let reached = match effective_wait {
+                "online" => reachable,
+                "offline" => !reachable,
+                "offline_then_online" => reachable && (observed_offline || instance_changed),
+                _ => false,
+            };
+            if reached {
+                if effective_wait == "offline_then_online"
+                    || instance_changed
+                    || matches!(self.lifecycle_state, LifecycleState::Ready)
+                {
+                    self.lifecycle_state = LifecycleState::Ready;
+                }
+                return self.wait_remote_result(
+                    effective_wait,
+                    true,
+                    false,
+                    observed_offline,
+                    attempts,
+                    started,
+                );
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.wait_remote_result(
+                    effective_wait,
+                    false,
+                    true,
+                    observed_offline,
+                    attempts,
+                    started,
+                );
+            }
+            thread::sleep(Duration::from_millis(poll_interval_ms).min(remaining));
+        }
+    }
+
+    pub fn reboot(&mut self, delay_ms: u64) -> Result<Value, ClientError> {
+        let requested_at_ms = unix_time_ms();
+        let fallback_instance = self
+            .last_agent_info
+            .as_ref()
+            .and_then(agent_instance_id)
+            .map(str::to_string);
+        let response = self.call("reboot", json!({"delay_ms": delay_ms}));
+        let (acknowledged, disconnect_observed, agent_response, previous_instance_id) =
+            match response {
+                Ok(response) => {
+                    let previous = response["previous_instance_id"]
+                        .as_str()
+                        .map(str::to_string)
+                        .or(fallback_instance);
+                    if let Some(agent) = response.get("agent") {
+                        self.last_agent_info = Some(agent.clone());
+                    }
+                    (true, false, Some(response), previous)
+                }
+                Err(error) if error.kind == "connection_uncertain" => {
+                    (false, true, None, fallback_instance)
+                }
+                Err(error) => return Err(error),
+            };
+        self.session = None;
+        self.last_activity = None;
+        self.lifecycle_state = LifecycleState::Rebooting {
+            previous_instance_id: previous_instance_id.clone(),
+        };
+        Ok(json!({
+            "accepted": true,
+            "acknowledged": acknowledged,
+            "disconnect_observed": disconnect_observed,
+            "requested_at_ms": requested_at_ms,
+            "delay_ms": delay_ms,
+            "previous_instance_id": previous_instance_id,
+            "lifecycle_state": self.lifecycle_state.name(),
+            "agent_response": agent_response
+        }))
+    }
+
+    pub fn agent_update(
+        &mut self,
+        local_path: &str,
+        timeout_ms: u64,
+        poll_interval_ms: u64,
+        probe_timeout_ms: u64,
+    ) -> Result<Value, ClientError> {
+        let started = Instant::now();
+        let probe = self.remote_probe(probe_timeout_ms);
+        if !probe["reachable"].as_bool().unwrap_or(false) {
+            return Err(probe["error"]
+                .as_object()
+                .map(|error| {
+                    ClientError::local(
+                        error
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("connection_unavailable"),
+                        error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("remote probe failed"),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    ClientError::local("connection_unavailable", "remote probe failed")
+                }));
+        }
+        let previous_agent = probe["agent_info"].clone();
+        let previous_instance_id = agent_instance_id(&previous_agent).map(str::to_string);
+        let staging_path = previous_agent["update"]["staging_path"]
+            .as_str()
+            .ok_or_else(|| {
+                ClientError::local(
+                    "unsupported",
+                    "remote agent did not provide an update staging path",
+                )
+            })?
+            .to_string();
+        if previous_agent["capabilities"]["self_update"] != true {
+            return Err(ClientError::local(
+                "unsupported",
+                "remote agent does not support self-update",
+            ));
+        }
+        let upload = self.upload(local_path, &staging_path, true)?;
+        let sha256 = upload["sha256"]
+            .as_str()
+            .ok_or_else(|| ClientError::local("protocol", "upload response omitted SHA-256"))?
+            .to_string();
+        let prepare = self.call("agent_update_prepare", json!({"expected_sha256": sha256}));
+        let (restart_acknowledged, prepared) = match prepare {
+            Ok(value) => (true, Some(value)),
+            Err(error) if error.kind == "connection_uncertain" => (false, None),
+            Err(error) => return Err(error),
+        };
+        self.session = None;
+        self.last_activity = None;
+        self.lifecycle_state = LifecycleState::Updating {
+            previous_instance_id: previous_instance_id.clone(),
+        };
+        let wait = self.wait_remote(
+            Some("offline_then_online"),
+            timeout_ms,
+            poll_interval_ms,
+            probe_timeout_ms,
+        );
+        let current_agent = wait["agent_info"].clone();
+        let reached = wait["reached"].as_bool().unwrap_or(false);
+        let candidate = prepared
+            .as_ref()
+            .and_then(|value| value.get("candidate"))
+            .cloned();
+        let status = if !reached {
+            "timed_out"
+        } else if candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate_matches_agent(candidate, &current_agent))
+        {
+            "updated"
+        } else if restart_acknowledged {
+            "rolled_back"
+        } else {
+            "unconfirmed"
+        };
+        Ok(json!({
+            "status": status,
+            "updated": status == "updated",
+            "rolled_back": status == "rolled_back",
+            "timed_out": status == "timed_out",
+            "restart_acknowledged": restart_acknowledged,
+            "previous_agent": previous_agent,
+            "candidate": candidate,
+            "current_agent": current_agent,
+            "staging_path": staging_path,
+            "bytes_transferred": upload["bytes_transferred"],
+            "sha256": sha256,
+            "wait": wait,
+            "elapsed_ms": duration_ms(started.elapsed())
+        }))
     }
 
     pub fn upload(
@@ -349,12 +640,106 @@ impl RemoteClient {
         self.finish_operation(result)
     }
 
+    fn probe(&mut self, timeout: Duration) -> Value {
+        let started = Instant::now();
+        let connection_reused = self.session.is_some();
+        let first = if self.session.is_some() {
+            self.ping_current_session(timeout)
+        } else {
+            self.ensure_connected_with(timeout)
+                .and_then(|_| self.ping_current_session(timeout))
+        };
+        let result = match first {
+            Ok(agent_info) => Ok(agent_info),
+            Err(first_error) if connection_reused => {
+                self.session = None;
+                self.last_activity = None;
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    Err(first_error)
+                } else {
+                    self.ensure_connected_with(remaining)
+                        .and_then(|_| self.ping_current_session(remaining))
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let probed_at_ms = unix_time_ms();
+        let latency_ms = duration_ms(started.elapsed());
+        let probe = match result {
+            Ok(agent_info) => {
+                self.last_success_at_ms = Some(probed_at_ms);
+                self.last_error = None;
+                self.last_agent_info = Some(agent_info.clone());
+                json!({
+                    "address": self.remote.to_string(),
+                    "reachable": true,
+                    "connected": true,
+                    "connection_reused": connection_reused,
+                    "latency_ms": latency_ms,
+                    "probed_at_ms": probed_at_ms,
+                    "lifecycle_state": self.lifecycle_state.name(),
+                    "agent_info": agent_info,
+                    "error": null
+                })
+            }
+            Err(error) => {
+                self.session = None;
+                self.last_activity = None;
+                let error_value = json!({"kind": error.kind, "message": error.message});
+                self.last_error = Some(error_value.clone());
+                json!({
+                    "address": self.remote.to_string(),
+                    "reachable": false,
+                    "connected": false,
+                    "connection_reused": connection_reused,
+                    "latency_ms": latency_ms,
+                    "probed_at_ms": probed_at_ms,
+                    "lifecycle_state": self.lifecycle_state.name(),
+                    "agent_info": null,
+                    "error": error_value
+                })
+            }
+        };
+        self.last_probe = Some(probe.clone());
+        probe
+    }
+
+    fn wait_remote_result(
+        &self,
+        wait_for: &str,
+        reached: bool,
+        timed_out: bool,
+        observed_offline: bool,
+        attempts: u64,
+        started: Instant,
+    ) -> Value {
+        json!({
+            "address": self.remote.to_string(),
+            "wait_for": wait_for,
+            "reached": reached,
+            "timed_out": timed_out,
+            "observed_offline": observed_offline,
+            "attempts": attempts,
+            "elapsed_ms": duration_ms(started.elapsed()),
+            "connected": self.session.is_some(),
+            "connection_state": if self.session.is_some() { "cached" } else { "disconnected" },
+            "lifecycle_state": self.lifecycle_state.name(),
+            "last_probe": self.last_probe,
+            "agent_info": self.last_agent_info
+        })
+    }
+
     fn prepare_connection(&mut self) -> Result<(), ClientError> {
         self.ensure_connected()?;
         let needs_health_check = self
             .last_activity
             .is_some_and(|last_activity| last_activity.elapsed() >= self.health_check_after);
-        if needs_health_check && self.ping_current_session().is_err() {
+        if needs_health_check
+            && self
+                .ping_current_session(DEFAULT_HEALTH_CHECK_TIMEOUT)
+                .is_err()
+        {
             self.session = None;
             self.last_activity = None;
             self.ensure_connected()?;
@@ -363,12 +748,20 @@ impl RemoteClient {
     }
 
     fn ensure_connected(&mut self) -> Result<(), ClientError> {
+        self.ensure_connected_with(DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    fn ensure_connected_with(&mut self, connect_timeout: Duration) -> Result<(), ClientError> {
         if self.session.is_none() {
+            let mut options = SessionOptions::proxy(self.timeout);
+            let phase_timeout = (connect_timeout / 2).max(Duration::from_millis(1));
+            options.connect_timeout = phase_timeout;
+            options.handshake_timeout = phase_timeout;
             self.session = Some(
                 Session::connect(
                     SocketAddr::V4(self.remote),
                     BUILTIN_PSK,
-                    SessionOptions::proxy(self.timeout),
+                    options,
                     DEFAULT_MAX_CONTROL_BYTES,
                 )
                 .map_err(connection_error)?,
@@ -378,7 +771,7 @@ impl RemoteClient {
         Ok(())
     }
 
-    fn ping_current_session(&mut self) -> Result<(), ClientError> {
+    fn ping_current_session(&mut self, timeout: Duration) -> Result<Value, ClientError> {
         let request_id = self.allocate_request_id()?;
         let session = self.session.as_mut().expect("connected");
         session
@@ -392,17 +785,29 @@ impl RemoteClient {
             )
             .map_err(health_check_error)?;
         let frame = session
-            .receive_with_idle_timeout(Some(DEFAULT_HEALTH_CHECK_TIMEOUT))
+            .receive_with_idle_timeout(Some(timeout))
             .map_err(health_check_error)?;
         check_request_id(&frame, request_id)?;
-        match frame.kind {
+        let agent_info = match frame.kind {
             FrameType::Response => {
-                serde_json::from_slice::<RemoteResponse>(&frame.payload)
+                let response = serde_json::from_slice::<RemoteResponse>(&frame.payload)
                     .map_err(|error| ClientError::local("protocol", error.to_string()))?;
+                if response.ok {
+                    response.result.unwrap_or(Value::Null)
+                } else {
+                    return Err(response
+                        .error
+                        .unwrap_or(RemoteError {
+                            kind: "remote".to_string(),
+                            message: "health check failed".to_string(),
+                        })
+                        .into());
+                }
             }
             FrameType::Error => {
-                serde_json::from_slice::<RemoteError>(&frame.payload)
-                    .map_err(|error| ClientError::local("protocol", error.to_string()))?;
+                return Err(serde_json::from_slice::<RemoteError>(&frame.payload)
+                    .map_err(|error| ClientError::local("protocol", error.to_string()))?
+                    .into());
             }
             _ => {
                 return Err(ClientError::local(
@@ -410,17 +815,36 @@ impl RemoteClient {
                     "unexpected health check response frame",
                 ));
             }
+        };
+        if agent_info["name"] != "remote-ops-agent"
+            || agent_info["runtime"]["instance_id"].as_str().is_none()
+            || agent_info["supported_operations"].as_array().is_none()
+        {
+            return Err(ClientError::local(
+                "incompatible_agent",
+                "health check did not return Agent identity and capabilities; upgrade the remote Agent",
+            ));
         }
         self.last_activity = Some(Instant::now());
-        Ok(())
+        self.last_agent_info = Some(agent_info.clone());
+        Ok(agent_info)
     }
 
     fn finish_operation<T>(&mut self, result: Result<T, ClientError>) -> Result<T, ClientError> {
-        if result.is_ok() {
-            self.last_activity = Some(Instant::now());
-        } else {
-            self.session = None;
-            self.last_activity = None;
+        match &result {
+            Ok(_) => {
+                self.last_activity = Some(Instant::now());
+                self.last_success_at_ms = Some(unix_time_ms());
+                self.last_error = None;
+            }
+            Err(error) => {
+                self.session = None;
+                self.last_activity = None;
+                self.last_error = Some(json!({
+                    "kind": error.kind,
+                    "message": error.message
+                }));
+            }
         }
         result
     }
@@ -433,6 +857,31 @@ impl RemoteClient {
             .ok_or_else(|| ClientError::local("protocol", "request id exhausted"))?;
         Ok(id)
     }
+}
+
+fn agent_instance_id(agent_info: &Value) -> Option<&str> {
+    agent_info["runtime"]["instance_id"].as_str()
+}
+
+fn candidate_matches_agent(candidate: &Value, agent_info: &Value) -> bool {
+    candidate["name"] == agent_info["name"]
+        && candidate["version"] == agent_info["version"]
+        && candidate["protocol_version"] == agent_info["protocol_version"]
+        && candidate["build"]["target"] == agent_info["build"]["target"]
+        && candidate["build"]["git_revision"] == agent_info["build"]["git_revision"]
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn receive_remote_response(session: &mut Session, request_id: u64) -> Result<Value, ClientError> {

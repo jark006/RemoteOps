@@ -1123,6 +1123,7 @@ mod linux_pkill_tests {
             "pkill",
             serde_json::json!({"name": name}),
             &crate::tools::jobs::JobManager::new(),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
         assert_eq!(result["signal"], 15);
@@ -1243,6 +1244,7 @@ mod tests {
                     "kill",
                     serde_json::json!({"pid": pid}),
                     &crate::tools::jobs::JobManager::new(),
+                    remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
                 )
                 .unwrap(),
             };
@@ -1296,6 +1298,7 @@ mod tests {
             "pkill",
             serde_json::json!({"name": name}),
             &crate::tools::jobs::JobManager::new(),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
         assert_eq!(result["signal"], 15);
@@ -1437,6 +1440,7 @@ mod macos_tests {
             "pkill",
             serde_json::json!({"name": name}),
             &crate::tools::jobs::JobManager::new(),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
         assert_eq!(result["signal"], 15);

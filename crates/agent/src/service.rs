@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use remote_ops_protocol::{
     BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_TRANSFER_IDLE_TIMEOUT,
-    DownloadRequest, FrameType, INTERNAL_PING_OPERATION, PROTOCOL_VERSION, ProtocolError,
-    RemoteError, RemoteRequest, RemoteResponse, Session, SessionOptions, TransferEnd,
-    TransferMetadata, UploadRequest,
+    DownloadRequest, FrameType, INTERNAL_PING_OPERATION, ProtocolError, RemoteError, RemoteRequest,
+    RemoteResponse, Session, SessionOptions, TransferEnd, TransferMetadata, UploadRequest,
 };
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -19,6 +19,19 @@ use crate::tools::files::{
     preserve_existing_mode,
 };
 use crate::tools::jobs::JobManager;
+use crate::tools::lifecycle;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionAction {
+    Continue,
+    RestartAgent,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentUpdatePrepareArgs {
+    expected_sha256: String,
+}
 
 enum TransferError {
     Agent(AgentError),
@@ -41,7 +54,7 @@ pub fn handle_connection(
     stream: TcpStream,
     max_transfer_bytes: u64,
     jobs: &JobManager,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ConnectionAction, Box<dyn std::error::Error + Send + Sync>> {
     let peer = stream
         .peer_addr()
         .map(|address| address.to_string())
@@ -55,7 +68,9 @@ pub fn handle_connection(
     loop {
         let frame = match session.receive() {
             Ok(frame) => frame,
-            Err(ProtocolError::Io(error)) if is_quiet_disconnect(&error) => return Ok(()),
+            Err(ProtocolError::Io(error)) if is_quiet_disconnect(&error) => {
+                return Ok(ConnectionAction::Continue);
+            }
             Err(error) => return Err(error.into()),
         };
         if frame.kind != FrameType::Request {
@@ -66,13 +81,50 @@ pub fn handle_connection(
             session.send_json(
                 FrameType::Response,
                 frame.request_id,
-                &RemoteResponse::success(json!({"protocol_version": PROTOCOL_VERSION})),
+                &RemoteResponse::success(lifecycle::agent_info(max_transfer_bytes)),
             )?;
             continue;
         }
         let started_at = Instant::now();
         log_operation_started(&peer, frame.request_id, &request.operation);
         match request.operation.as_str() {
+            "agent_update_prepare" => {
+                let result = serde_json::from_value::<AgentUpdatePrepareArgs>(request.arguments)
+                    .map_err(|error| AgentError::invalid(error.to_string()))
+                    .and_then(|args| {
+                        lifecycle::prepare_agent_update(
+                            &args.expected_sha256,
+                            max_transfer_bytes,
+                            lifecycle::restart_args(),
+                        )
+                    });
+                let (response, action, error) = match result {
+                    Ok(value) => (
+                        RemoteResponse::success(value),
+                        ConnectionAction::RestartAgent,
+                        None,
+                    ),
+                    Err(error) => {
+                        let message = error.to_string();
+                        (
+                            RemoteResponse::failure(error.into()),
+                            ConnectionAction::Continue,
+                            Some(message),
+                        )
+                    }
+                };
+                log_operation_finished(
+                    &peer,
+                    frame.request_id,
+                    &request.operation,
+                    started_at,
+                    error.as_deref(),
+                );
+                session.send_json(FrameType::Response, frame.request_id, &response)?;
+                if action == ConnectionAction::RestartAgent {
+                    return Ok(action);
+                }
+            }
             "upload_file" => {
                 let args: UploadRequest = match serde_json::from_value(request.arguments) {
                     Ok(args) => args,
@@ -140,7 +192,12 @@ pub fn handle_connection(
                 )?;
             }
             _ => {
-                let response = match dispatch(&request.operation, request.arguments, jobs) {
+                let response = match dispatch(
+                    &request.operation,
+                    request.arguments,
+                    jobs,
+                    max_transfer_bytes,
+                ) {
                     Ok(value) => {
                         log_operation_finished(
                             &peer,

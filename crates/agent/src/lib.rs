@@ -10,7 +10,12 @@ use serde_json::Value;
 use error::{AgentError, AgentResult};
 use tools::jobs::JobManager;
 
-pub fn dispatch(operation: &str, arguments: Value, jobs: &JobManager) -> AgentResult<Value> {
+pub fn dispatch(
+    operation: &str,
+    arguments: Value,
+    jobs: &JobManager,
+    max_transfer_bytes: u64,
+) -> AgentResult<Value> {
     match operation {
         "read_text" => {
             let args: ReadTextArgs = decode(arguments)?;
@@ -134,6 +139,14 @@ pub fn dispatch(operation: &str, arguments: Value, jobs: &JobManager) -> AgentRe
             let _: EmptyArgs = decode(arguments)?;
             tools::system::system_info()
         }
+        "agent_info" => {
+            let _: EmptyArgs = decode(arguments)?;
+            Ok(tools::lifecycle::agent_info(max_transfer_bytes))
+        }
+        "reboot" => {
+            let args: RebootArgs = decode(arguments)?;
+            tools::lifecycle::schedule_reboot(args.delay_ms, max_transfer_bytes)
+        }
         _ => Err(AgentError::invalid(format!(
             "unknown operation: {operation}"
         ))),
@@ -191,6 +204,10 @@ fn default_process_output_bytes() -> usize {
 }
 fn default_process_wait() -> u64 {
     remote_ops_protocol::DEFAULT_PROCESS_WAIT_MS
+}
+
+fn default_reboot_delay() -> u64 {
+    remote_ops_protocol::DEFAULT_REBOOT_DELAY_MS
 }
 
 #[derive(Deserialize)]
@@ -386,6 +403,13 @@ struct JobIdArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RebootArgs {
+    #[serde(default = "default_reboot_delay")]
+    delay_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
 #[cfg(test)]
@@ -396,7 +420,13 @@ mod tests {
     #[test]
     fn rejects_unknown_arguments() {
         let jobs = JobManager::new();
-        let error = dispatch("stat", json!({"path": ".", "extra": true}), &jobs).unwrap_err();
+        let error = dispatch(
+            "stat",
+            json!({"path": ".", "extra": true}),
+            &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
     }
 
@@ -409,9 +439,16 @@ mod tests {
             "write_text",
             json!({"path": path, "content": "hello"}),
             &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
-        let result = dispatch("read_text", json!({"path": path}), &jobs).unwrap();
+        let result = dispatch(
+            "read_text",
+            json!({"path": path}),
+            &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        )
+        .unwrap();
         assert_eq!(result["text"], "hello");
     }
 
@@ -422,6 +459,7 @@ mod tests {
             "apply_patch",
             json!({"path":"file.txt","patch":"invalid","extra":true}),
             &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
@@ -438,6 +476,7 @@ mod tests {
             "read_file_lines",
             json!({"path": path, "start_line": 2, "end_line": 2}),
             &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
         assert_eq!(lines["text"], "needle\n");
@@ -446,6 +485,7 @@ mod tests {
             "grep",
             json!({"path": directory.path(), "pattern": "needle"}),
             &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
         assert_eq!(search["matches"].as_array().unwrap().len(), 1);
@@ -454,11 +494,18 @@ mod tests {
             "list_files",
             json!({"path": directory.path(), "pattern": "*.rs"}),
             &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )
         .unwrap();
         assert_eq!(listing["entries"][0]["name"], "source.rs");
 
-        let error = dispatch("ls", json!({"path": directory.path()}), &jobs).unwrap_err();
+        let error = dispatch(
+            "ls",
+            json!({"path": directory.path()}),
+            &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
         assert!(error.message.contains("unknown operation"));
     }
@@ -486,12 +533,23 @@ mod tests {
             ("process_close", json!({"job_id":0})),
         ];
         for (operation, arguments) in invalid_calls {
-            let error = dispatch(operation, arguments, &jobs).unwrap_err();
+            let error = dispatch(
+                operation,
+                arguments,
+                &jobs,
+                remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+            )
+            .unwrap_err();
             assert_eq!(error.kind, "invalid_params", "{operation}");
         }
 
-        let error =
-            dispatch("process_output", json!({"job_id":1,"extra":true}), &jobs).unwrap_err();
+        let error = dispatch(
+            "process_output",
+            json!({"job_id":1,"extra":true}),
+            &jobs,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
     }
 }

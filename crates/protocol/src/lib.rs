@@ -33,6 +33,17 @@ pub const DEFAULT_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_HEALTH_CHECK_AFTER: Duration = Duration::from_secs(60);
 pub const DEFAULT_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_REMOTE_PROBE_TIMEOUT_MS: u64 = 5_000;
+pub const MIN_REMOTE_PROBE_TIMEOUT_MS: u64 = 100;
+pub const MAX_REMOTE_PROBE_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_WAIT_REMOTE_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_WAIT_REMOTE_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_WAIT_REMOTE_POLL_MS: u64 = 1_000;
+pub const MIN_WAIT_REMOTE_POLL_MS: u64 = 100;
+pub const MAX_WAIT_REMOTE_POLL_MS: u64 = 10_000;
+pub const DEFAULT_REBOOT_DELAY_MS: u64 = 1_000;
+pub const MIN_REBOOT_DELAY_MS: u64 = 250;
+pub const MAX_REBOOT_DELAY_MS: u64 = 10_000;
 pub const INTERNAL_PING_OPERATION: &str = "__remote_ops_ping";
 
 const HELLO_MAGIC: &[u8; 4] = b"ROPS";

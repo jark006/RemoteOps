@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 globset.workspace = true
+getrandom.workspace = true
 if-addrs.workspace = true
 libc.workspace = true
 regex.workspace = true

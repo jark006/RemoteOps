@@ -85,6 +85,8 @@ proxy 参数：
 
 ## 🛠️ MCP 工具
 
+proxy 当前暴露 30 个 MCP 工具：
+
 | 工具 | 主要参数 | 说明 |
 | --- | --- | --- |
 | `read_text` | `path`, `offset?`, `max_bytes?` | 有界读取远端文本，最大 1 MiB。 |
@@ -110,8 +112,13 @@ proxy 参数：
 | `system_info` | 无 | 运行时间、内存、系统盘和可用的负载/温度信息。 |
 | `upload_file` | `local_path`, `remote_path`, `overwrite?` | 从 proxy 所在 PC 上传一个普通文件。 |
 | `download_file` | `remote_path`, `local_path`, `overwrite?` | 下载一个普通文件到 proxy 所在 PC。 |
-| `remote_status` | 无 | 查询当前 `ip`、`port`、`address` 和缓存的 `connected` 状态，不主动连接。 |
+| `remote_status` | 无 | 被动查询地址、缓存连接、生命周期状态，以及最近一次成功、错误、探测和 Agent 信息，不主动连接。 |
 | `set_remote` | `ip?`, `port?` | 动态设置远端 IPv4 或端口；至少提供一项，未提供部分保持不变。 |
+| `agent_info` | 无 | 查询 Agent 版本、协议、构建信息、运行实例、平台、能力和限制。 |
+| `remote_probe` | `timeout_ms?` | 主动连接或健康检查远端，返回可达性、延迟、Agent 信息或结构化错误。 |
+| `wait_remote` | `wait_for?`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 有界轮询远端，等待 `online`、`offline` 或 `offline_then_online`。 |
+| `reboot` | `delay_ms?` | 请求 Agent 延迟重启设备，并将 proxy 生命周期状态切换为 `rebooting`。 |
+| `agent_update` | `local_path`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 上传并验证 Agent 候选程序，原子替换、重启验证，失败时自动回滚。 |
 
 `overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
 
@@ -139,6 +146,15 @@ proxy 参数：
 
 补丁保留 UTF-8 BOM、原有行尾和末尾换行状态；新增行沿用文件现有的 LF 或 CRLF。首版不支持创建、删除或重命名文件，也不支持无上下文的纯插入 hunk。
 
+### Agent 与设备生命周期
+
+- `remote_status` 是被动快照，不会为确认设备在线而建立连接。`connection_state` 为 `cached` 或 `disconnected`，只表示 proxy 是否持有已认证会话；`lifecycle_state` 为 `ready`、`rebooting` 或 `updating`。结果还包含 `last_success_at_ms`、`last_error`、`last_probe` 和最近缓存的 `agent_info`。
+- `remote_probe` 会主动建立连接或复用缓存连接执行健康检查。`timeout_ms` 默认 5,000 ms，范围 100..=30,000 ms；结果始终给出 `reachable`、延迟、是否复用连接、生命周期状态，以及 Agent 信息或结构化错误。
+- `wait_remote` 支持 `online`、`offline` 和 `offline_then_online`。正常状态默认等待 `online`，重启或更新期间默认等待 `offline_then_online`；后者在观察到离线后重新在线，或 Agent `instance_id` 已变化时完成。总超时默认 120,000 ms、范围 1..=600,000 ms，轮询间隔默认 1,000 ms、范围 100..=10,000 ms，每次探测超时默认 5,000 ms、范围 100..=30,000 ms。
+- `reboot` 的延迟默认 1,000 ms，范围 250..=10,000 ms。Agent 先确认请求再延迟执行，proxy 随后丢弃缓存会话并进入 `rebooting`；如果响应恰好因重启断开而丢失，结果会通过 `acknowledged` 和 `disconnect_observed` 区分。可继续使用 `wait_remote` 等待设备恢复。普通请求在发送后发生连接错误时仍不会自动重放。
+- `agent_update` 的 `local_path` 指向 proxy 所在 PC 上的候选 Agent 普通文件。proxy 先探测现有 Agent，将候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选程序通过 `--self-check` 校验协议版本和构建 target 后，由独立 helper 等待旧 Agent 退出、原子替换程序并重启。新 Agent 成功监听且通过稳定性检查后删除备份；启动失败则恢复旧程序并重启。结果以 `updated`、`rolled_back`、`timed_out` 或 `unconfirmed` 明确报告状态。等待和探测参数范围与 `wait_remote` 相同。
+- Linux 的 `reboot` 调用系统 `reboot(2)`，Agent 必须以 root 运行；Windows 使用 `shutdown.exe /r /t 0 /f`；macOS 返回结构化 `unsupported`。`agent_info` 会据实报告 `reboot` 和 `self_update` 能力。
+
 ⚠️ 被控端 Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。
 
 ## 🔒 传输协议和安全边界
@@ -164,6 +180,8 @@ cargo build --release --workspace
 target/release/remote-ops-proxy
 target/release/remote-ops-agent
 ```
+
+Agent 的 `build.rs` 会在编译时注入 target、profile 和 Git revision；这些信息可通过 `agent_info.build` 查看，并用于自更新候选程序的兼容性检查。可设置 `REMOTE_OPS_GIT_REVISION` 显式指定 revision，否则构建脚本尝试读取当前 Git 提交，无法读取时使用 `unknown`。
 
 可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
 
@@ -200,8 +218,8 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-unknown-linux-musl
-cargo check --target aarch64-unknown-linux-musl
-cargo check --target armv7-unknown-linux-musleabihf
+cargo check -p remote-ops-agent --target aarch64-unknown-linux-musl
+cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabihf
 ```
 
-测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现、后台任务增量输出与断线重连，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。
+测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现、后台任务增量输出与断线重连、Agent 生命周期与更新校验，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。
