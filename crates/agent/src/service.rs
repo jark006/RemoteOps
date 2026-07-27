@@ -18,6 +18,7 @@ use crate::tools::files::{
     create_transfer_temp, ensure_regular_file, normalized_path, persist_replace,
     preserve_existing_mode,
 };
+use crate::tools::jobs::JobManager;
 
 enum TransferError {
     Agent(AgentError),
@@ -39,6 +40,7 @@ impl From<ProtocolError> for TransferError {
 pub fn handle_connection(
     stream: TcpStream,
     max_transfer_bytes: u64,
+    jobs: &JobManager,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let peer = stream
         .peer_addr()
@@ -138,7 +140,7 @@ pub fn handle_connection(
                 )?;
             }
             _ => {
-                let response = match dispatch(&request.operation, request.arguments) {
+                let response = match dispatch(&request.operation, request.arguments, jobs) {
                     Ok(value) => {
                         log_operation_finished(
                             &peer,

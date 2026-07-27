@@ -1,10 +1,13 @@
 use globset::Glob;
 use regex::RegexBuilder;
 use remote_ops_protocol::{
-    APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
+    APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, DEFAULT_PROCESS_JOB_TIMEOUT_MS,
+    DEFAULT_PROCESS_OUTPUT_BYTES, DEFAULT_PROCESS_WAIT_MS, MAX_PROCESS_JOB_TIMEOUT_MS,
+    MAX_PROCESS_OUTPUT_BYTES, MAX_PROCESS_WAIT_MS, PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 use crate::client::{ClientError, RemoteClient};
@@ -101,6 +104,21 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
             .and_then(|_| client.call(name, arguments)),
         "list_files" => decode_transfer::<ListFilesArgs>(&arguments)
             .and_then(validate_list_files_args)
+            .and_then(|_| client.call(name, arguments)),
+        "process_start" => decode_transfer::<ProcessStartArgs>(&arguments)
+            .and_then(validate_process_start_args)
+            .and_then(|_| client.call(name, arguments)),
+        "process_output" => decode_transfer::<ProcessOutputArgs>(&arguments)
+            .and_then(validate_process_output_args)
+            .and_then(|_| client.call(name, arguments)),
+        "process_wait" => decode_transfer::<ProcessWaitArgs>(&arguments)
+            .and_then(validate_process_wait_args)
+            .and_then(|_| client.call(name, arguments)),
+        "process_signal" => decode_transfer::<ProcessSignalArgs>(&arguments)
+            .and_then(validate_process_signal_args)
+            .and_then(|_| client.call(name, arguments)),
+        "process_close" => decode_transfer::<JobIdArgs>(&arguments)
+            .and_then(validate_job_id_args)
             .and_then(|_| client.call(name, arguments)),
         _ => client.call(name, arguments),
     };
@@ -201,6 +219,53 @@ struct PkillArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProcessStartArgs {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default = "default_process_job_timeout")]
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessOutputArgs {
+    job_id: u64,
+    #[serde(default)]
+    stdout_cursor: u64,
+    #[serde(default)]
+    stderr_cursor: u64,
+    #[serde(default = "default_process_output_bytes")]
+    max_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessWaitArgs {
+    job_id: u64,
+    #[serde(default = "default_process_wait")]
+    wait_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessSignalArgs {
+    job_id: u64,
+    #[serde(default = "default_signal")]
+    signal: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobIdArgs {
+    job_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ApplyPatchArgs {
     path: String,
     patch: String,
@@ -268,6 +333,18 @@ fn default_list_limit() -> usize {
 
 fn default_list_depth() -> usize {
     16
+}
+
+fn default_process_job_timeout() -> u64 {
+    DEFAULT_PROCESS_JOB_TIMEOUT_MS
+}
+
+fn default_process_output_bytes() -> usize {
+    DEFAULT_PROCESS_OUTPUT_BYTES
+}
+
+fn default_process_wait() -> u64 {
+    DEFAULT_PROCESS_WAIT_MS
 }
 
 fn validate_apply_patch_args(args: ApplyPatchArgs) -> Result<(), ClientError> {
@@ -386,6 +463,80 @@ fn validate_list_files_args(args: ListFilesArgs) -> Result<(), ClientError> {
     Ok(())
 }
 
+fn validate_process_start_args(args: ProcessStartArgs) -> Result<(), ClientError> {
+    if args.program.is_empty() {
+        return invalid_params("program must not be empty");
+    }
+    if args.program.contains('\0') {
+        return invalid_params("program must not contain NUL");
+    }
+    if args.args.iter().any(|arg| arg.contains('\0')) {
+        return invalid_params("args must not contain NUL");
+    }
+    if let Some(cwd) = args.cwd {
+        if cwd.is_empty() {
+            return invalid_params("cwd must not be empty");
+        }
+        if cwd.contains('\0') {
+            return invalid_params("cwd must not contain NUL");
+        }
+    }
+    if args.env.iter().any(|(name, value)| {
+        name.is_empty() || name.contains('\0') || name.contains('=') || value.contains('\0')
+    }) {
+        return invalid_params(
+            "environment names must be non-empty without NUL or '=' and values must not contain NUL",
+        );
+    }
+    if args.timeout_ms == 0 || args.timeout_ms > MAX_PROCESS_JOB_TIMEOUT_MS {
+        return invalid_params(format!(
+            "timeout_ms must be in range 1..={MAX_PROCESS_JOB_TIMEOUT_MS}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_process_output_args(args: ProcessOutputArgs) -> Result<(), ClientError> {
+    validate_job_id(args.job_id)?;
+    if args.max_bytes > MAX_PROCESS_OUTPUT_BYTES {
+        return invalid_params(format!(
+            "max_bytes must be in range 0..={MAX_PROCESS_OUTPUT_BYTES}"
+        ));
+    }
+    let _ = (args.stdout_cursor, args.stderr_cursor);
+    Ok(())
+}
+
+fn validate_process_wait_args(args: ProcessWaitArgs) -> Result<(), ClientError> {
+    validate_job_id(args.job_id)?;
+    if args.wait_ms > MAX_PROCESS_WAIT_MS {
+        return invalid_params(format!(
+            "wait_ms must be in range 0..={MAX_PROCESS_WAIT_MS}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_process_signal_args(args: ProcessSignalArgs) -> Result<(), ClientError> {
+    validate_job_id(args.job_id)?;
+    if !(1..=64).contains(&args.signal) {
+        return invalid_params("signal must be in range 1..=64");
+    }
+    Ok(())
+}
+
+fn validate_job_id_args(args: JobIdArgs) -> Result<(), ClientError> {
+    validate_job_id(args.job_id)
+}
+
+fn validate_job_id(job_id: u64) -> Result<(), ClientError> {
+    if job_id == 0 {
+        invalid_params("job_id must be at least 1")
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_remote_path(path: &str) -> Result<(), ClientError> {
     if path.is_empty() {
         invalid_params("path must not be empty")
@@ -457,6 +608,11 @@ pub fn tool_names() -> &'static [&'static str] {
         "pkill",
         "sh_exec",
         "exec",
+        "process_start",
+        "process_output",
+        "process_wait",
+        "process_signal",
+        "process_close",
         "system_info",
         "upload_file",
         "download_file",
@@ -750,6 +906,104 @@ pub fn tool_definitions() -> Vec<Value> {
             (false, true, false),
         ),
         tool(
+            "process_start",
+            "Start background process",
+            "Start a managed remote program and return immediately with a job ID",
+            props(&[
+                ("program", string_prop("Program path or name")),
+                ("args", json!({"type":"array","items":{"type":"string"}})),
+                ("cwd", string_prop("Working directory")),
+                (
+                    "env",
+                    json!({"type":"object","additionalProperties":{"type":"string"}}),
+                ),
+                (
+                    "timeout_ms",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_PROCESS_JOB_TIMEOUT_MS),
+                        DEFAULT_PROCESS_JOB_TIMEOUT_MS,
+                        "Maximum job runtime in milliseconds",
+                    ),
+                ),
+            ]),
+            &["program"],
+            (false, true, false),
+        ),
+        tool(
+            "process_output",
+            "Read background output",
+            "Read bounded incremental stdout and stderr from a managed background job",
+            props(&[
+                ("job_id", integer_prop(1, None, "Background job ID")),
+                (
+                    "stdout_cursor",
+                    integer_prop_default(0, None, 0, "Absolute stdout byte cursor"),
+                ),
+                (
+                    "stderr_cursor",
+                    integer_prop_default(0, None, 0, "Absolute stderr byte cursor"),
+                ),
+                (
+                    "max_bytes",
+                    integer_prop_default(
+                        0,
+                        Some(MAX_PROCESS_OUTPUT_BYTES as u64),
+                        DEFAULT_PROCESS_OUTPUT_BYTES as u64,
+                        "Maximum bytes returned from each stream",
+                    ),
+                ),
+            ]),
+            &["job_id"],
+            (true, false, true),
+        ),
+        tool(
+            "process_wait",
+            "Wait for background process",
+            "Wait for a managed background job to finish for a bounded interval",
+            props(&[
+                ("job_id", integer_prop(1, None, "Background job ID")),
+                (
+                    "wait_ms",
+                    integer_prop_default(
+                        0,
+                        Some(MAX_PROCESS_WAIT_MS),
+                        DEFAULT_PROCESS_WAIT_MS,
+                        "Maximum wait in milliseconds",
+                    ),
+                ),
+            ]),
+            &["job_id"],
+            (true, false, true),
+        ),
+        tool(
+            "process_signal",
+            "Signal background process",
+            "Signal a managed Unix process group or terminate its Windows Job Object",
+            props(&[
+                ("job_id", integer_prop(1, None, "Background job ID")),
+                (
+                    "signal",
+                    integer_prop_default(
+                        1,
+                        Some(64),
+                        15,
+                        "Unix signal number; Windows accepts 9 or 15",
+                    ),
+                ),
+            ]),
+            &["job_id"],
+            (false, true, false),
+        ),
+        tool(
+            "process_close",
+            "Close background job",
+            "Release a finished background job and its retained output",
+            props(&[("job_id", integer_prop(1, None, "Background job ID"))]),
+            &["job_id"],
+            (false, true, false),
+        ),
+        tool(
             "system_info",
             "System information",
             "Read bounded system information",
@@ -828,7 +1082,7 @@ fn tool(
         "name": name, "title": title, "description": description,
         "inputSchema": input_schema,
         "outputSchema": output_schema(name),
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec")}
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start")}
     })
 }
 
@@ -1036,6 +1290,40 @@ fn output_schema(name: &str) -> Value {
                 "stderr_truncated",
             ],
         ),
+        "process_start" | "process_wait" => process_status_output(json!({}), &[]),
+        "process_output" => process_status_output(
+            json!({
+                "stdout":{"type":"string"},
+                "stderr":{"type":"string"},
+                "stdout_start_cursor":{"type":"integer","minimum":0},
+                "stderr_start_cursor":{"type":"integer","minimum":0},
+                "next_stdout_cursor":{"type":"integer","minimum":0},
+                "next_stderr_cursor":{"type":"integer","minimum":0},
+                "stdout_truncated":{"type":"boolean"},
+                "stderr_truncated":{"type":"boolean"}
+            }),
+            &[
+                "stdout",
+                "stderr",
+                "stdout_start_cursor",
+                "stderr_start_cursor",
+                "next_stdout_cursor",
+                "next_stderr_cursor",
+                "stdout_truncated",
+                "stderr_truncated",
+            ],
+        ),
+        "process_signal" => process_status_output(
+            json!({"signal":{"type":"integer","minimum":1,"maximum":64}}),
+            &["signal"],
+        ),
+        "process_close" => strict_output(
+            json!({
+                "job_id":{"type":"integer","minimum":1},
+                "closed":{"type":"boolean","const":true}
+            }),
+            &["job_id", "closed"],
+        ),
         "system_info" => strict_output(
             json!({
                 "hostname":{"type":"string"},
@@ -1076,6 +1364,43 @@ fn output_schema(name: &str) -> Value {
     }
 }
 
+fn process_status_output(extra: Value, extra_required: &[&str]) -> Value {
+    let mut properties = match json!({
+        "job_id":{"type":"integer","minimum":1},
+        "pid":{"type":"integer","minimum":1},
+        "state":{"type":"string","enum":["running","exited","failed"]},
+        "exit_code":{"type":["integer","null"]},
+        "timed_out":{"type":"boolean"},
+        "error":{"type":["string","null"]},
+        "started_at_ms":{"type":"integer","minimum":0},
+        "finished_at_ms":{"type":["integer","null"],"minimum":0},
+        "timeout_ms":{"type":"integer","minimum":1,"maximum":MAX_PROCESS_JOB_TIMEOUT_MS},
+        "stdout_complete":{"type":"boolean"},
+        "stderr_complete":{"type":"boolean"}
+    }) {
+        Value::Object(properties) => properties,
+        _ => unreachable!("literal object"),
+    };
+    if let Value::Object(extra) = extra {
+        properties.extend(extra);
+    }
+    let mut required = vec![
+        "job_id",
+        "pid",
+        "state",
+        "exit_code",
+        "timed_out",
+        "error",
+        "started_at_ms",
+        "finished_at_ms",
+        "timeout_ms",
+        "stdout_complete",
+        "stderr_complete",
+    ];
+    required.extend_from_slice(extra_required);
+    strict_output(Value::Object(properties), &required)
+}
+
 fn strict_output(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
@@ -1087,7 +1412,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 25);
         assert_eq!(
             tools
                 .iter()
@@ -1162,6 +1487,36 @@ mod tests {
         assert_eq!(
             shell["description"],
             "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows"
+        );
+        let process_start = tools
+            .iter()
+            .find(|tool| tool["name"] == "process_start")
+            .unwrap();
+        assert_eq!(
+            process_start["inputSchema"]["properties"]["timeout_ms"]["maximum"],
+            MAX_PROCESS_JOB_TIMEOUT_MS
+        );
+        assert_eq!(process_start["annotations"]["openWorldHint"], true);
+        let process_output = tools
+            .iter()
+            .find(|tool| tool["name"] == "process_output")
+            .unwrap();
+        assert_eq!(
+            process_output["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            MAX_PROCESS_OUTPUT_BYTES
+        );
+        assert_eq!(
+            process_output["outputSchema"]["properties"]["state"]["enum"],
+            json!(["running", "exited", "failed"])
+        );
+        assert_eq!(process_output["annotations"]["readOnlyHint"], true);
+        let process_wait = tools
+            .iter()
+            .find(|tool| tool["name"] == "process_wait")
+            .unwrap();
+        assert_eq!(
+            process_wait["inputSchema"]["properties"]["wait_ms"]["maximum"],
+            MAX_PROCESS_WAIT_MS
         );
         let status = tools
             .iter()
@@ -1295,6 +1650,40 @@ mod tests {
                 &mut client,
             );
             assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    #[test]
+    fn background_process_arguments_are_validated_before_connecting() {
+        let mut client = RemoteClient::new(
+            "127.0.0.1:1".parse().unwrap(),
+            std::time::Duration::from_millis(10),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let invalid_calls = [
+            json!({"name":"process_start","arguments":{}}),
+            json!({"name":"process_start","arguments":{"program":""}}),
+            json!({"name":"process_start","arguments":{"program":"has\u{0}nul"}}),
+            json!({"name":"process_start","arguments":{"program":"ok","args":["has\u{0}nul"]}}),
+            json!({"name":"process_start","arguments":{"program":"ok","cwd":""}}),
+            json!({"name":"process_start","arguments":{"program":"ok","env":{"":"value"}}}),
+            json!({"name":"process_start","arguments":{"program":"ok","env":{"A":"has\u{0}nul"}}}),
+            json!({"name":"process_start","arguments":{"program":"ok","timeout_ms":0}}),
+            json!({"name":"process_start","arguments":{"program":"ok","timeout_ms":MAX_PROCESS_JOB_TIMEOUT_MS + 1}}),
+            json!({"name":"process_start","arguments":{"program":"ok","extra":true}}),
+            json!({"name":"process_output","arguments":{"job_id":0}}),
+            json!({"name":"process_output","arguments":{"job_id":1,"max_bytes":MAX_PROCESS_OUTPUT_BYTES + 1}}),
+            json!({"name":"process_output","arguments":{"job_id":1,"extra":true}}),
+            json!({"name":"process_wait","arguments":{"job_id":0}}),
+            json!({"name":"process_wait","arguments":{"job_id":1,"wait_ms":MAX_PROCESS_WAIT_MS + 1}}),
+            json!({"name":"process_signal","arguments":{"job_id":0}}),
+            json!({"name":"process_signal","arguments":{"job_id":1,"signal":0}}),
+            json!({"name":"process_signal","arguments":{"job_id":1,"signal":65}}),
+            json!({"name":"process_close","arguments":{"job_id":0}}),
+        ];
+        for params in invalid_calls {
+            let response = call_tool(json!(1), Some(&params), &mut client);
+            assert_eq!(response["error"]["code"], -32602, "{params}");
         }
     }
 

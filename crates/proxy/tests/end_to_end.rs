@@ -3,9 +3,10 @@ use std::io::Write;
 use std::net::{SocketAddrV4, TcpListener};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use remote_ops_agent::service::handle_connection;
+use remote_ops_agent::tools::jobs::JobManager;
 use remote_ops_protocol::{
     BUILTIN_PSK, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_MAX_TRANSFER_BYTES, FrameType,
     INTERNAL_PING_OPERATION, PROTOCOL_VERSION, RemoteRequest, RemoteResponse, Session,
@@ -14,13 +15,123 @@ use remote_ops_protocol::{
 use remote_ops_proxy::client::RemoteClient;
 use serde_json::{Value, json};
 
+const BACKGROUND_JOB_TEST_ROLE: &str = "REMOTE_OPS_BACKGROUND_E2E_ROLE";
+
+#[test]
+fn background_job_output_survives_proxy_reconnect() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let jobs = JobManager::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
+        }
+    });
+    let program = std::env::current_exe().unwrap();
+    let program = program.to_string_lossy().into_owned();
+    let mut first_client = RemoteClient::new(
+        address.to_string().parse().unwrap(),
+        Duration::from_secs(5),
+        DEFAULT_MAX_TRANSFER_BYTES,
+    );
+    let started = first_client
+        .call(
+            "process_start",
+            json!({
+                "program": program,
+                "args": ["--exact", "background_job_end_to_end_helper", "--nocapture"],
+                "env": {"REMOTE_OPS_BACKGROUND_E2E_ROLE": "1"},
+                "timeout_ms": 5_000
+            }),
+        )
+        .unwrap();
+    let job_id = started["job_id"].as_u64().unwrap();
+    assert_eq!(started["state"], "running");
+
+    let system = first_client.call("system_info", json!({})).unwrap();
+    assert!(!system["hostname"].as_str().unwrap().is_empty());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let first_output = loop {
+        let output = first_client
+            .call(
+                "process_output",
+                json!({"job_id":job_id,"stdout_cursor":0,"stderr_cursor":0}),
+            )
+            .unwrap();
+        if output["stdout"].as_str().unwrap().contains("e2e-first") {
+            break output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first job output was not observed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(first_output["state"], "running");
+    let stdout_cursor = first_output["next_stdout_cursor"].as_u64().unwrap();
+    let stderr_cursor = first_output["next_stderr_cursor"].as_u64().unwrap();
+    drop(first_client);
+
+    let mut second_client = RemoteClient::new(
+        address.to_string().parse().unwrap(),
+        Duration::from_secs(5),
+        DEFAULT_MAX_TRANSFER_BYTES,
+    );
+    let finished = second_client
+        .call("process_wait", json!({"job_id":job_id,"wait_ms":5_000}))
+        .unwrap();
+    assert_eq!(finished["state"], "exited");
+    assert_eq!(finished["exit_code"], 6);
+    let remaining = second_client
+        .call(
+            "process_output",
+            json!({
+                "job_id":job_id,
+                "stdout_cursor":stdout_cursor,
+                "stderr_cursor":stderr_cursor
+            }),
+        )
+        .unwrap();
+    assert!(remaining["stdout"].as_str().unwrap().contains("e2e-second"));
+    assert!(remaining["stderr"].as_str().unwrap().contains("e2e-error"));
+    assert_eq!(remaining["stdout_truncated"], false);
+    assert_eq!(
+        second_client
+            .call("process_close", json!({"job_id":job_id}))
+            .unwrap()["closed"],
+        true
+    );
+    drop(second_client);
+    server.join().unwrap();
+}
+
+#[test]
+fn background_job_end_to_end_helper() {
+    if std::env::var_os(BACKGROUND_JOB_TEST_ROLE).is_none() {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "e2e-first").unwrap();
+    stdout.flush().unwrap();
+    thread::sleep(Duration::from_secs(1));
+    writeln!(stdout, "e2e-second").unwrap();
+    stdout.flush().unwrap();
+    let mut stderr = std::io::stderr().lock();
+    writeln!(stderr, "e2e-error").unwrap();
+    stderr.flush().unwrap();
+    std::process::exit(6);
+}
+
 #[test]
 fn binary_file_round_trip_crosses_multiple_chunks() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
     });
 
     let local = tempfile::tempdir().unwrap();
@@ -70,7 +181,8 @@ fn file_discovery_tools_cross_the_remote_connection() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
     });
     let remote = tempfile::tempdir().unwrap();
     fs::create_dir_all(remote.path().join("src/nested")).unwrap();
@@ -170,7 +282,7 @@ fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
         .collect();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 20);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 25);
     assert_eq!(
         lines[2]["result"]["structuredContent"]["address"],
         "192.168.43.106:8022"
@@ -185,7 +297,8 @@ fn upload_rejection_before_chunks_remains_structured() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, 64).unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, 64, &jobs).unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("too-large.bin");
@@ -217,7 +330,8 @@ fn agent_answers_internal_health_checks_without_exposing_an_mcp_tool() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
     });
     {
         let mut session = Session::connect(
@@ -253,7 +367,8 @@ fn context_checked_patch_is_applied_over_the_remote_protocol() {
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
     });
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("remote.txt");

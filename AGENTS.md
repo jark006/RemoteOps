@@ -21,10 +21,11 @@
 
 ## 工具契约
 
-proxy 暴露 20 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
+proxy 暴露 25 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
 
 - 兼容工具：`read_text`、`read_file_lines`、`tail_text`、`write_text`、`apply_patch`、`list_files`、`grep`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
 - 进程工具：`pkill`。
+- 后台任务工具：`process_start`、`process_output`、`process_wait`、`process_signal`、`process_close`。
 - 传输工具：`upload_file`、`download_file`。
 - proxy 本地管理工具：`remote_status`、`set_remote`。前者被动查询当前地址和缓存连接状态；后者可单独设置 IPv4 或端口，配置仅在当前进程内生效。
 - `upload_file` 的 `local_path` 和 `download_file` 的 `local_path` 均属于 proxy 所在 PC。
@@ -35,6 +36,8 @@ proxy 暴露 20 个工具。修改名称、参数、默认值、上限或结果�
 - `grep` 对单个普通文件或目录树中的普通 UTF-8 文件执行逐行 Rust 正则搜索，大小写敏感默认开启，可用最大 1 KiB 的 `glob` 过滤相对路径。正则最大 4 KiB，结果默认 200 条、最多 1,000 条，单文件默认扫描 1 MiB、最多 16 MiB，单次总计最多枚举 100,000 个目录项、递归 64 层、扫描 10,000 个文件或 64 MiB、输出 1 MiB；匹配文本最多保留 1 KiB。目录搜索不跟随符号链接，并跳过 `.git`、`.hg`、`.svn`、`.next`、`node_modules`、`target`、`dist`、`build`。
 - 文件传输必须校验长度和 SHA-256，成功前使用同目录临时文件，失败时不得留下目标半文件。
 - 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒。
+- `process_start` 不经过 shell，stdin 固定为空；后台任务默认超时 1 小时、最大 24 小时，同时最多保留 16 个。任务属于 agent 进程而非单个连接，可在 proxy 断线重连后继续查询，但不跨 agent 进程重启持久化。达到上限时先回收最早结束的任务；若全部仍在运行则拒绝启动。
+- 后台任务 stdout/stderr 各保留最近 256 KiB。`process_output` 使用绝对字节游标，每路默认返回 64 KiB、最多 256 KiB；游标落后于保留窗口时必须报告截断及最早可用游标。`process_wait` 默认等待 10 秒、最长 30 秒；`process_close` 只释放已结束任务，运行中的任务必须先 signal 并 wait。
 
 ## 平台行为
 
@@ -42,6 +45,7 @@ proxy 暴露 20 个工具。修改名称、参数、默认值、上限或结果�
 - Windows/macOS 提供通用文件工具、文件传输和 `exec`；Windows 还提供 `kill` 和 `system_info`。
 - macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell，Git Bash 不存在时返回结构化 unsupported。Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
+- 后台任务在 Unix 使用独立进程组，在 Windows 使用 Job Object；`process_signal` 在 Unix 接受 1..=64，Windows 仅接受 9 或 15 且两者都终止整个 Job Object。Agent 的任务管理器释放时必须终止仍在运行的任务并回收工作线程。
 - `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
 - `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。

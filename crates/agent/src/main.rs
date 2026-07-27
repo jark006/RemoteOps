@@ -2,6 +2,7 @@ use std::env;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 
 use remote_ops_agent::service::handle_connection;
+use remote_ops_agent::tools::jobs::JobManager;
 use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
 
 struct Config {
@@ -23,10 +24,11 @@ fn main() {
         std::process::exit(1);
     });
     print_listening_addresses(local_addr);
+    let jobs = JobManager::new();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_connection(stream, config.max_transfer_bytes) {
+                if let Err(error) = handle_connection(stream, config.max_transfer_bytes, &jobs) {
                     eprintln!("connection closed: {error}");
                 }
             }

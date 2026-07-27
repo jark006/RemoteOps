@@ -8,8 +8,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use error::{AgentError, AgentResult};
+use tools::jobs::JobManager;
 
-pub fn dispatch(operation: &str, arguments: Value) -> AgentResult<Value> {
+pub fn dispatch(operation: &str, arguments: Value, jobs: &JobManager) -> AgentResult<Value> {
     match operation {
         "read_text" => {
             let args: ReadTextArgs = decode(arguments)?;
@@ -96,6 +97,39 @@ pub fn dispatch(operation: &str, arguments: Value) -> AgentResult<Value> {
                 args.timeout_ms,
             )
         }
+        "process_start" => {
+            let args: ProcessStartArgs = decode(arguments)?;
+            tools::jobs::process_start(
+                jobs,
+                &args.program,
+                &args.args,
+                args.cwd.as_deref(),
+                &args.env,
+                args.timeout_ms,
+            )
+        }
+        "process_output" => {
+            let args: ProcessOutputArgs = decode(arguments)?;
+            tools::jobs::process_output(
+                jobs,
+                args.job_id,
+                args.stdout_cursor,
+                args.stderr_cursor,
+                args.max_bytes,
+            )
+        }
+        "process_wait" => {
+            let args: ProcessWaitArgs = decode(arguments)?;
+            tools::jobs::process_wait(jobs, args.job_id, args.wait_ms)
+        }
+        "process_signal" => {
+            let args: ProcessSignalArgs = decode(arguments)?;
+            tools::jobs::process_signal(jobs, args.job_id, args.signal)
+        }
+        "process_close" => {
+            let args: JobIdArgs = decode(arguments)?;
+            tools::jobs::process_close(jobs, args.job_id)
+        }
         "system_info" => {
             let _: EmptyArgs = decode(arguments)?;
             tools::system::system_info()
@@ -148,6 +182,15 @@ fn default_signal() -> i32 {
 }
 fn default_hash_bytes() -> u64 {
     tools::files::FILE_HASH_MAX_BYTES
+}
+fn default_process_job_timeout() -> u64 {
+    remote_ops_protocol::DEFAULT_PROCESS_JOB_TIMEOUT_MS
+}
+fn default_process_output_bytes() -> usize {
+    remote_ops_protocol::DEFAULT_PROCESS_OUTPUT_BYTES
+}
+fn default_process_wait() -> u64 {
+    remote_ops_protocol::DEFAULT_PROCESS_WAIT_MS
 }
 
 #[derive(Deserialize)]
@@ -296,6 +339,53 @@ struct ExecArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProcessStartArgs {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default = "default_process_job_timeout")]
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessOutputArgs {
+    job_id: u64,
+    #[serde(default)]
+    stdout_cursor: u64,
+    #[serde(default)]
+    stderr_cursor: u64,
+    #[serde(default = "default_process_output_bytes")]
+    max_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessWaitArgs {
+    job_id: u64,
+    #[serde(default = "default_process_wait")]
+    wait_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessSignalArgs {
+    job_id: u64,
+    #[serde(default = "default_signal")]
+    signal: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobIdArgs {
+    job_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
 #[cfg(test)]
@@ -305,24 +395,33 @@ mod tests {
 
     #[test]
     fn rejects_unknown_arguments() {
-        let error = dispatch("stat", json!({"path": ".", "extra": true})).unwrap_err();
+        let jobs = JobManager::new();
+        let error = dispatch("stat", json!({"path": ".", "extra": true}), &jobs).unwrap_err();
         assert_eq!(error.kind, "invalid_params");
     }
 
     #[test]
     fn file_tools_operate_on_binary_safe_paths() {
+        let jobs = JobManager::new();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hello.txt");
-        dispatch("write_text", json!({"path": path, "content": "hello"})).unwrap();
-        let result = dispatch("read_text", json!({"path": path})).unwrap();
+        dispatch(
+            "write_text",
+            json!({"path": path, "content": "hello"}),
+            &jobs,
+        )
+        .unwrap();
+        let result = dispatch("read_text", json!({"path": path}), &jobs).unwrap();
         assert_eq!(result["text"], "hello");
     }
 
     #[test]
     fn apply_patch_rejects_unknown_arguments() {
+        let jobs = JobManager::new();
         let error = dispatch(
             "apply_patch",
             json!({"path":"file.txt","patch":"invalid","extra":true}),
+            &jobs,
         )
         .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
@@ -330,6 +429,7 @@ mod tests {
 
     #[test]
     fn dispatches_new_file_discovery_tools_and_rejects_old_ls_name() {
+        let jobs = JobManager::new();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.rs");
         std::fs::write(&path, "one\nneedle\nthree\n").unwrap();
@@ -337,6 +437,7 @@ mod tests {
         let lines = dispatch(
             "read_file_lines",
             json!({"path": path, "start_line": 2, "end_line": 2}),
+            &jobs,
         )
         .unwrap();
         assert_eq!(lines["text"], "needle\n");
@@ -344,6 +445,7 @@ mod tests {
         let search = dispatch(
             "grep",
             json!({"path": directory.path(), "pattern": "needle"}),
+            &jobs,
         )
         .unwrap();
         assert_eq!(search["matches"].as_array().unwrap().len(), 1);
@@ -351,12 +453,45 @@ mod tests {
         let listing = dispatch(
             "list_files",
             json!({"path": directory.path(), "pattern": "*.rs"}),
+            &jobs,
         )
         .unwrap();
         assert_eq!(listing["entries"][0]["name"], "source.rs");
 
-        let error = dispatch("ls", json!({"path": directory.path()})).unwrap_err();
+        let error = dispatch("ls", json!({"path": directory.path()}), &jobs).unwrap_err();
         assert_eq!(error.kind, "invalid_params");
         assert!(error.message.contains("unknown operation"));
+    }
+
+    #[test]
+    fn background_process_arguments_are_validated_on_agent() {
+        let jobs = JobManager::new();
+        let invalid_calls = [
+            ("process_start", json!({"program":"","timeout_ms":1})),
+            ("process_start", json!({"program":"ok","timeout_ms":0})),
+            (
+                "process_start",
+                json!({"program":"ok","timeout_ms":remote_ops_protocol::MAX_PROCESS_JOB_TIMEOUT_MS + 1}),
+            ),
+            ("process_output", json!({"job_id":0})),
+            (
+                "process_output",
+                json!({"job_id":1,"max_bytes":remote_ops_protocol::MAX_PROCESS_OUTPUT_BYTES + 1}),
+            ),
+            (
+                "process_wait",
+                json!({"job_id":1,"wait_ms":remote_ops_protocol::MAX_PROCESS_WAIT_MS + 1}),
+            ),
+            ("process_signal", json!({"job_id":1,"signal":0})),
+            ("process_close", json!({"job_id":0})),
+        ];
+        for (operation, arguments) in invalid_calls {
+            let error = dispatch(operation, arguments, &jobs).unwrap_err();
+            assert_eq!(error.kind, "invalid_params", "{operation}");
+        }
+
+        let error =
+            dispatch("process_output", json!({"job_id":1,"extra":true}), &jobs).unwrap_err();
+        assert_eq!(error.kind, "invalid_params");
     }
 }

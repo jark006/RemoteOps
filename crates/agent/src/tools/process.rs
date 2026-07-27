@@ -1119,7 +1119,12 @@ mod linux_pkill_tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        let result = crate::dispatch("pkill", serde_json::json!({"name": name})).unwrap();
+        let result = crate::dispatch(
+            "pkill",
+            serde_json::json!({"name": name}),
+            &crate::tools::jobs::JobManager::new(),
+        )
+        .unwrap();
         assert_eq!(result["signal"], 15);
         assert_eq!(result["matched"], 1);
         assert_eq!(result["signaled_pids"], serde_json::json!([pid]));
@@ -1234,7 +1239,12 @@ mod tests {
 
             let result = match requested_signal {
                 Some(signal) => kill(pid, signal).unwrap(),
-                None => crate::dispatch("kill", serde_json::json!({"pid": pid})).unwrap(),
+                None => crate::dispatch(
+                    "kill",
+                    serde_json::json!({"pid": pid}),
+                    &crate::tools::jobs::JobManager::new(),
+                )
+                .unwrap(),
             };
             assert_eq!(result["pid"], pid);
             assert_eq!(result["signal"], expected_signal);
@@ -1282,7 +1292,12 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        let result = crate::dispatch("pkill", serde_json::json!({"name": name})).unwrap();
+        let result = crate::dispatch(
+            "pkill",
+            serde_json::json!({"name": name}),
+            &crate::tools::jobs::JobManager::new(),
+        )
+        .unwrap();
         assert_eq!(result["signal"], 15);
         assert_eq!(result["matched"], 1);
         assert_eq!(result["signaled_pids"], serde_json::json!([pid]));
@@ -1418,7 +1433,12 @@ mod macos_tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        let result = crate::dispatch("pkill", serde_json::json!({"name": name})).unwrap();
+        let result = crate::dispatch(
+            "pkill",
+            serde_json::json!({"name": name}),
+            &crate::tools::jobs::JobManager::new(),
+        )
+        .unwrap();
         assert_eq!(result["signal"], 15);
         assert_eq!(result["matched"], 1);
         assert_eq!(result["signaled_pids"], serde_json::json!([pid]));

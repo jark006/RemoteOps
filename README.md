@@ -102,6 +102,11 @@ proxy 参数：
 | `pkill` | `name`, `signal?` | 按平台进程名完整匹配并排除 agent 自身，默认 signal 15；Linux/macOS 名称分别最多 15/31 字节，Windows 最多 260 个 UTF-16 单元且 signal 仅接受 9/15。匹配超过 1024 个进程时不执行，返回 `matched`、`signaled_pids` 和 `failed_pids`。 |
 | `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。 |
 | `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。 |
+| `process_start` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 启动由 agent 管理的后台程序并立即返回 job ID；默认最长 1 小时，最大 24 小时。 |
+| `process_output` | `job_id`, `stdout_cursor?`, `stderr_cursor?`, `max_bytes?` | 按绝对字节游标增量读取后台任务的 stdout/stderr。 |
+| `process_wait` | `job_id`, `wait_ms?` | 有界等待后台任务退出，默认 10 秒，最长 30 秒。 |
+| `process_signal` | `job_id`, `signal?` | 向 Unix 任务进程组发送信号；Windows 接受 9/15 并终止整个 Job Object。 |
+| `process_close` | `job_id` | 释放已结束任务及其保留输出；运行中的任务必须先 signal 并 wait。 |
 | `system_info` | 无 | 运行时间、内存、系统盘和可用的负载/温度信息。 |
 | `upload_file` | `local_path`, `remote_path`, `overwrite?` | 从 proxy 所在 PC 上传一个普通文件。 |
 | `download_file` | `remote_path`, `local_path`, `overwrite?` | 下载一个普通文件到 proxy 所在 PC。 |
@@ -109,6 +114,10 @@ proxy 参数：
 | `set_remote` | `ip?`, `port?` | 动态设置远端 IPv4 或端口；至少提供一项，未提供部分保持不变。 |
 
 `overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
+
+后台任务最多同时保留 16 个。`process_start` 不经过 shell，stdin 固定为空；需要 shell 语法时可将 `program` 设为 `/bin/sh`，并使用 `args: ["-c", "..."]`。每个任务的 stdout 和 stderr 各保留最近 256 KiB，`process_output.max_bytes` 默认每路 64 KiB、最大每路 256 KiB；输出以有损 UTF-8 字符串返回，游标按原始字节计数。请求游标早于仍保留的内容时，对应 `*_truncated` 为 `true`，并从 `*_start_cursor` 继续。
+
+任务属于 agent 进程而不是单个 TCP 会话，proxy 断线重连后仍可凭 `job_id` 查询。任务不会跨 agent 进程重启持久化。达到 16 个任务时会先回收最早结束的任务；如果 16 个任务都仍在运行，新的 `process_start` 会被拒绝。`process_close` 可用于及时释放已结束任务。
 
 `read_file_lines` 未提供 `end_line` 时读取从 `start_line` 开始的 200 行；为定位行号最多扫描 64 MiB。达到 `max_bytes` 时不会返回半行，`next_line` 指向下一次应读取的行。
 
@@ -195,4 +204,4 @@ cargo check --target aarch64-unknown-linux-musl
 cargo check --target armv7-unknown-linux-musleabihf
 ```
 
-测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。
+测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现、后台任务增量输出与断线重连，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。

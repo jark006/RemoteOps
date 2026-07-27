@@ -167,7 +167,7 @@ fn read_bounded(mut reader: impl Read) -> (Vec<u8>, bool) {
 }
 
 #[cfg(unix)]
-fn set_process_group(command: &mut Command) {
+pub(super) fn set_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     unsafe {
         command.pre_exec(|| {
@@ -196,11 +196,17 @@ fn terminate(child: &mut std::process::Child) -> AgentResult<()> {
 }
 
 #[cfg(windows)]
-struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
+pub(super) struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
+
+// Windows kernel handles may be used from any thread while the handle remains open.
+#[cfg(windows)]
+unsafe impl Send for WindowsJob {}
+#[cfg(windows)]
+unsafe impl Sync for WindowsJob {}
 
 #[cfg(windows)]
 impl WindowsJob {
-    fn new() -> AgentResult<Self> {
+    pub(super) fn new() -> AgentResult<Self> {
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -234,7 +240,7 @@ impl WindowsJob {
         Ok(job)
     }
 
-    fn assign(&self, child: &std::process::Child) -> AgentResult<()> {
+    pub(super) fn assign(&self, child: &std::process::Child) -> AgentResult<()> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
@@ -248,7 +254,7 @@ impl WindowsJob {
         Ok(())
     }
 
-    fn terminate(&self) -> AgentResult<()> {
+    pub(super) fn terminate(&self) -> AgentResult<()> {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
         if unsafe { TerminateJobObject(self.0, 1) } == 0 {
