@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::net::{SocketAddrV4, TcpListener};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,7 +14,9 @@ use remote_ops_protocol::{
     SessionOptions,
 };
 use remote_ops_proxy::client::RemoteClient;
+use remote_ops_proxy::deployment::{self, SyncOptions};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const BACKGROUND_JOB_TEST_ROLE: &str = "REMOTE_OPS_BACKGROUND_E2E_ROLE";
 
@@ -159,10 +162,20 @@ fn binary_file_round_trip_crosses_multiple_chunks() {
                 &source.to_string_lossy(),
                 &remote_file.to_string_lossy(),
                 true,
+                if cfg!(unix) { Some(0o750) } else { None },
+                false,
             )
             .unwrap();
         assert_eq!(upload["bytes_transferred"], 150_000);
         assert_eq!(fs::read(&remote_file).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&remote_file).unwrap().permissions().mode() & 0o7777,
+                0o750
+            );
+        }
 
         let stat = client.call("stat", json!({"path": remote_file})).unwrap();
         assert_eq!(stat["size"], 150_000);
@@ -172,12 +185,208 @@ fn binary_file_round_trip_crosses_multiple_chunks() {
                 &remote_file.to_string_lossy(),
                 &downloaded.to_string_lossy(),
                 true,
+                false,
             )
             .unwrap();
         assert_eq!(download["bytes_transferred"], 150_000);
         assert_eq!(upload["sha256"], download["sha256"]);
         assert_eq!(fs::read(downloaded).unwrap(), bytes);
     }
+    server.join().unwrap();
+}
+
+#[test]
+fn resumable_transfers_verify_existing_prefixes() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
+    });
+    let local = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let source = local.path().join("source.bin");
+    let remote_file = remote.path().join("remote.bin");
+    let downloaded = local.path().join("downloaded.bin");
+    let bytes: Vec<u8> = (0..180_000).map(|index| (index % 239) as u8).collect();
+    fs::write(&source, &bytes).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let upload_partial = remote.path().join(format!(
+        ".remoteops-upload-remote.bin-{}.part",
+        &sha256[..16]
+    ));
+    fs::write(&upload_partial, &bytes[..70_000]).unwrap();
+
+    let mut client = RemoteClient::new(
+        address.to_string().parse().unwrap(),
+        Duration::from_secs(5),
+        DEFAULT_MAX_TRANSFER_BYTES,
+    );
+    let upload = client
+        .upload(
+            &source.to_string_lossy(),
+            &remote_file.to_string_lossy(),
+            true,
+            None,
+            true,
+        )
+        .unwrap();
+    assert_eq!(upload["resumed_from"], 70_000);
+    assert_eq!(upload["bytes_transferred"], 110_000);
+    assert_eq!(fs::read(&remote_file).unwrap(), bytes);
+
+    let download_partial = local.path().join(".remoteops-download-downloaded.bin.part");
+    fs::write(&download_partial, &bytes[..90_000]).unwrap();
+    let download = client
+        .download(
+            &remote_file.to_string_lossy(),
+            &downloaded.to_string_lossy(),
+            true,
+            true,
+        )
+        .unwrap();
+    assert_eq!(download["resumed_from"], 90_000);
+    assert_eq!(download["bytes_transferred"], 90_000);
+    assert_eq!(download["sha256"], sha256);
+    assert_eq!(fs::read(&downloaded).unwrap(), bytes);
+    drop(client);
+    server.join().unwrap();
+}
+
+#[test]
+fn directory_sync_transfers_only_changes_and_retains_previous_tree() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
+    });
+    let local = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    fs::create_dir_all(local.path().join("bin")).unwrap();
+    fs::create_dir_all(local.path().join("ignored")).unwrap();
+    fs::write(local.path().join("bin/app"), "v1").unwrap();
+    fs::write(local.path().join("config"), "same").unwrap();
+    fs::write(local.path().join("ignored/cache"), "skip").unwrap();
+    let destination = remote.path().join("release");
+    let options = || SyncOptions {
+        excludes: vec!["ignored".to_string()],
+        max_files: 100,
+        max_total_bytes: 1024,
+        max_depth: 8,
+    };
+    let mut client = RemoteClient::new(
+        address.to_string().parse().unwrap(),
+        Duration::from_secs(5),
+        DEFAULT_MAX_TRANSFER_BYTES,
+    );
+    let first = deployment::sync_directory(
+        &mut client,
+        &local.path().to_string_lossy(),
+        &destination.to_string_lossy(),
+        options(),
+    )
+    .unwrap();
+    assert_eq!(first["files_transferred"], 2);
+    assert!(!destination.join("ignored").exists());
+
+    fs::write(local.path().join("bin/app"), "v2").unwrap();
+    let second = deployment::sync_directory(
+        &mut client,
+        &local.path().to_string_lossy(),
+        &destination.to_string_lossy(),
+        options(),
+    )
+    .unwrap();
+    assert_eq!(second["files_transferred"], 1);
+    assert_eq!(second["files_reused"], 1);
+    assert_eq!(
+        fs::read_to_string(destination.join("bin/app")).unwrap(),
+        "v2"
+    );
+    let backup = second["backup_path"].as_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(PathBuf::from(backup).join("bin/app")).unwrap(),
+        "v1"
+    );
+    drop(client);
+    server.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn release_deployment_switches_atomically_and_rolls_back_failed_health() {
+    use std::collections::BTreeMap;
+
+    use remote_ops_protocol::CommandSpec;
+    use remote_ops_proxy::deployment::DeployOptions;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
+    });
+    let local_v1 = tempfile::tempdir().unwrap();
+    let local_v2 = tempfile::tempdir().unwrap();
+    fs::write(local_v1.path().join("version"), "v1").unwrap();
+    fs::write(local_v2.path().join("version"), "v2").unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let releases = remote.path().join("releases");
+    let current = remote.path().join("current");
+    let command = |program: &str| CommandSpec {
+        program: program.to_string(),
+        args: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+        timeout_ms: 5_000,
+    };
+    let options = |local: &PathBuf, release_id: &str, health: &str| DeployOptions {
+        local_path: local.to_string_lossy().into_owned(),
+        releases_path: releases.to_string_lossy().into_owned(),
+        current_path: current.to_string_lossy().into_owned(),
+        release_id: release_id.to_string(),
+        expected_arch: Some(std::env::consts::ARCH.to_string()),
+        min_free_bytes: 0,
+        dependencies: vec!["true".to_string()],
+        stop: Some(command("/bin/true")),
+        start: command("/bin/true"),
+        health: command(health),
+        rollback_start: Some(command("/bin/true")),
+        sync: SyncOptions {
+            excludes: Vec::new(),
+            max_files: 100,
+            max_total_bytes: 1024,
+            max_depth: 8,
+        },
+    };
+    let mut client = RemoteClient::new(
+        address.to_string().parse().unwrap(),
+        Duration::from_secs(5),
+        DEFAULT_MAX_TRANSFER_BYTES,
+    );
+    let first = deployment::deploy_release(
+        &mut client,
+        options(&local_v1.path().to_path_buf(), "v1", "/bin/true"),
+    )
+    .unwrap();
+    assert_eq!(first["status"], "deployed");
+    let first_target = fs::read_link(&current).unwrap();
+    assert_eq!(fs::read_to_string(current.join("version")).unwrap(), "v1");
+
+    let second = deployment::deploy_release(
+        &mut client,
+        options(&local_v2.path().to_path_buf(), "v2", "/bin/false"),
+    )
+    .unwrap();
+    assert_eq!(second["status"], "rolled_back");
+    assert_eq!(second["rolled_back"], true);
+    assert_eq!(fs::read_link(&current).unwrap(), first_target);
+    assert_eq!(fs::read_to_string(current.join("version")).unwrap(), "v1");
+    drop(client);
     server.join().unwrap();
 }
 
@@ -288,7 +497,7 @@ fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
         .collect();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 30);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 38);
     assert_eq!(
         lines[2]["result"]["structuredContent"]["address"],
         "192.168.43.106:8022"
@@ -321,6 +530,8 @@ fn upload_rejection_before_chunks_remains_structured() {
                 &source.to_string_lossy(),
                 &destination.to_string_lossy(),
                 true,
+                None,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.kind, "invalid_params");

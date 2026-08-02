@@ -7,6 +7,10 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use remote_ops_protocol::{
+    DeployActivateRequest, DeployPreflightRequest, SyncFinishRequest, SyncPrepareRequest,
+};
+
 use error::{AgentError, AgentResult};
 use tools::jobs::JobManager;
 
@@ -71,6 +75,60 @@ pub fn dispatch(
         "file_hash" => {
             let args: HashArgs = decode(arguments)?;
             tools::files::file_hash(&args.path, args.max_bytes)
+        }
+        "mkdir" => {
+            let args: MkdirArgs = decode(arguments)?;
+            tools::file_ops::mkdir(&args.path, args.recursive, args.mode)
+        }
+        "remove" => {
+            let args: RemoveArgs = decode(arguments)?;
+            tools::file_ops::remove(&args.path, args.recursive)
+        }
+        "move" => {
+            let args: MoveArgs = decode(arguments)?;
+            tools::file_ops::move_path(&args.source, &args.destination, args.overwrite)
+        }
+        "copy" => {
+            let args: CopyArgs = decode(arguments)?;
+            tools::file_ops::copy_path(
+                &args.source,
+                &args.destination,
+                args.overwrite,
+                args.recursive,
+            )
+        }
+        "chmod" => {
+            let args: ChmodArgs = decode(arguments)?;
+            tools::file_ops::chmod(&args.path, args.mode)
+        }
+        "symlink" => {
+            let args: SymlinkArgs = decode(arguments)?;
+            tools::file_ops::symlink(
+                &args.target,
+                &args.link_path,
+                args.overwrite,
+                args.target_kind.as_deref(),
+            )
+        }
+        "sync_prepare" => {
+            let args: SyncPrepareRequest = decode(arguments)?;
+            tools::deployment::sync_prepare(args)
+        }
+        "sync_commit" => {
+            let args: SyncFinishRequest = decode(arguments)?;
+            tools::deployment::sync_commit(args)
+        }
+        "sync_abort" => {
+            let args: SyncFinishRequest = decode(arguments)?;
+            tools::deployment::sync_abort(args)
+        }
+        "deploy_preflight" => {
+            let args: DeployPreflightRequest = decode(arguments)?;
+            tools::deployment::deploy_preflight(args)
+        }
+        "deploy_activate" => {
+            let args: DeployActivateRequest = decode(arguments)?;
+            tools::deployment::deploy_activate(args)
         }
         "pids" => {
             let args: PidsArgs = decode(arguments)?;
@@ -300,6 +358,60 @@ struct HashArgs {
     path: String,
     #[serde(default = "default_hash_bytes")]
     max_bytes: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MkdirArgs {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+    mode: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveArgs {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveArgs {
+    source: String,
+    destination: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyArgs {
+    source: String,
+    destination: String,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    recursive: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChmodArgs {
+    path: String,
+    mode: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymlinkArgs {
+    target: String,
+    link_path: String,
+    #[serde(default)]
+    overwrite: bool,
+    target_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -551,5 +663,43 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind, "invalid_params");
+    }
+
+    #[test]
+    fn deployment_file_arguments_are_validated_on_agent() {
+        let jobs = JobManager::new();
+        let invalid_calls = [
+            ("mkdir", json!({"path":"","mode":0})),
+            ("mkdir", json!({"path":"path","mode":4096})),
+            ("remove", json!({"path":""})),
+            ("move", json!({"source":"same","destination":"same"})),
+            ("copy", json!({"source":"same","destination":"same"})),
+            ("chmod", json!({"path":"path","mode":4096})),
+            (
+                "symlink",
+                json!({"target":"a","link_path":"b","target_kind":"other"}),
+            ),
+            (
+                "sync_prepare",
+                json!({
+                    "remote_path":"target",
+                    "manifest_sha256":"0".repeat(64),
+                    "entries":[],
+                    "max_files":0,
+                    "max_total_bytes":0,
+                    "max_depth":1
+                }),
+            ),
+        ];
+        for (operation, arguments) in invalid_calls {
+            let error = dispatch(
+                operation,
+                arguments,
+                &jobs,
+                remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind, "invalid_params", "{operation}");
+        }
     }
 }

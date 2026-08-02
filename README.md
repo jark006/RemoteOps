@@ -85,7 +85,7 @@ proxy 参数：
 
 ## 🛠️ MCP 工具
 
-proxy 当前暴露 30 个 MCP 工具：
+proxy 当前暴露 38 个 MCP 工具：
 
 | 工具 | 主要参数 | 说明 |
 | --- | --- | --- |
@@ -98,6 +98,14 @@ proxy 当前暴露 30 个 MCP 工具：
 | `grep` | `path`, `pattern`, `glob?`, `case_sensitive?`, `max_results?`, `max_file_bytes?` | 对远端普通 UTF-8 文件执行有界逐行 Rust 正则搜索。 |
 | `stat` | `path` | 不跟随符号链接读取元数据。 |
 | `file_hash` | `path`, `max_bytes?` | 计算最大 64 MiB 文件的 SHA-256。 |
+| `mkdir` | `path`, `recursive?`, `mode?` | 创建精确指定的远端目录；可显式递归创建父目录并设置 Unix mode。 |
+| `remove` | `path`, `recursive?` | 删除一个精确路径；目录默认只允许空目录，递归删除必须显式开启。 |
+| `move` | `source`, `destination`, `overwrite?` | 同一文件系统内移动文件、目录或符号链接；跨文件系统返回结构化错误。 |
+| `copy` | `source`, `destination`, `overwrite?`, `recursive?` | 复制普通文件或显式递归复制目录，不跟随符号链接。 |
+| `chmod` | `path`, `mode` | 在 Unix 上设置普通文件或目录 mode，不跟随符号链接。 |
+| `symlink` | `target`, `link_path`, `overwrite?`, `target_kind?` | 创建一个符号链接；Windows 必须提供 `target_kind`。 |
+| `sync_directory` | `local_path`, `remote_path`, `excludes?`, `max_files?`, `max_total_bytes?`, `max_depth?` | 生成 manifest，只上传变化文件，在远端 staging 完整校验后切换目录并保留旧树。 |
+| `deploy_release` | `local_path`, `releases_path`, `current_path`, `release_id`, `start`, `health`, ... | Unix 发布事务：preflight、同步独立 release、原子切换 symlink、启动和健康检查，失败自动回滚。 |
 | `pids` | `filter?`, `cursor?`, `limit?` | Linux/Windows/macOS 进程分页；不可读取的 Windows/macOS 命令行返回空字符串。 |
 | `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。 |
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
@@ -110,8 +118,8 @@ proxy 当前暴露 30 个 MCP 工具：
 | `process_signal` | `job_id`, `signal?` | 向 Unix 任务进程组发送信号；Windows 接受 9/15 并终止整个 Job Object。 |
 | `process_close` | `job_id` | 释放已结束任务及其保留输出；运行中的任务必须先 signal 并 wait。 |
 | `system_info` | 无 | 有界读取系统、CPU、身份权限、网络、文件系统、时间、init 和工具链画像。 |
-| `upload_file` | `local_path`, `remote_path`, `overwrite?` | 从 proxy 所在 PC 上传一个普通文件。 |
-| `download_file` | `remote_path`, `local_path`, `overwrite?` | 下载一个普通文件到 proxy 所在 PC。 |
+| `upload_file` | `local_path`, `remote_path`, `overwrite?`, `mode?`, `resume?` | 从 proxy 所在 PC 上传一个普通文件，可设置 Unix mode 并校验续传。 |
+| `download_file` | `remote_path`, `local_path`, `overwrite?`, `resume?` | 下载一个普通文件到 proxy 所在 PC，可校验续传。 |
 | `remote_status` | 无 | 被动查询地址、缓存连接、生命周期状态，以及最近一次成功、错误、探测和 Agent 信息，不主动连接。 |
 | `set_remote` | `ip?`, `port?` | 动态设置远端 IPv4 或端口；至少提供一项，未提供部分保持不变。 |
 | `agent_info` | 无 | 查询 Agent 版本、协议、构建信息、运行实例、平台、能力和限制。 |
@@ -120,7 +128,13 @@ proxy 当前暴露 30 个 MCP 工具：
 | `reboot` | `delay_ms?` | 请求 Agent 延迟重启设备，并将 proxy 生命周期状态切换为 `rebooting`。 |
 | `agent_update` | `local_path`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 上传并验证 Agent 候选程序，原子替换、重启验证，失败时自动回滚。 |
 
-`overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
+`upload_file` 和 `download_file` 的 `overwrite` 默认为 `true`，`resume` 默认为 `false`。续传开启后，接收端保留同目录 partial 文件，双方先校验已传前缀的 SHA-256，再从确认的字节偏移继续；远端内容变化导致下载前缀不匹配时会安全回退到偏移 0。最终仍校验完整长度和 SHA-256，成功前不会暴露半文件。`upload_file.mode` 范围为 `0..=0o7777`，只在 Unix Agent 上支持。单文件传输拒绝目录、符号链接和特殊文件。
+
+`mkdir`、`remove`、`move`、`copy`、`chmod` 和 `symlink` 都要求精确路径。`remove` 的递归模式和 `copy` 的目录递归模式最多处理 100,000 个条目，先拒绝特殊文件；递归复制不接受符号链接。`move` 不隐式退化为 copy-delete，遇到跨文件系统移动返回 `cross_filesystem`。覆盖目录始终被拒绝，覆盖非目录必须显式设置 `overwrite`。
+
+`sync_directory` 在 proxy 所在 PC 扫描普通文件和目录，拒绝符号链接、特殊文件及非 UTF-8 相对路径。manifest 默认最多 4,096 个条目、4 GiB、32 层，硬上限分别为 10,000 个、4 GiB、64 层；最多 64 个排除 glob，每个最多 1 KiB。Agent 将远端未变化文件复制进 staging，只传输大小或 SHA-256 不同的文件，并保留文件、目录及根目录 Unix mode。提交前逐项复核 staging，随后将旧目标改名为返回的 `backup_path`，不会静默删除备份。
+
+`deploy_release` 仅在 Unix Agent 上支持。`release_id` 只能使用 ASCII 字母、数字、`.`、`_` 和 `-`；新版本同步到 `releases_path/release_id`。preflight 检查远端架构、所需磁盘空间、release/current 父目录写权限和最多 64 个依赖程序。`stop`、`start`、`health`、`rollback_start` 均采用与 `exec` 相同的不经过 shell 的结构化命令，单步最长 300 秒；`start` 和 `health` 必填。Agent 在同一请求内停止服务、原子替换 `current_path` symlink、启动并执行健康检查，启动或健康检查失败时切回旧 symlink，并按 `rollback_start`（默认复用 `start`）恢复旧服务。
 
 `system_info` 保留原有的主机、内核、运行时间、负载、内存、系统盘和温度字段，并新增 `os`、`cpu`、`identity`、`network`、`filesystems`、`time`、`init_system` 和 `toolchains`。Linux 会解析 `/etc/os-release`、CPU 拓扑和 libc/ABI，当前用户、组、umask 与 capabilities，网卡/IP、IPv4/IPv6 路由、DNS、TCP/UDP 监听端口，以及 mount 类型、空间、inode 和只读状态。网卡最多 128 个、地址最多 512 个、路由最多 256 条、监听端口最多 512 个、mount 最多 256 个、工具链最多 24 个；各集合通过 `available` 和 `truncated` 区分平台不可采集与结果截断。Windows/macOS 返回可可靠采集的同构字段，Linux 专属信息明确标记为不可用，不伪造数据。
 
@@ -161,7 +175,7 @@ proxy 当前暴露 30 个 MCP 工具：
 
 ## 🔒 传输协议和安全边界
 
-- 当前远端协议版本为 2；proxy 与 agent 版本不一致时握手失败，不进行兼容降级。
+- 当前远端协议版本为 3；proxy 与 agent 版本不一致时握手失败，不进行兼容降级。v3 增加续传偏移/前缀哈希、上传 mode、目录 manifest 和部署事务消息。
 - TCP 握手使用双方随机 nonce 和内置值 `JARK006_PSK` 派生会话密钥。
 - 帧头、请求 ID、序号和 payload 均受 HMAC 保护，用于避免本地网络中的误连接和传输损坏。
 - 控制帧最大 2 MiB，二进制 chunk 固定上限 64 KiB。
@@ -224,4 +238,4 @@ cargo check -p remote-ops-agent --target aarch64-unknown-linux-musl
 cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabihf
 ```
 
-测试包含认证失败、HMAC 标准向量、帧篡改与重放、MCP stdio 发现、后台任务增量输出与断线重连、Agent 生命周期与更新校验，以及跨多个 chunk 的 150,000 字节二进制上传/下载往返。
+测试包含认证失败、协议版本拒绝、HMAC 标准向量、帧篡改与重放、MCP stdio 发现、后台任务增量输出与断线重连、Agent 生命周期与更新校验、跨多个 chunk 的二进制往返、前缀校验续传、只传变化文件的目录同步，以及 Unix 发布切换和健康检查失败回滚。

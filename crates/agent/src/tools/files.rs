@@ -1057,6 +1057,17 @@ pub fn persist_replace(temp: NamedTempFile, target: &Path, overwrite: bool) -> A
     sync_parent_directory(target)
 }
 
+pub fn persist_path_replace(source: &Path, target: &Path, overwrite: bool) -> AgentResult<()> {
+    if target.exists() && !overwrite {
+        return Err(AgentError::invalid(format!(
+            "destination already exists: {}",
+            target.display()
+        )));
+    }
+    platform_persist_path(source, target)?;
+    sync_parent_directory(target)
+}
+
 pub fn preserve_existing_mode(target: &Path, temporary: &Path) -> AgentResult<()> {
     #[cfg(unix)]
     if let Ok(metadata) = fs::metadata(target) {
@@ -1072,6 +1083,12 @@ fn platform_persist(temp: NamedTempFile, target: &Path) -> AgentResult<()> {
     temp.persist(target)
         .map(|_| ())
         .map_err(|error| AgentError::io(format!("persist {}", target.display()), error.error))
+}
+
+#[cfg(not(windows))]
+fn platform_persist_path(source: &Path, target: &Path) -> AgentResult<()> {
+    fs::rename(source, target)
+        .map_err(|error| AgentError::io(format!("persist {}", target.display()), error))
 }
 
 #[cfg(unix)]
@@ -1109,6 +1126,36 @@ fn platform_persist(temp: NamedTempFile, target: &Path) -> AgentResult<()> {
         )
     };
     if result == 0 {
+        Err(AgentError::io(
+            format!("persist {}", target.display()),
+            std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn platform_persist_path(source: &Path, target: &Path) -> AgentResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "Kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
         Err(AgentError::io(
             format!("persist {}", target.display()),
             std::io::Error::last_os_error(),

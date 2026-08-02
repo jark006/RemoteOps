@@ -36,6 +36,17 @@ pub const SUPPORTED_OPERATIONS: &[&str] = &[
     "grep",
     "stat",
     "file_hash",
+    "mkdir",
+    "remove",
+    "move",
+    "copy",
+    "chmod",
+    "symlink",
+    "sync_prepare",
+    "sync_commit",
+    "sync_abort",
+    "deploy_preflight",
+    "deploy_activate",
     "pids",
     "process_info",
     "kill",
@@ -114,7 +125,10 @@ pub fn agent_info(max_transfer_bytes: u64) -> Value {
             "active_probe": true,
             "wait_remote": true,
             "reboot": reboot_supported(),
-            "self_update": executable.is_some() && staging.is_some()
+            "self_update": executable.is_some() && staging.is_some(),
+            "resumable_transfers": true,
+            "directory_sync": true,
+            "release_deployment": cfg!(unix)
         },
         "limits": {
             "max_control_bytes": DEFAULT_MAX_CONTROL_BYTES,
@@ -130,7 +144,13 @@ pub fn agent_info(max_transfer_bytes: u64) -> Value {
             "max_process_wait_ms": MAX_PROCESS_WAIT_MS,
             "apply_patch_max_patch_bytes": APPLY_PATCH_MAX_PATCH_BYTES,
             "apply_patch_max_file_bytes": APPLY_PATCH_MAX_FILE_BYTES,
-            "apply_patch_max_hunks": APPLY_PATCH_MAX_HUNKS
+            "apply_patch_max_hunks": APPLY_PATCH_MAX_HUNKS,
+            "max_file_operation_entries": remote_ops_protocol::MAX_FILE_OPERATION_ENTRIES,
+            "default_sync_max_files": remote_ops_protocol::DEFAULT_SYNC_MAX_FILES,
+            "max_sync_files": remote_ops_protocol::MAX_SYNC_FILES,
+            "default_sync_max_depth": remote_ops_protocol::DEFAULT_SYNC_MAX_DEPTH,
+            "max_sync_depth": remote_ops_protocol::MAX_SYNC_DEPTH,
+            "max_sync_exclude_patterns": remote_ops_protocol::MAX_SYNC_EXCLUDE_PATTERNS
         },
         "update": {
             "executable_path": executable.as_ref().map(|path| path.to_string_lossy().into_owned()),

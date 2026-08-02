@@ -1,12 +1,15 @@
 use globset::Glob;
 use regex::RegexBuilder;
 use remote_ops_protocol::{
-    APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, DEFAULT_PROCESS_JOB_TIMEOUT_MS,
-    DEFAULT_PROCESS_OUTPUT_BYTES, DEFAULT_PROCESS_WAIT_MS, DEFAULT_REBOOT_DELAY_MS,
-    DEFAULT_REMOTE_PROBE_TIMEOUT_MS, DEFAULT_WAIT_REMOTE_POLL_MS, DEFAULT_WAIT_REMOTE_TIMEOUT_MS,
-    MAX_PROCESS_JOB_TIMEOUT_MS, MAX_PROCESS_OUTPUT_BYTES, MAX_PROCESS_WAIT_MS, MAX_REBOOT_DELAY_MS,
-    MAX_REMOTE_PROBE_TIMEOUT_MS, MAX_WAIT_REMOTE_POLL_MS, MAX_WAIT_REMOTE_TIMEOUT_MS,
-    MIN_REBOOT_DELAY_MS, MIN_REMOTE_PROBE_TIMEOUT_MS, MIN_WAIT_REMOTE_POLL_MS,
+    APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, CommandSpec, DEFAULT_MAX_TRANSFER_BYTES,
+    DEFAULT_PROCESS_JOB_TIMEOUT_MS, DEFAULT_PROCESS_OUTPUT_BYTES, DEFAULT_PROCESS_WAIT_MS,
+    DEFAULT_REBOOT_DELAY_MS, DEFAULT_REMOTE_PROBE_TIMEOUT_MS, DEFAULT_SYNC_MAX_DEPTH,
+    DEFAULT_SYNC_MAX_FILES, DEFAULT_WAIT_REMOTE_POLL_MS, DEFAULT_WAIT_REMOTE_TIMEOUT_MS,
+    MAX_DEPLOY_DEPENDENCIES, MAX_PROCESS_JOB_TIMEOUT_MS, MAX_PROCESS_OUTPUT_BYTES,
+    MAX_PROCESS_WAIT_MS, MAX_REBOOT_DELAY_MS, MAX_RELEASE_ID_BYTES, MAX_REMOTE_PROBE_TIMEOUT_MS,
+    MAX_SYNC_DEPTH, MAX_SYNC_EXCLUDE_PATTERNS, MAX_SYNC_FILES, MAX_SYNC_GLOB_BYTES, MAX_UNIX_MODE,
+    MAX_WAIT_REMOTE_POLL_MS, MAX_WAIT_REMOTE_TIMEOUT_MS, MIN_REBOOT_DELAY_MS,
+    MIN_REMOTE_PROBE_TIMEOUT_MS, MIN_WAIT_REMOTE_POLL_MS,
     PROTOCOL_VERSION as REMOTE_PROTOCOL_VERSION,
 };
 use serde::Deserialize;
@@ -15,6 +18,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 use crate::client::{ClientError, RemoteClient};
+use crate::deployment::{self, DeployOptions, SyncOptions};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -88,9 +92,57 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
 
     let result = match name {
         "upload_file" => decode_transfer::<UploadArgs>(&arguments)
-            .and_then(|args| client.upload(&args.local_path, &args.remote_path, args.overwrite)),
+            .and_then(validate_upload_args)
+            .and_then(|args| {
+                client.upload(
+                    &args.local_path,
+                    &args.remote_path,
+                    args.overwrite,
+                    args.mode,
+                    args.resume,
+                )
+            }),
         "download_file" => decode_transfer::<DownloadArgs>(&arguments)
-            .and_then(|args| client.download(&args.remote_path, &args.local_path, args.overwrite)),
+            .and_then(validate_download_args)
+            .and_then(|args| {
+                client.download(
+                    &args.remote_path,
+                    &args.local_path,
+                    args.overwrite,
+                    args.resume,
+                )
+            }),
+        "mkdir" => decode_transfer::<MkdirArgs>(&arguments)
+            .and_then(validate_mkdir_args)
+            .and_then(|_| client.call(name, arguments)),
+        "remove" => decode_transfer::<RemoveArgs>(&arguments)
+            .and_then(validate_remove_args)
+            .and_then(|_| client.call(name, arguments)),
+        "move" => decode_transfer::<MoveArgs>(&arguments)
+            .and_then(validate_move_args)
+            .and_then(|_| client.call(name, arguments)),
+        "copy" => decode_transfer::<CopyArgs>(&arguments)
+            .and_then(validate_copy_args)
+            .and_then(|_| client.call(name, arguments)),
+        "chmod" => decode_transfer::<ChmodArgs>(&arguments)
+            .and_then(validate_chmod_args)
+            .and_then(|_| client.call(name, arguments)),
+        "symlink" => decode_transfer::<SymlinkArgs>(&arguments)
+            .and_then(validate_symlink_args)
+            .and_then(|_| client.call(name, arguments)),
+        "sync_directory" => decode_transfer::<SyncDirectoryArgs>(&arguments)
+            .and_then(validate_sync_directory_args)
+            .and_then(|args| {
+                deployment::sync_directory(
+                    client,
+                    &args.local_path,
+                    &args.remote_path,
+                    args.sync_options(),
+                )
+            }),
+        "deploy_release" => decode_transfer::<DeployReleaseArgs>(&arguments)
+            .and_then(validate_deploy_release_args)
+            .and_then(|args| deployment::deploy_release(client, args.into_options())),
         "remote_status" => decode_transfer::<EmptyArgs>(&arguments).map(|_| client.remote_status()),
         "set_remote" => decode_transfer::<SetRemoteArgs>(&arguments)
             .and_then(|args| client.set_remote(args.ip, args.port)),
@@ -220,6 +272,9 @@ struct UploadArgs {
     remote_path: String,
     #[serde(default = "default_true")]
     overwrite: bool,
+    mode: Option<u32>,
+    #[serde(default)]
+    resume: bool,
 }
 
 #[derive(Deserialize)]
@@ -229,6 +284,163 @@ struct DownloadArgs {
     local_path: String,
     #[serde(default = "default_true")]
     overwrite: bool,
+    #[serde(default)]
+    resume: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MkdirArgs {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+    mode: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveArgs {
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveArgs {
+    source: String,
+    destination: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CopyArgs {
+    source: String,
+    destination: String,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    recursive: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChmodArgs {
+    path: String,
+    mode: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SymlinkArgs {
+    target: String,
+    link_path: String,
+    #[serde(default)]
+    overwrite: bool,
+    target_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncDirectoryArgs {
+    local_path: String,
+    remote_path: String,
+    #[serde(default)]
+    excludes: Vec<String>,
+    #[serde(default = "default_sync_max_files")]
+    max_files: usize,
+    #[serde(default = "default_sync_max_total_bytes")]
+    max_total_bytes: u64,
+    #[serde(default = "default_sync_max_depth")]
+    max_depth: usize,
+}
+
+impl SyncDirectoryArgs {
+    fn sync_options(&self) -> SyncOptions {
+        SyncOptions {
+            excludes: self.excludes.clone(),
+            max_files: self.max_files,
+            max_total_bytes: self.max_total_bytes,
+            max_depth: self.max_depth,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeployCommandArgs {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    cwd: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default = "default_command_timeout")]
+    timeout_ms: u64,
+}
+
+impl DeployCommandArgs {
+    fn into_spec(self) -> CommandSpec {
+        CommandSpec {
+            program: self.program,
+            args: self.args,
+            cwd: self.cwd,
+            env: self.env,
+            timeout_ms: self.timeout_ms,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeployReleaseArgs {
+    local_path: String,
+    releases_path: String,
+    current_path: String,
+    release_id: String,
+    expected_arch: Option<String>,
+    #[serde(default)]
+    min_free_bytes: u64,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    stop: Option<DeployCommandArgs>,
+    start: DeployCommandArgs,
+    health: DeployCommandArgs,
+    rollback_start: Option<DeployCommandArgs>,
+    #[serde(default)]
+    excludes: Vec<String>,
+    #[serde(default = "default_sync_max_files")]
+    max_files: usize,
+    #[serde(default = "default_sync_max_total_bytes")]
+    max_total_bytes: u64,
+    #[serde(default = "default_sync_max_depth")]
+    max_depth: usize,
+}
+
+impl DeployReleaseArgs {
+    fn into_options(self) -> DeployOptions {
+        DeployOptions {
+            local_path: self.local_path,
+            releases_path: self.releases_path,
+            current_path: self.current_path,
+            release_id: self.release_id,
+            expected_arch: self.expected_arch,
+            min_free_bytes: self.min_free_bytes,
+            dependencies: self.dependencies,
+            stop: self.stop.map(DeployCommandArgs::into_spec),
+            start: self.start.into_spec(),
+            health: self.health.into_spec(),
+            rollback_start: self.rollback_start.map(DeployCommandArgs::into_spec),
+            sync: SyncOptions {
+                excludes: self.excludes,
+                max_files: self.max_files,
+                max_total_bytes: self.max_total_bytes,
+                max_depth: self.max_depth,
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -406,6 +618,22 @@ fn default_list_depth() -> usize {
     16
 }
 
+fn default_sync_max_files() -> usize {
+    DEFAULT_SYNC_MAX_FILES
+}
+
+fn default_sync_max_total_bytes() -> u64 {
+    DEFAULT_MAX_TRANSFER_BYTES
+}
+
+fn default_sync_max_depth() -> usize {
+    DEFAULT_SYNC_MAX_DEPTH
+}
+
+fn default_command_timeout() -> u64 {
+    10_000
+}
+
 fn default_process_job_timeout() -> u64 {
     DEFAULT_PROCESS_JOB_TIMEOUT_MS
 }
@@ -432,6 +660,216 @@ fn default_wait_remote_poll() -> u64 {
 
 fn default_reboot_delay() -> u64 {
     DEFAULT_REBOOT_DELAY_MS
+}
+
+fn validate_upload_args(args: UploadArgs) -> Result<UploadArgs, ClientError> {
+    validate_local_path(&args.local_path, "local_path")?;
+    validate_remote_path(&args.remote_path)?;
+    validate_mode(args.mode)?;
+    Ok(args)
+}
+
+fn validate_download_args(args: DownloadArgs) -> Result<DownloadArgs, ClientError> {
+    validate_remote_path(&args.remote_path)?;
+    validate_local_path(&args.local_path, "local_path")?;
+    Ok(args)
+}
+
+fn validate_mkdir_args(args: MkdirArgs) -> Result<MkdirArgs, ClientError> {
+    validate_remote_path(&args.path)?;
+    validate_mode(args.mode)?;
+    let _ = args.recursive;
+    Ok(args)
+}
+
+fn validate_remove_args(args: RemoveArgs) -> Result<RemoveArgs, ClientError> {
+    validate_remote_path(&args.path)?;
+    let _ = args.recursive;
+    Ok(args)
+}
+
+fn validate_move_args(args: MoveArgs) -> Result<MoveArgs, ClientError> {
+    validate_remote_path(&args.source)?;
+    validate_remote_path(&args.destination)?;
+    if args.source == args.destination {
+        return invalid_params("source and destination must differ");
+    }
+    let _ = args.overwrite;
+    Ok(args)
+}
+
+fn validate_copy_args(args: CopyArgs) -> Result<CopyArgs, ClientError> {
+    validate_remote_path(&args.source)?;
+    validate_remote_path(&args.destination)?;
+    if args.source == args.destination {
+        return invalid_params("source and destination must differ");
+    }
+    let _ = (args.overwrite, args.recursive);
+    Ok(args)
+}
+
+fn validate_chmod_args(args: ChmodArgs) -> Result<ChmodArgs, ClientError> {
+    validate_remote_path(&args.path)?;
+    validate_mode(Some(args.mode))?;
+    Ok(args)
+}
+
+fn validate_symlink_args(args: SymlinkArgs) -> Result<SymlinkArgs, ClientError> {
+    validate_remote_path(&args.target)?;
+    validate_remote_path(&args.link_path)?;
+    if args.target == args.link_path {
+        return invalid_params("target and link_path must differ");
+    }
+    if args
+        .target_kind
+        .as_deref()
+        .is_some_and(|kind| !matches!(kind, "file" | "dir"))
+    {
+        return invalid_params("target_kind must be file or dir");
+    }
+    let _ = args.overwrite;
+    Ok(args)
+}
+
+fn validate_sync_directory_args(args: SyncDirectoryArgs) -> Result<SyncDirectoryArgs, ClientError> {
+    validate_local_path(&args.local_path, "local_path")?;
+    validate_remote_path(&args.remote_path)?;
+    validate_sync_limits(
+        &args.excludes,
+        args.max_files,
+        args.max_total_bytes,
+        args.max_depth,
+    )?;
+    Ok(args)
+}
+
+fn validate_deploy_release_args(args: DeployReleaseArgs) -> Result<DeployReleaseArgs, ClientError> {
+    validate_local_path(&args.local_path, "local_path")?;
+    validate_remote_path(&args.releases_path)?;
+    validate_remote_path(&args.current_path)?;
+    if args.release_id.is_empty()
+        || args.release_id.len() > MAX_RELEASE_ID_BYTES
+        || matches!(args.release_id.as_str(), "." | "..")
+        || !args
+            .release_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return invalid_params(
+            "release_id must use 1..=128 ASCII letters, digits, '.', '_', or '-'",
+        );
+    }
+    if args
+        .expected_arch
+        .as_deref()
+        .is_some_and(|arch| arch.is_empty() || arch.contains('\0'))
+    {
+        return invalid_params("expected_arch must not be empty or contain NUL");
+    }
+    if args.dependencies.len() > MAX_DEPLOY_DEPENDENCIES
+        || args
+            .dependencies
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 1024 || value.contains('\0'))
+    {
+        return invalid_params(
+            "dependencies must contain at most 64 non-empty paths or names of at most 1024 bytes",
+        );
+    }
+    validate_deploy_command(&args.start)?;
+    validate_deploy_command(&args.health)?;
+    if let Some(command) = &args.stop {
+        validate_deploy_command(command)?;
+    }
+    if let Some(command) = &args.rollback_start {
+        validate_deploy_command(command)?;
+    }
+    validate_sync_limits(
+        &args.excludes,
+        args.max_files,
+        args.max_total_bytes,
+        args.max_depth,
+    )?;
+    Ok(args)
+}
+
+fn validate_deploy_command(command: &DeployCommandArgs) -> Result<(), ClientError> {
+    if command.program.is_empty() || command.program.contains('\0') {
+        return invalid_params("deployment command program must not be empty or contain NUL");
+    }
+    if command.args.iter().any(|value| value.contains('\0')) {
+        return invalid_params("deployment command args must not contain NUL");
+    }
+    if command
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| cwd.is_empty() || cwd.contains('\0'))
+    {
+        return invalid_params("deployment command cwd must not be empty or contain NUL");
+    }
+    if command
+        .env
+        .iter()
+        .any(|(name, value)| name.is_empty() || name.contains(['\0', '=']) || value.contains('\0'))
+    {
+        return invalid_params("deployment command environment is invalid");
+    }
+    if command.timeout_ms > 300_000 {
+        return invalid_params("deployment command timeout_ms must be in range 0..=300000");
+    }
+    Ok(())
+}
+
+fn validate_sync_limits(
+    excludes: &[String],
+    max_files: usize,
+    max_total_bytes: u64,
+    max_depth: usize,
+) -> Result<(), ClientError> {
+    if excludes.len() > MAX_SYNC_EXCLUDE_PATTERNS {
+        return invalid_params(format!(
+            "excludes must contain at most {MAX_SYNC_EXCLUDE_PATTERNS} patterns"
+        ));
+    }
+    for pattern in excludes {
+        if pattern.is_empty() || pattern.len() > MAX_SYNC_GLOB_BYTES {
+            return invalid_params(format!(
+                "exclude patterns must contain 1..={MAX_SYNC_GLOB_BYTES} bytes"
+            ));
+        }
+        Glob::new(pattern).map_err(|error| ClientError {
+            kind: "invalid_params".to_string(),
+            message: format!("invalid exclude glob: {error}"),
+        })?;
+    }
+    if max_files == 0 || max_files > MAX_SYNC_FILES {
+        return invalid_params(format!("max_files must be in range 1..={MAX_SYNC_FILES}"));
+    }
+    if max_total_bytes > DEFAULT_MAX_TRANSFER_BYTES {
+        return invalid_params(format!(
+            "max_total_bytes must be in range 0..={DEFAULT_MAX_TRANSFER_BYTES}"
+        ));
+    }
+    if max_depth == 0 || max_depth > MAX_SYNC_DEPTH {
+        return invalid_params(format!("max_depth must be in range 1..={MAX_SYNC_DEPTH}"));
+    }
+    Ok(())
+}
+
+fn validate_mode(mode: Option<u32>) -> Result<(), ClientError> {
+    if mode.is_some_and(|mode| mode > MAX_UNIX_MODE) {
+        invalid_params(format!("mode must be in range 0..={MAX_UNIX_MODE}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_local_path(path: &str, name: &str) -> Result<(), ClientError> {
+    if path.is_empty() || path.contains('\0') {
+        invalid_params(format!("{name} must not be empty or contain NUL"))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_remote_probe_args(args: RemoteProbeArgs) -> Result<RemoteProbeArgs, ClientError> {
@@ -762,6 +1200,14 @@ pub fn tool_names() -> &'static [&'static str] {
         "grep",
         "stat",
         "file_hash",
+        "mkdir",
+        "remove",
+        "move",
+        "copy",
+        "chmod",
+        "symlink",
+        "sync_directory",
+        "deploy_release",
         "pids",
         "process_info",
         "kill",
@@ -973,6 +1419,223 @@ pub fn tool_definitions() -> Vec<Value> {
             (true, false, true),
         ),
         tool(
+            "mkdir",
+            "Create directory",
+            "Create one remote directory, with explicit recursive parent creation and optional Unix mode",
+            props(&[
+                ("path", string_prop("Exact remote directory path")),
+                ("recursive", json!({"type":"boolean","default":false})),
+                (
+                    "mode",
+                    integer_prop(
+                        0,
+                        Some(MAX_UNIX_MODE as u64),
+                        "Optional Unix permission mode",
+                    ),
+                ),
+            ]),
+            &["path"],
+            (false, true, true),
+        ),
+        tool(
+            "remove",
+            "Remove path",
+            "Remove one exact remote regular file, symlink, empty directory, or explicitly recursive directory",
+            props(&[
+                ("path", string_prop("Exact remote path")),
+                ("recursive", json!({"type":"boolean","default":false})),
+            ]),
+            &["path"],
+            (false, true, true),
+        ),
+        tool(
+            "move",
+            "Move path",
+            "Move one remote path without crossing filesystems; overwrite is limited to non-directories",
+            props(&[
+                ("source", string_prop("Exact remote source path")),
+                ("destination", string_prop("Exact remote destination path")),
+                ("overwrite", json!({"type":"boolean","default":false})),
+            ]),
+            &["source", "destination"],
+            (false, true, true),
+        ),
+        tool(
+            "copy",
+            "Copy path",
+            "Copy a remote regular file or an explicitly recursive directory without following symlinks",
+            props(&[
+                ("source", string_prop("Exact remote source path")),
+                ("destination", string_prop("Exact remote destination path")),
+                ("overwrite", json!({"type":"boolean","default":false})),
+                ("recursive", json!({"type":"boolean","default":false})),
+            ]),
+            &["source", "destination"],
+            (false, true, true),
+        ),
+        tool(
+            "chmod",
+            "Change mode",
+            "Set a Unix permission mode on one remote regular file or directory without following symlinks",
+            props(&[
+                ("path", string_prop("Exact remote path")),
+                (
+                    "mode",
+                    integer_prop(0, Some(MAX_UNIX_MODE as u64), "Unix permission mode"),
+                ),
+            ]),
+            &["path", "mode"],
+            (false, true, true),
+        ),
+        tool(
+            "symlink",
+            "Create symbolic link",
+            "Create or atomically replace one remote symbolic link; Windows requires target_kind",
+            props(&[
+                (
+                    "target",
+                    string_prop("Stored link target, which may be relative"),
+                ),
+                ("link_path", string_prop("Exact remote link path")),
+                ("overwrite", json!({"type":"boolean","default":false})),
+                (
+                    "target_kind",
+                    json!({"type":"string","enum":["file","dir"],"description":"Required on Windows"}),
+                ),
+            ]),
+            &["target", "link_path"],
+            (false, true, true),
+        ),
+        tool(
+            "sync_directory",
+            "Sync directory",
+            "Synchronize a proxy-local directory to a verified remote staging tree, upload changed files only, then commit with a retained backup",
+            props(&[
+                ("local_path", string_prop("Directory path on the proxy PC")),
+                (
+                    "remote_path",
+                    string_prop("Exact destination directory on the remote"),
+                ),
+                (
+                    "excludes",
+                    json!({"type":"array","maxItems":MAX_SYNC_EXCLUDE_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_SYNC_GLOB_BYTES},"default":[]}),
+                ),
+                (
+                    "max_files",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_SYNC_FILES as u64),
+                        DEFAULT_SYNC_MAX_FILES as u64,
+                        "Maximum manifest entries",
+                    ),
+                ),
+                (
+                    "max_total_bytes",
+                    integer_prop_default(
+                        0,
+                        Some(DEFAULT_MAX_TRANSFER_BYTES),
+                        DEFAULT_MAX_TRANSFER_BYTES,
+                        "Maximum total regular-file bytes",
+                    ),
+                ),
+                (
+                    "max_depth",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_SYNC_DEPTH as u64),
+                        DEFAULT_SYNC_MAX_DEPTH as u64,
+                        "Maximum relative directory depth",
+                    ),
+                ),
+            ]),
+            &["local_path", "remote_path"],
+            (false, true, true),
+        ),
+        tool(
+            "deploy_release",
+            "Deploy release",
+            "Preflight, stage an independent release, atomically switch the current symlink, start and health-check it, and roll back on failure",
+            props(&[
+                (
+                    "local_path",
+                    string_prop("Release directory on the proxy PC"),
+                ),
+                (
+                    "releases_path",
+                    string_prop("Remote parent directory containing releases"),
+                ),
+                (
+                    "current_path",
+                    string_prop("Remote symlink switched atomically"),
+                ),
+                (
+                    "release_id",
+                    json!({"type":"string","minLength":1,"maxLength":MAX_RELEASE_ID_BYTES,"pattern":"^[A-Za-z0-9._-]+$"}),
+                ),
+                (
+                    "expected_arch",
+                    string_prop("Optional required remote architecture"),
+                ),
+                (
+                    "min_free_bytes",
+                    integer_prop_default(
+                        0,
+                        None,
+                        0,
+                        "Free bytes retained in addition to release size",
+                    ),
+                ),
+                (
+                    "dependencies",
+                    json!({"type":"array","maxItems":MAX_DEPLOY_DEPENDENCIES,"items":{"type":"string","minLength":1,"maxLength":1024},"default":[]}),
+                ),
+                ("stop", deploy_command_schema()),
+                ("start", deploy_command_schema()),
+                ("health", deploy_command_schema()),
+                ("rollback_start", deploy_command_schema()),
+                (
+                    "excludes",
+                    json!({"type":"array","maxItems":MAX_SYNC_EXCLUDE_PATTERNS,"items":{"type":"string","minLength":1,"maxLength":MAX_SYNC_GLOB_BYTES},"default":[]}),
+                ),
+                (
+                    "max_files",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_SYNC_FILES as u64),
+                        DEFAULT_SYNC_MAX_FILES as u64,
+                        "Maximum manifest entries",
+                    ),
+                ),
+                (
+                    "max_total_bytes",
+                    integer_prop_default(
+                        0,
+                        Some(DEFAULT_MAX_TRANSFER_BYTES),
+                        DEFAULT_MAX_TRANSFER_BYTES,
+                        "Maximum total regular-file bytes",
+                    ),
+                ),
+                (
+                    "max_depth",
+                    integer_prop_default(
+                        1,
+                        Some(MAX_SYNC_DEPTH as u64),
+                        DEFAULT_SYNC_MAX_DEPTH as u64,
+                        "Maximum relative directory depth",
+                    ),
+                ),
+            ]),
+            &[
+                "local_path",
+                "releases_path",
+                "current_path",
+                "release_id",
+                "start",
+                "health",
+            ],
+            (false, true, false),
+        ),
+        tool(
             "pids",
             "List processes",
             "List Linux, Windows, or macOS processes with pagination",
@@ -1179,11 +1842,20 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "upload_file",
             "Upload file",
-            "Transfer one binary file from the proxy PC to the remote",
+            "Transfer one binary file from the proxy PC to the remote with optional Unix mode and verified resume",
             props(&[
                 ("local_path", string_prop("Path on the proxy PC")),
                 ("remote_path", string_prop("Destination path on the remote")),
                 ("overwrite", json!({"type":"boolean","default":true})),
+                (
+                    "mode",
+                    integer_prop(
+                        0,
+                        Some(MAX_UNIX_MODE as u64),
+                        "Optional Unix permission mode",
+                    ),
+                ),
+                ("resume", json!({"type":"boolean","default":false})),
             ]),
             &["local_path", "remote_path"],
             (false, true, true),
@@ -1191,7 +1863,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "download_file",
             "Download file",
-            "Transfer one binary file from the remote to the proxy PC",
+            "Transfer one binary file from the remote to the proxy PC with verified resume",
             props(&[
                 ("remote_path", string_prop("Path on the remote")),
                 (
@@ -1199,6 +1871,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     string_prop("Destination path on the proxy PC"),
                 ),
                 ("overwrite", json!({"type":"boolean","default":true})),
+                ("resume", json!({"type":"boolean","default":false})),
             ]),
             &["remote_path", "local_path"],
             (false, true, true),
@@ -1371,7 +2044,7 @@ fn tool(
         "name": name, "title": title, "description": description,
         "inputSchema": input_schema,
         "outputSchema": output_schema(name),
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start" | "reboot" | "agent_update")}
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start" | "reboot" | "agent_update" | "deploy_release")}
     })
 }
 
@@ -1402,6 +2075,21 @@ fn integer_prop_default(
     let mut value = integer_prop(minimum, maximum, description);
     value["default"] = json!(default);
     value
+}
+
+fn deploy_command_schema() -> Value {
+    json!({
+        "type":"object",
+        "properties":{
+            "program":{"type":"string","minLength":1},
+            "args":{"type":"array","items":{"type":"string"},"default":[]},
+            "cwd":{"type":"string","minLength":1},
+            "env":{"type":"object","additionalProperties":{"type":"string"},"default":{}},
+            "timeout_ms":{"type":"integer","minimum":0,"maximum":300000,"default":10000}
+        },
+        "required":["program"],
+        "additionalProperties":false
+    })
 }
 
 fn output_schema(name: &str) -> Value {
@@ -1516,6 +2204,144 @@ fn output_schema(name: &str) -> Value {
                 "bytes_hashed":{"type":"integer","minimum":0}
             }),
             &["algorithm", "digest", "bytes_hashed"],
+        ),
+        "mkdir" => strict_output(
+            json!({
+                "path":{"type":"string"},
+                "created":{"type":"boolean"},
+                "recursive":{"type":"boolean"},
+                "mode":{"type":["integer","null"],"minimum":0,"maximum":MAX_UNIX_MODE}
+            }),
+            &["path", "created", "recursive", "mode"],
+        ),
+        "remove" => strict_output(
+            json!({
+                "path":{"type":"string"},
+                "kind":{"type":"string","enum":["file","dir","symlink"]},
+                "recursive":{"type":"boolean"},
+                "entries_removed":{"type":"integer","minimum":1,"maximum":remote_ops_protocol::MAX_FILE_OPERATION_ENTRIES}
+            }),
+            &["path", "kind", "recursive", "entries_removed"],
+        ),
+        "move" => strict_output(
+            json!({
+                "source":{"type":"string"},
+                "destination":{"type":"string"},
+                "kind":{"type":"string","enum":["file","dir","symlink"]},
+                "overwritten":{"type":"boolean"},
+                "cross_filesystem":{"type":"boolean","const":false},
+                "atomic":{"type":"boolean"}
+            }),
+            &[
+                "source",
+                "destination",
+                "kind",
+                "overwritten",
+                "cross_filesystem",
+                "atomic",
+            ],
+        ),
+        "copy" => strict_output(
+            json!({
+                "source":{"type":"string"},
+                "destination":{"type":"string"},
+                "kind":{"type":"string","enum":["file","dir"]},
+                "recursive":{"type":"boolean"},
+                "overwritten":{"type":"boolean"},
+                "entries_copied":{"type":"integer","minimum":1,"maximum":remote_ops_protocol::MAX_FILE_OPERATION_ENTRIES},
+                "bytes_copied":{"type":"integer","minimum":0}
+            }),
+            &[
+                "source",
+                "destination",
+                "kind",
+                "recursive",
+                "overwritten",
+                "entries_copied",
+                "bytes_copied",
+            ],
+        ),
+        "chmod" => strict_output(
+            json!({
+                "path":{"type":"string"},
+                "kind":{"type":"string","enum":["file","dir"]},
+                "mode":{"type":"integer","minimum":0,"maximum":MAX_UNIX_MODE}
+            }),
+            &["path", "kind", "mode"],
+        ),
+        "symlink" => strict_output(
+            json!({
+                "target":{"type":"string"},
+                "link_path":{"type":"string"},
+                "target_kind":{"type":["string","null"],"enum":["file","dir",null]},
+                "overwritten":{"type":"boolean"},
+                "atomic":{"type":"boolean"}
+            }),
+            &[
+                "target",
+                "link_path",
+                "target_kind",
+                "overwritten",
+                "atomic",
+            ],
+        ),
+        "sync_directory" => strict_output(
+            json!({
+                "committed":{"type":"boolean","const":true},
+                "local_path":{"type":"string"},
+                "remote_path":{"type":"string"},
+                "manifest_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                "files":{"type":"integer","minimum":0,"maximum":MAX_SYNC_FILES},
+                "directories":{"type":"integer","minimum":0,"maximum":MAX_SYNC_FILES},
+                "total_bytes":{"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TRANSFER_BYTES},
+                "files_transferred":{"type":"integer","minimum":0,"maximum":MAX_SYNC_FILES},
+                "bytes_transferred":{"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TRANSFER_BYTES},
+                "files_reused":{"type":"integer","minimum":0,"maximum":MAX_SYNC_FILES},
+                "bytes_reused":{"type":"integer","minimum":0,"maximum":DEFAULT_MAX_TRANSFER_BYTES},
+                "backup_path":{"type":["string","null"]},
+                "staging_path":{"type":"string"}
+            }),
+            &[
+                "committed",
+                "local_path",
+                "remote_path",
+                "manifest_sha256",
+                "files",
+                "directories",
+                "total_bytes",
+                "files_transferred",
+                "bytes_transferred",
+                "files_reused",
+                "bytes_reused",
+                "backup_path",
+                "staging_path",
+            ],
+        ),
+        "deploy_release" => strict_output(
+            json!({
+                "status":{"type":"string","enum":["deployed","stop_failed","rolled_back","rollback_failed"]},
+                "deployed":{"type":"boolean"},
+                "rolled_back":{"type":"boolean"},
+                "release_id":{"type":"string"},
+                "release_path":{"type":"string"},
+                "current_path":{"type":"string"},
+                "manifest_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                "preflight":{"type":"object"},
+                "sync":{"type":"object"},
+                "activation":{"type":"object"}
+            }),
+            &[
+                "status",
+                "deployed",
+                "rolled_back",
+                "release_id",
+                "release_path",
+                "current_path",
+                "manifest_sha256",
+                "preflight",
+                "sync",
+                "activation",
+            ],
         ),
         "pids" => strict_output(
             json!({
@@ -1700,12 +2526,41 @@ fn output_schema(name: &str) -> Value {
                 "elapsed_ms",
             ],
         ),
-        "upload_file" | "download_file" => strict_output(
+        "upload_file" => strict_output(
             json!({
                 "bytes_transferred":{"type":"integer","minimum":0},
-                "sha256":{"type":"string"},"source":{"type":"string"},"destination":{"type":"string"}
+                "size":{"type":"integer","minimum":0},
+                "resumed_from":{"type":"integer","minimum":0},
+                "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                "mode":{"type":["integer","null"],"minimum":0,"maximum":MAX_UNIX_MODE},
+                "source":{"type":"string"},"destination":{"type":"string"}
             }),
-            &["bytes_transferred", "sha256", "source", "destination"],
+            &[
+                "bytes_transferred",
+                "size",
+                "resumed_from",
+                "sha256",
+                "mode",
+                "source",
+                "destination",
+            ],
+        ),
+        "download_file" => strict_output(
+            json!({
+                "bytes_transferred":{"type":"integer","minimum":0},
+                "size":{"type":"integer","minimum":0},
+                "resumed_from":{"type":"integer","minimum":0},
+                "sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
+                "source":{"type":"string"},"destination":{"type":"string"}
+            }),
+            &[
+                "bytes_transferred",
+                "size",
+                "resumed_from",
+                "sha256",
+                "source",
+                "destination",
+            ],
         ),
         "remote_status" | "set_remote" => strict_output(
             json!({
@@ -2032,11 +2887,14 @@ fn agent_info_output_schema() -> Value {
                     "active_probe":{"type":"boolean"},
                     "wait_remote":{"type":"boolean"},
                     "reboot":{"type":"boolean"},
-                    "self_update":{"type":"boolean"}
+                    "self_update":{"type":"boolean"},
+                    "resumable_transfers":{"type":"boolean"},
+                    "directory_sync":{"type":"boolean"},
+                    "release_deployment":{"type":"boolean"}
                 },
                 "required":[
                     "background_processes","incremental_output","active_probe","wait_remote",
-                    "reboot","self_update"
+                    "reboot","self_update","resumable_transfers","directory_sync","release_deployment"
                 ],
                 "additionalProperties":false
             },
@@ -2056,7 +2914,13 @@ fn agent_info_output_schema() -> Value {
                     "max_process_wait_ms":{"type":"integer","minimum":0},
                     "apply_patch_max_patch_bytes":{"type":"integer","minimum":1},
                     "apply_patch_max_file_bytes":{"type":"integer","minimum":1},
-                    "apply_patch_max_hunks":{"type":"integer","minimum":1}
+                    "apply_patch_max_hunks":{"type":"integer","minimum":1},
+                    "max_file_operation_entries":{"type":"integer","minimum":1},
+                    "default_sync_max_files":{"type":"integer","minimum":1},
+                    "max_sync_files":{"type":"integer","minimum":1},
+                    "default_sync_max_depth":{"type":"integer","minimum":1},
+                    "max_sync_depth":{"type":"integer","minimum":1},
+                    "max_sync_exclude_patterns":{"type":"integer","minimum":1}
                 },
                 "required":[
                     "max_control_bytes","chunk_bytes","max_transfer_bytes","max_process_jobs",
@@ -2064,7 +2928,9 @@ fn agent_info_output_schema() -> Value {
                     "process_output_buffer_bytes","default_process_output_bytes",
                     "max_process_output_bytes","default_process_wait_ms","max_process_wait_ms",
                     "apply_patch_max_patch_bytes","apply_patch_max_file_bytes",
-                    "apply_patch_max_hunks"
+                    "apply_patch_max_hunks","max_file_operation_entries",
+                    "default_sync_max_files","max_sync_files","default_sync_max_depth",
+                    "max_sync_depth","max_sync_exclude_patterns"
                 ],
                 "additionalProperties":false
             },
@@ -2169,7 +3035,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 38);
         assert_eq!(
             tools
                 .iter()
@@ -2187,6 +3053,36 @@ mod tests {
                 .iter()
                 .all(|keyword| tool["inputSchema"].get(keyword).is_none())
         }));
+        let upload = tools
+            .iter()
+            .find(|tool| tool["name"] == "upload_file")
+            .unwrap();
+        assert_eq!(
+            upload["inputSchema"]["properties"]["mode"]["maximum"],
+            MAX_UNIX_MODE
+        );
+        assert_eq!(
+            upload["inputSchema"]["properties"]["resume"]["default"],
+            false
+        );
+        let sync = tools
+            .iter()
+            .find(|tool| tool["name"] == "sync_directory")
+            .unwrap();
+        assert_eq!(
+            sync["inputSchema"]["properties"]["max_files"]["maximum"],
+            MAX_SYNC_FILES
+        );
+        assert_eq!(sync["outputSchema"]["additionalProperties"], false);
+        let deploy = tools
+            .iter()
+            .find(|tool| tool["name"] == "deploy_release")
+            .unwrap();
+        assert_eq!(deploy["annotations"]["openWorldHint"], true);
+        assert_eq!(
+            deploy["inputSchema"]["properties"]["start"]["additionalProperties"],
+            false
+        );
         let system = tools
             .iter()
             .find(|tool| tool["name"] == "system_info")
@@ -2518,6 +3414,39 @@ mod tests {
                 Some(&json!({"name":params["name"],"arguments":params["arguments"]})),
                 &mut client,
             );
+            assert_eq!(response["error"]["code"], -32602, "{params}");
+        }
+    }
+
+    #[test]
+    fn deployment_arguments_are_validated_before_connecting() {
+        let mut client = RemoteClient::new(
+            "127.0.0.1:1".parse().unwrap(),
+            std::time::Duration::from_millis(10),
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let invalid_calls = [
+            json!({"name":"upload_file","arguments":{"local_path":"file","remote_path":"remote","mode":4096}}),
+            json!({"name":"download_file","arguments":{"local_path":"","remote_path":"remote"}}),
+            json!({"name":"mkdir","arguments":{"path":"","mode":0}}),
+            json!({"name":"remove","arguments":{"path":""}}),
+            json!({"name":"move","arguments":{"source":"same","destination":"same"}}),
+            json!({"name":"copy","arguments":{"source":"same","destination":"same"}}),
+            json!({"name":"chmod","arguments":{"path":"file","mode":4096}}),
+            json!({"name":"symlink","arguments":{"target":"a","link_path":"b","target_kind":"other"}}),
+            json!({"name":"sync_directory","arguments":{"local_path":".","remote_path":"remote","max_files":0}}),
+            json!({"name":"sync_directory","arguments":{"local_path":".","remote_path":"remote","excludes":["["]}}),
+            json!({"name":"deploy_release","arguments":{
+                "local_path":".","releases_path":"releases","current_path":"current",
+                "release_id":"../escape","start":{"program":"true"},"health":{"program":"true"}
+            }}),
+            json!({"name":"deploy_release","arguments":{
+                "local_path":".","releases_path":"releases","current_path":"current",
+                "release_id":"v1","start":{"program":"","timeout_ms":1},"health":{"program":"true"}
+            }}),
+        ];
+        for params in invalid_calls {
+            let response = call_tool(json!(1), Some(&params), &mut client);
             assert_eq!(response["error"]["code"], -32602, "{params}");
         }
     }

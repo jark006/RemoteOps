@@ -36,6 +36,13 @@ impl AgentError {
             message: message.into(),
         }
     }
+
+    pub fn cross_filesystem(message: impl Into<String>) -> Self {
+        Self {
+            kind: "cross_filesystem",
+            message: message.into(),
+        }
+    }
 }
 
 impl fmt::Display for AgentError {

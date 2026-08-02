@@ -21,16 +21,22 @@
 
 ## 工具契约
 
-proxy 暴露 30 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
+proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
 
 - 兼容工具：`read_text`、`read_file_lines`、`tail_text`、`write_text`、`apply_patch`、`list_files`、`grep`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
 - 进程工具：`pkill`。
 - 后台任务工具：`process_start`、`process_output`、`process_wait`、`process_signal`、`process_close`。
 - 传输工具：`upload_file`、`download_file`。
+- 基础文件变更工具：`mkdir`、`remove`、`move`、`copy`、`chmod`、`symlink`。
+- 目录同步与发布工具：`sync_directory`、`deploy_release`。
 - Agent 生命周期工具：`agent_info`、`reboot`。
 - proxy 本地管理与生命周期编排工具：`remote_status`、`set_remote`、`remote_probe`、`wait_remote`、`agent_update`。`remote_status` 被动查询地址、缓存连接和生命周期状态；`set_remote` 可单独设置 IPv4 或端口，配置仅在当前进程内生效；其余工具负责主动探测、等待状态变化和编排 Agent 自更新。
-- `upload_file` 的 `local_path` 和 `download_file` 的 `local_path` 均属于 proxy 所在 PC。
+- `upload_file`、`download_file`、`sync_directory` 和 `deploy_release` 的 `local_path` 均属于 proxy 所在 PC。
 - 单文件默认上限 4 GiB，chunk 上限 64 KiB；控制帧上限 2 MiB。
+- 远端协议版本为 3。上传请求必须携带完整 SHA-256，可选 `mode` 范围为 `0..=0o7777` 且只在 Unix Agent 生效；上传和下载的 `resume` 默认 false。续传必须校验 partial 文件的已有长度和前缀 SHA-256，最终仍校验完整长度和 SHA-256；前缀不匹配的下载安全回退到偏移 0。成功前使用同目录 partial 文件，失败时仅在启用续传时保留可恢复 partial，目标不得出现半文件。
+- `mkdir`、`remove`、`move`、`copy`、`chmod`、`symlink` 必须使用精确路径并区分普通文件、目录、符号链接和特殊文件。递归删除和复制最多检查 100,000 个条目；递归复制拒绝符号链接和特殊文件，递归删除不跟随符号链接并拒绝特殊文件。`move` 不得在跨文件系统时隐式 copy-delete；目录覆盖始终拒绝，非目录覆盖必须显式开启。
+- `sync_directory` 基于排序 manifest、大小和 SHA-256，只传变化普通文件；本地符号链接、特殊文件和非 UTF-8 相对路径必须拒绝。同步在目标同级 staging 构建，提交前逐项复核类型、大小和哈希，再将旧目标改名为 `backup_path` 并切换 staging；旧 backup 不得静默删除。保留文件、目录和同步根目录 Unix mode。manifest 默认最多 4,096 个条目、4 GiB、32 层，最大 10,000 个条目、4 GiB、64 层；排除 glob 最多 64 个、每个 1 KiB。
+- `deploy_release` 仅在 Unix Agent 上支持。`release_id` 限 1..=128 个 ASCII 字母、数字、`.`、`_`、`-`，release 必须是 `releases_path` 的直接子目录，`current_path` 必须不存在或为符号链接。preflight 必须验证架构、release/current 父目录写权限、可用磁盘和最多 64 个依赖。`stop` 可选，`start` 和 `health` 必填，`rollback_start` 默认复用 `start`；命令不经过 shell 且每步最多 300 秒。服务停止后原子切换 current symlink，启动或健康检查失败时必须在同一 Agent 请求内切回旧链接并恢复旧服务，返回 `deployed`、`stop_failed`、`rolled_back` 或 `rollback_failed` 结构化状态。
 - `apply_patch` 仅更新一个已存在的普通 UTF-8 文本文件，补丁路径必须与请求路径完全一致；补丁最大 256 KiB，目标文件最大 16 MiB，最多 128 个 hunk，不支持创建、删除、重命名或无上下文纯插入。旧侧上下文必须唯一匹配，可用 `expected_sha256` 检测冲突；整个补丁成功前不得修改目标，并保留 BOM、原有行尾和末尾换行状态。
 - `read_file_lines` 使用 1-based inclusive 行号，`start_line` 默认 1，未提供 `end_line` 时默认读取 200 行；单次最多 10,000 行、返回 1 MiB，并将为定位起始行而扫描的内容限制为 64 MiB。只接受非符号链接的普通文件，请求范围必须是 UTF-8。
 - `list_files` 对目录项排序并分页，`limit` 默认 200、最大 1,000；`recursive` 默认 false，递归时 `name` 为相对请求目录的 `/` 分隔路径，`max_depth` 默认 16、最大 64。可用最大 1 KiB 的 `pattern` glob 过滤相对路径；符号链接可列出但不遍历，单次最多扫描 100,000 个目录项、输出 1 MiB。
@@ -49,7 +55,7 @@ proxy 暴露 30 个工具。修改名称、参数、默认值、上限或结果�
 ## 平台行为
 
 - Linux 提供全部工具；`reboot` 使用 `reboot(2)` 并要求 Agent 以 root 运行。
-- Windows/macOS 提供通用文件工具、文件传输和 `exec`；Windows 还提供 `kill` 和 `system_info`。
+- Windows/macOS 提供通用文件工具、基础文件变更、可恢复文件传输、目录同步和 `exec`；Unix 还提供 `chmod`、Unix mode 和 `deploy_release`。Windows 还提供 `kill` 和 `system_info`，其 `chmod` 和带 mode 的创建/上传返回结构化 unsupported。
 - `agent_info` 和 proxy 生命周期编排工具不受目标平台限制。Windows 的 `reboot` 使用 `shutdown.exe /r /t 0 /f`，macOS 的 `reboot` 返回结构化 unsupported。
 - macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell，Git Bash 不存在时返回结构化 unsupported。Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。

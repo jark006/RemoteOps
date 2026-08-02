@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -8,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
 
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 pub const BUILTIN_PSK: &[u8] = b"JARK006_PSK";
 pub const DEFAULT_MAX_CONTROL_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
@@ -44,6 +45,16 @@ pub const MAX_WAIT_REMOTE_POLL_MS: u64 = 10_000;
 pub const DEFAULT_REBOOT_DELAY_MS: u64 = 1_000;
 pub const MIN_REBOOT_DELAY_MS: u64 = 250;
 pub const MAX_REBOOT_DELAY_MS: u64 = 10_000;
+pub const MAX_UNIX_MODE: u32 = 0o7777;
+pub const MAX_FILE_OPERATION_ENTRIES: usize = 100_000;
+pub const DEFAULT_SYNC_MAX_FILES: usize = 4_096;
+pub const MAX_SYNC_FILES: usize = 10_000;
+pub const DEFAULT_SYNC_MAX_DEPTH: usize = 32;
+pub const MAX_SYNC_DEPTH: usize = 64;
+pub const MAX_SYNC_EXCLUDE_PATTERNS: usize = 64;
+pub const MAX_SYNC_GLOB_BYTES: usize = 1_024;
+pub const MAX_DEPLOY_DEPENDENCIES: usize = 64;
+pub const MAX_RELEASE_ID_BYTES: usize = 128;
 pub const INTERNAL_PING_OPERATION: &str = "__remote_ops_ping";
 
 const HELLO_MAGIC: &[u8; 4] = b"ROPS";
@@ -172,19 +183,29 @@ pub struct RemoteError {
 pub struct UploadRequest {
     pub remote_path: String,
     pub size: u64,
+    pub sha256: String,
     pub overwrite: bool,
+    pub resume: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DownloadRequest {
     pub remote_path: String,
+    pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransferMetadata {
     pub size: u64,
+    pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +213,78 @@ pub struct TransferMetadata {
 pub struct TransferEnd {
     pub size: u64,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SyncEntry {
+    pub path: String,
+    pub kind: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncPrepareRequest {
+    pub remote_path: String,
+    pub manifest_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_mode: Option<u32>,
+    pub entries: Vec<SyncEntry>,
+    pub max_files: usize,
+    pub max_total_bytes: u64,
+    pub max_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncFinishRequest {
+    pub remote_path: String,
+    pub staging_path: String,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandSpec {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployPreflightRequest {
+    pub releases_path: String,
+    pub current_path: String,
+    pub release_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_arch: Option<String>,
+    pub required_bytes: u64,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeployActivateRequest {
+    pub release_path: String,
+    pub current_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<CommandSpec>,
+    pub start: CommandSpec,
+    pub health: CommandSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_start: Option<CommandSpec>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -651,6 +744,28 @@ mod tests {
     fn built_in_psk_is_the_deployment_value() {
         assert_eq!(BUILTIN_PSK, b"JARK006_PSK");
         assert!(validate_psk(BUILTIN_PSK).is_ok());
+    }
+
+    #[test]
+    fn protocol_v3_transfer_requests_require_resume_integrity_fields() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+        assert!(
+            serde_json::from_value::<UploadRequest>(serde_json::json!({
+                "remote_path":"file","size":1,"overwrite":true
+            }))
+            .is_err()
+        );
+        let request = UploadRequest {
+            remote_path: "file".to_string(),
+            size: 1,
+            sha256: "0".repeat(64),
+            overwrite: true,
+            resume: true,
+            mode: Some(0o755),
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["resume"], true);
+        assert_eq!(encoded["mode"], 0o755);
     }
 
     #[test]

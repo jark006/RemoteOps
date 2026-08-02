@@ -1,6 +1,7 @@
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use remote_ops_protocol::{
@@ -14,9 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crate::dispatch;
 use crate::error::AgentError;
+use crate::tools::file_ops::set_optional_mode;
 use crate::tools::files::{
-    create_transfer_temp, ensure_regular_file, normalized_path, persist_replace,
-    preserve_existing_mode,
+    ensure_regular_file, normalized_path, persist_path_replace, preserve_existing_mode,
 };
 use crate::tools::jobs::JobManager;
 use crate::tools::lifecycle;
@@ -306,6 +307,13 @@ fn receive_upload(
             AgentError::invalid(format!("file exceeds transfer limit ({max_bytes})")).into(),
         );
     }
+    validate_sha256(&args.sha256)?;
+    if args
+        .mode
+        .is_some_and(|mode| mode > remote_ops_protocol::MAX_UNIX_MODE)
+    {
+        return Err(AgentError::invalid("mode must be in range 0..=4095").into());
+    }
     let target = normalized_path(&args.remote_path)?;
     if let Ok(metadata) = std::fs::symlink_metadata(&target) {
         if !metadata.file_type().is_file() {
@@ -322,14 +330,31 @@ fn receive_upload(
             .into());
         }
     }
-    let mut temp = create_transfer_temp(&target)?;
+    let partial = upload_partial_path(&target, &args.sha256)?;
+    let mut file = open_upload_partial(&partial, args.resume)?;
+    let mut cleanup = UploadPartialCleanup::new(partial.clone(), args.resume);
+    let mut offset = file
+        .metadata()
+        .map_err(|error| AgentError::io("stat upload partial file", error))?
+        .len();
+    if offset > args.size {
+        file.set_len(0)
+            .map_err(|error| AgentError::io("truncate upload partial file", error))?;
+        offset = 0;
+    }
+    let (mut digest, prefix_sha256) = hash_prefix(&mut file, offset)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| AgentError::io("seek upload partial file", error))?;
     session.send_json(
         FrameType::Response,
         request_id,
-        &TransferMetadata { size: args.size },
+        &TransferMetadata {
+            size: args.size,
+            offset,
+            prefix_sha256: (offset > 0).then_some(prefix_sha256),
+        },
     )?;
-    let mut digest = Sha256::new();
-    let mut total = 0u64;
+    let mut total = offset;
     loop {
         let frame = session.receive_with_idle_timeout(Some(DEFAULT_TRANSFER_IDLE_TIMEOUT))?;
         if frame.request_id != request_id {
@@ -343,7 +368,7 @@ fn receive_upload(
                 if total > args.size || total > max_bytes {
                     return Err(AgentError::invalid("upload exceeded declared size").into());
                 }
-                temp.write_all(&frame.payload)
+                file.write_all(&frame.payload)
                     .map_err(|error| AgentError::io("write upload temporary file", error))?;
                 digest.update(&frame.payload);
             }
@@ -351,22 +376,61 @@ fn receive_upload(
                 let end: TransferEnd = serde_json::from_slice(&frame.payload)
                     .map_err(|error| AgentError::invalid(error.to_string()))?;
                 let actual = format!("{:x}", digest.finalize());
-                if total != args.size || end.size != total || end.sha256 != actual {
+                if total != args.size
+                    || end.size != total
+                    || !end.sha256.eq_ignore_ascii_case(&actual)
+                    || !args.sha256.eq_ignore_ascii_case(&actual)
+                {
                     return Err(AgentError::invalid("upload length or SHA-256 mismatch").into());
                 }
-                temp.flush()
-                    .and_then(|_| temp.as_file().sync_all())
+                file.flush()
+                    .and_then(|_| file.sync_all())
                     .map_err(|error| AgentError::io("flush upload temporary file", error))?;
-                preserve_existing_mode(&target, temp.path())?;
-                persist_replace(temp, &target, args.overwrite)?;
-                let response =
-                    RemoteResponse::success(json!({"bytes_transferred": total, "sha256": actual}));
+                if args.mode.is_some() {
+                    set_optional_mode(&partial, args.mode)?;
+                } else {
+                    preserve_existing_mode(&target, &partial)?;
+                }
+                drop(file);
+                persist_path_replace(&partial, &target, args.overwrite)?;
+                cleanup.committed = true;
+                let response = RemoteResponse::success(json!({
+                    "bytes_transferred": total - offset,
+                    "size": total,
+                    "resumed_from": offset,
+                    "sha256": actual,
+                    "mode": args.mode
+                }));
                 session
                     .send_json(FrameType::Response, request_id, &response)
                     .map_err(TransferError::from)?;
                 return Ok(());
             }
             _ => return Err(AgentError::command("unexpected frame during upload").into()),
+        }
+    }
+}
+
+struct UploadPartialCleanup {
+    path: PathBuf,
+    keep_on_failure: bool,
+    committed: bool,
+}
+
+impl UploadPartialCleanup {
+    fn new(path: PathBuf, keep_on_failure: bool) -> Self {
+        Self {
+            path,
+            keep_on_failure,
+            committed: false,
+        }
+    }
+}
+
+impl Drop for UploadPartialCleanup {
+    fn drop(&mut self) {
+        if !self.keep_on_failure && !self.committed {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
@@ -384,9 +448,42 @@ fn send_download(
             AgentError::invalid(format!("file exceeds transfer limit ({max_bytes})")).into(),
         );
     }
-    session.send_json(FrameType::Response, request_id, &TransferMetadata { size })?;
-    let mut digest = Sha256::new();
-    let mut total = 0u64;
+    if args.offset > max_bytes {
+        return Err(AgentError::invalid("download offset exceeds transfer limit").into());
+    }
+    if let Some(prefix) = &args.prefix_sha256 {
+        validate_sha256(prefix)?;
+    }
+    let requested_offset = args.offset.min(size);
+    let (prefix_digest, prefix_sha256) = hash_prefix(&mut file, requested_offset)?;
+    let accepted_offset = if requested_offset == args.offset
+        && (args.offset == 0
+            || args
+                .prefix_sha256
+                .as_deref()
+                .is_some_and(|expected| expected.eq_ignore_ascii_case(&prefix_sha256)))
+    {
+        args.offset
+    } else {
+        0
+    };
+    let mut digest = if accepted_offset == requested_offset {
+        prefix_digest
+    } else {
+        Sha256::new()
+    };
+    file.seek(SeekFrom::Start(accepted_offset))
+        .map_err(|error| AgentError::io(format!("seek {}", path.display()), error))?;
+    session.send_json(
+        FrameType::Response,
+        request_id,
+        &TransferMetadata {
+            size,
+            offset: accepted_offset,
+            prefix_sha256: (accepted_offset > 0).then_some(prefix_sha256),
+        },
+    )?;
+    let mut total = accepted_offset;
     let mut buffer = vec![0u8; DEFAULT_CHUNK_BYTES];
     loop {
         let read = file.read(&mut buffer).map_err(|error| {
@@ -409,6 +506,76 @@ fn send_download(
     session
         .send_json(FrameType::End, request_id, &end)
         .map_err(TransferError::from)
+}
+
+fn upload_partial_path(target: &Path, sha256: &str) -> Result<PathBuf, AgentError> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AgentError::invalid("remote_path must name a UTF-8 file"))?;
+    Ok(parent.join(format!(".remoteops-upload-{name}-{}.part", &sha256[..16])))
+}
+
+fn open_upload_partial(path: &Path, resume: bool) -> Result<File, AgentError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() {
+            return Err(AgentError::invalid(
+                "upload partial path is not a regular file",
+            ));
+        }
+        if !resume {
+            fs::remove_file(path).map_err(|error| {
+                AgentError::io(
+                    format!("remove stale upload partial {}", path.display()),
+                    error,
+                )
+            })?;
+        }
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| AgentError::io(format!("open upload partial {}", path.display()), error))
+}
+
+fn hash_prefix(file: &mut File, length: u64) -> Result<(Sha256, String), AgentError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| AgentError::io("seek transfer file", error))?;
+    let mut digest = Sha256::new();
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = buffer.len().min(remaining as usize);
+        let read = file
+            .read(&mut buffer[..limit])
+            .map_err(|error| AgentError::io("read transfer prefix", error))?;
+        if read == 0 {
+            return Err(AgentError::invalid(
+                "transfer prefix is shorter than declared",
+            ));
+        }
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let prefix = format!("{:x}", digest.clone().finalize());
+    Ok((digest, prefix))
+}
+
+fn validate_sha256(value: &str) -> Result<(), AgentError> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(AgentError::invalid(
+            "SHA-256 must contain exactly 64 hexadecimal characters",
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,6 @@ use remote_ops_protocol::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 
 #[derive(Debug)]
 pub struct ClientError {
@@ -22,7 +21,7 @@ pub struct ClientError {
 }
 
 impl ClientError {
-    fn local(kind: &str, message: impl Into<String>) -> Self {
+    pub(crate) fn local(kind: &str, message: impl Into<String>) -> Self {
         Self {
             kind: kind.to_string(),
             message: message.into(),
@@ -358,7 +357,7 @@ impl RemoteClient {
                 "remote agent does not support self-update",
             ));
         }
-        let upload = self.upload(local_path, &staging_path, true)?;
+        let upload = self.upload(local_path, &staging_path, true, Some(0o755), true)?;
         let sha256 = upload["sha256"]
             .as_str()
             .ok_or_else(|| ClientError::local("protocol", "upload response omitted SHA-256"))?
@@ -420,6 +419,8 @@ impl RemoteClient {
         local_path: &str,
         remote_path: &str,
         overwrite: bool,
+        mode: Option<u32>,
+        resume: bool,
     ) -> Result<Value, ClientError> {
         if local_path.is_empty() || remote_path.is_empty() {
             return Err(ClientError::local(
@@ -447,6 +448,15 @@ impl RemoteClient {
                 format!("file exceeds transfer limit ({})", self.max_transfer_bytes),
             ));
         }
+        if mode.is_some_and(|mode| mode > remote_ops_protocol::MAX_UNIX_MODE) {
+            return Err(ClientError::local(
+                "invalid_params",
+                "mode must be in range 0..=4095",
+            ));
+        }
+        let sha256 = hash_file(&mut file, local_path, size)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ClientError::local("io", format!("seek {local_path}: {error}")))?;
         self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
         let result = (|| {
@@ -460,15 +470,38 @@ impl RemoteClient {
                         arguments: serde_json::to_value(UploadRequest {
                             remote_path: remote_path.to_string(),
                             size,
+                            sha256: sha256.clone(),
                             overwrite,
+                            resume,
+                            mode,
                         })
                         .expect("serializable"),
                     },
                 )
                 .map_err(protocol_error)?;
-            receive_transfer_metadata(session, request_id, size)?;
-            let mut digest = Sha256::new();
-            let mut total = 0u64;
+            let metadata = receive_transfer_metadata(session, request_id, size)?;
+            if metadata.offset > size {
+                return Err(ClientError::local(
+                    "protocol",
+                    "remote upload offset exceeds local file size",
+                ));
+            }
+            let (mut digest, prefix_sha256) =
+                hash_local_prefix(&mut file, metadata.offset, local_path)?;
+            if metadata.offset > 0
+                && !metadata
+                    .prefix_sha256
+                    .as_deref()
+                    .is_some_and(|remote| remote.eq_ignore_ascii_case(&prefix_sha256))
+            {
+                return Err(ClientError::local(
+                    "protocol",
+                    "remote upload prefix SHA-256 does not match local file",
+                ));
+            }
+            file.seek(SeekFrom::Start(metadata.offset))
+                .map_err(|error| ClientError::local("io", format!("seek {local_path}: {error}")))?;
+            let mut total = metadata.offset;
             let mut buffer = vec![0u8; DEFAULT_CHUNK_BYTES];
             loop {
                 let read = file.read(&mut buffer).map_err(|error| {
@@ -483,21 +516,30 @@ impl RemoteClient {
                 digest.update(&buffer[..read]);
                 total += read as u64;
             }
-            let sha256 = format!("{:x}", digest.finalize());
+            let actual_sha256 = format!("{:x}", digest.finalize());
+            if !actual_sha256.eq_ignore_ascii_case(&sha256) {
+                return Err(ClientError::local(
+                    "invalid_params",
+                    "local file changed while it was being uploaded",
+                ));
+            }
             session
                 .send_json(
                     FrameType::End,
                     request_id,
                     &TransferEnd {
                         size: total,
-                        sha256: sha256.clone(),
+                        sha256: actual_sha256.clone(),
                     },
                 )
                 .map_err(protocol_error)?;
             let remote = receive_remote_response(session, request_id)?;
             Ok(json!({
                 "bytes_transferred": remote["bytes_transferred"],
+                "size": remote["size"],
+                "resumed_from": remote["resumed_from"],
                 "sha256": remote["sha256"],
+                "mode": remote["mode"],
                 "source": local_path,
                 "destination": remote_path
             }))
@@ -510,6 +552,7 @@ impl RemoteClient {
         remote_path: &str,
         local_path: &str,
         overwrite: bool,
+        resume: bool,
     ) -> Result<Value, ClientError> {
         if local_path.is_empty() || remote_path.is_empty() {
             return Err(ClientError::local(
@@ -532,16 +575,22 @@ impl RemoteClient {
                 "local_path must be a regular file and not a symlink",
             ));
         }
-        let parent = target
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut temp = NamedTempFile::new_in(parent).map_err(|error| {
-            ClientError::local(
-                "io",
-                format!("create temporary file for {local_path}: {error}"),
-            )
-        })?;
+        let partial = download_partial_path(target)?;
+        let mut temp = open_download_partial(&partial, resume)?;
+        let requested_offset = temp
+            .metadata()
+            .map_err(|error| {
+                ClientError::local("io", format!("stat {}: {error}", partial.display()))
+            })?
+            .len();
+        if requested_offset > self.max_transfer_bytes {
+            return Err(ClientError::local(
+                "invalid_params",
+                "download partial file exceeds transfer limit",
+            ));
+        }
+        let (prefix_digest, prefix_sha256) =
+            hash_local_prefix(&mut temp, requested_offset, &partial.to_string_lossy())?;
         self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
         let result = (|| {
@@ -554,6 +603,8 @@ impl RemoteClient {
                         operation: "download_file".to_string(),
                         arguments: serde_json::to_value(DownloadRequest {
                             remote_path: remote_path.to_string(),
+                            offset: requested_offset,
+                            prefix_sha256: (requested_offset > 0).then_some(prefix_sha256.clone()),
                         })
                         .expect("serializable"),
                     },
@@ -577,8 +628,38 @@ impl RemoteClient {
                     format!("file exceeds transfer limit ({})", self.max_transfer_bytes),
                 ));
             }
-            let mut digest = Sha256::new();
-            let mut total = 0u64;
+            if metadata.offset != 0 && metadata.offset != requested_offset {
+                return Err(ClientError::local(
+                    "protocol",
+                    "remote returned an unexpected download offset",
+                ));
+            }
+            if metadata.offset > 0
+                && !metadata
+                    .prefix_sha256
+                    .as_deref()
+                    .is_some_and(|remote| remote.eq_ignore_ascii_case(&prefix_sha256))
+            {
+                return Err(ClientError::local(
+                    "protocol",
+                    "remote download prefix SHA-256 acknowledgement mismatch",
+                ));
+            }
+            if metadata.offset == 0 {
+                temp.set_len(0).map_err(|error| {
+                    ClientError::local("io", format!("truncate {}: {error}", partial.display()))
+                })?;
+            }
+            temp.seek(SeekFrom::Start(metadata.offset))
+                .map_err(|error| {
+                    ClientError::local("io", format!("seek {}: {error}", partial.display()))
+                })?;
+            let mut digest = if metadata.offset == requested_offset {
+                prefix_digest
+            } else {
+                Sha256::new()
+            };
+            let mut total = metadata.offset;
             loop {
                 let frame = session
                     .receive_with_idle_timeout(Some(DEFAULT_TRANSFER_IDLE_TIMEOUT))
@@ -613,15 +694,21 @@ impl RemoteClient {
                             ));
                         }
                         temp.flush()
-                            .and_then(|_| temp.as_file().sync_all())
+                            .and_then(|_| temp.sync_all())
                             .map_err(|error| {
                                 ClientError::local("io", format!("flush {local_path}: {error}"))
                             })?;
-                        preserve_local_mode(target, temp.path())?;
-                        persist_local(temp, target, overwrite)?;
-                        return Ok(
-                            json!({"bytes_transferred": total, "sha256": sha256, "source": remote_path, "destination": local_path}),
-                        );
+                        preserve_local_mode(target, &partial)?;
+                        drop(temp);
+                        persist_local(&partial, target, overwrite)?;
+                        return Ok(json!({
+                            "bytes_transferred": total - metadata.offset,
+                            "size": total,
+                            "resumed_from": metadata.offset,
+                            "sha256": sha256,
+                            "source": remote_path,
+                            "destination": local_path
+                        }));
                     }
                     FrameType::Error => {
                         return Err(serde_json::from_slice::<RemoteError>(&frame.payload)
@@ -637,7 +724,11 @@ impl RemoteClient {
                 }
             }
         })();
-        self.finish_operation(result)
+        let result = self.finish_operation(result);
+        if result.is_err() && !resume {
+            let _ = fs::remove_file(&partial);
+        }
+        result
     }
 
     fn probe(&mut self, timeout: Duration) -> Value {
@@ -914,7 +1005,7 @@ fn receive_transfer_metadata(
     session: &mut Session,
     request_id: u64,
     expected_size: u64,
-) -> Result<(), ClientError> {
+) -> Result<TransferMetadata, ClientError> {
     let frame = session.receive().map_err(protocol_error)?;
     check_request_id(&frame, request_id)?;
     match frame.kind {
@@ -927,7 +1018,7 @@ fn receive_transfer_metadata(
                     "remote upload size acknowledgement mismatch",
                 ));
             }
-            Ok(())
+            Ok(metadata)
         }
         FrameType::Error => Err(serde_json::from_slice::<RemoteError>(&frame.payload)
             .map_err(|error| ClientError::local("protocol", error.to_string()))?
@@ -968,14 +1059,14 @@ fn health_check_error(error: remote_ops_protocol::ProtocolError) -> ClientError 
     )
 }
 
-fn persist_local(temp: NamedTempFile, target: &Path, overwrite: bool) -> Result<(), ClientError> {
+fn persist_local(source: &Path, target: &Path, overwrite: bool) -> Result<(), ClientError> {
     if target.exists() && !overwrite {
         return Err(ClientError::local(
             "invalid_params",
             format!("destination already exists: {}", target.display()),
         ));
     }
-    platform_persist_local(temp, target)?;
+    platform_persist_local(source, target)?;
     sync_local_parent(target)
 }
 
@@ -996,13 +1087,9 @@ fn preserve_local_mode(target: &Path, temporary: &Path) -> Result<(), ClientErro
 }
 
 #[cfg(not(windows))]
-fn platform_persist_local(temp: NamedTempFile, target: &Path) -> Result<(), ClientError> {
-    temp.persist(target).map(|_| ()).map_err(|error| {
-        ClientError::local(
-            "io",
-            format!("persist {}: {}", target.display(), error.error),
-        )
-    })
+fn platform_persist_local(source: &Path, target: &Path) -> Result<(), ClientError> {
+    fs::rename(source, target)
+        .map_err(|error| ClientError::local("io", format!("persist {}: {error}", target.display())))
 }
 
 #[cfg(unix)]
@@ -1024,7 +1111,7 @@ fn sync_local_parent(_target: &Path) -> Result<(), ClientError> {
 }
 
 #[cfg(windows)]
-fn platform_persist_local(temp: NamedTempFile, target: &Path) -> Result<(), ClientError> {
+fn platform_persist_local(source: &Path, target: &Path) -> Result<(), ClientError> {
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "Kernel32")]
@@ -1034,8 +1121,7 @@ fn platform_persist_local(temp: NamedTempFile, target: &Path) -> Result<(), Clie
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
-    let temporary = temp.into_temp_path();
-    let source: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
     let result = unsafe {
         MoveFileExW(
@@ -1056,6 +1142,77 @@ fn platform_persist_local(temp: NamedTempFile, target: &Path) -> Result<(), Clie
     } else {
         Ok(())
     }
+}
+
+fn download_partial_path(target: &Path) -> Result<PathBuf, ClientError> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ClientError::local("invalid_params", "local_path must name a UTF-8 file"))?;
+    Ok(parent.join(format!(".remoteops-download-{name}.part")))
+}
+
+fn open_download_partial(path: &Path, resume: bool) -> Result<File, ClientError> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() {
+            return Err(ClientError::local(
+                "invalid_params",
+                "download partial path is not a regular file",
+            ));
+        }
+        if !resume {
+            fs::remove_file(path).map_err(|error| {
+                ClientError::local(
+                    "io",
+                    format!("remove stale partial {}: {error}", path.display()),
+                )
+            })?;
+        }
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| ClientError::local("io", format!("open {}: {error}", path.display())))
+}
+
+fn hash_file(file: &mut File, display: &str, expected_size: u64) -> Result<String, ClientError> {
+    let (digest, _) = hash_local_prefix(file, expected_size, display)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn hash_local_prefix(
+    file: &mut File,
+    length: u64,
+    display: &str,
+) -> Result<(Sha256, String), ClientError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| ClientError::local("io", format!("seek {display}: {error}")))?;
+    let mut digest = Sha256::new();
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = buffer.len().min(remaining as usize);
+        let read = file
+            .read(&mut buffer[..limit])
+            .map_err(|error| ClientError::local("io", format!("read {display}: {error}")))?;
+        if read == 0 {
+            return Err(ClientError::local(
+                "io",
+                format!("{display} became shorter while hashing"),
+            ));
+        }
+        digest.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let sha256 = format!("{:x}", digest.clone().finalize());
+    Ok((digest, sha256))
 }
 
 #[cfg(test)]
