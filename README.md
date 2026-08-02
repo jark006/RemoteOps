@@ -109,7 +109,7 @@ proxy 当前暴露 30 个 MCP 工具：
 | `process_wait` | `job_id`, `wait_ms?` | 有界等待后台任务退出，默认 10 秒，最长 30 秒。 |
 | `process_signal` | `job_id`, `signal?` | 向 Unix 任务进程组发送信号；Windows 接受 9/15 并终止整个 Job Object。 |
 | `process_close` | `job_id` | 释放已结束任务及其保留输出；运行中的任务必须先 signal 并 wait。 |
-| `system_info` | 无 | 运行时间、内存、系统盘和可用的负载/温度信息。 |
+| `system_info` | 无 | 有界读取系统、CPU、身份权限、网络、文件系统、时间、init 和工具链画像。 |
 | `upload_file` | `local_path`, `remote_path`, `overwrite?` | 从 proxy 所在 PC 上传一个普通文件。 |
 | `download_file` | `remote_path`, `local_path`, `overwrite?` | 下载一个普通文件到 proxy 所在 PC。 |
 | `remote_status` | 无 | 被动查询地址、缓存连接、生命周期状态，以及最近一次成功、错误、探测和 Agent 信息，不主动连接。 |
@@ -121,6 +121,8 @@ proxy 当前暴露 30 个 MCP 工具：
 | `agent_update` | `local_path`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 上传并验证 Agent 候选程序，原子替换、重启验证，失败时自动回滚。 |
 
 `overwrite` 默认为 `true`。传输工具拒绝目录、符号链接和特殊文件；目录传输可由 Agent 先通过 `exec`/`sh_exec` 打包，再传输生成的归档文件。
+
+`system_info` 保留原有的主机、内核、运行时间、负载、内存、系统盘和温度字段，并新增 `os`、`cpu`、`identity`、`network`、`filesystems`、`time`、`init_system` 和 `toolchains`。Linux 会解析 `/etc/os-release`、CPU 拓扑和 libc/ABI，当前用户、组、umask 与 capabilities，网卡/IP、IPv4/IPv6 路由、DNS、TCP/UDP 监听端口，以及 mount 类型、空间、inode 和只读状态。网卡最多 128 个、地址最多 512 个、路由最多 256 条、监听端口最多 512 个、mount 最多 256 个、工具链最多 24 个；各集合通过 `available` 和 `truncated` 区分平台不可采集与结果截断。Windows/macOS 返回可可靠采集的同构字段，Linux 专属信息明确标记为不可用，不伪造数据。
 
 后台任务最多同时保留 16 个。`process_start` 不经过 shell，stdin 固定为空；需要 shell 语法时可将 `program` 设为 `/bin/sh`，并使用 `args: ["-c", "..."]`。每个任务的 stdout 和 stderr 各保留最近 256 KiB，`process_output.max_bytes` 默认每路 64 KiB、最大每路 256 KiB；输出以有损 UTF-8 字符串返回，游标按原始字节计数。请求游标早于仍保留的内容时，对应 `*_truncated` 为 `true`，并从 `*_start_cursor` 继续。
 

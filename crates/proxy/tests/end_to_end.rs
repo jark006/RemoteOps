@@ -51,6 +51,12 @@ fn background_job_output_survives_proxy_reconnect() {
 
     let system = first_client.call("system_info", json!({})).unwrap();
     assert!(!system["hostname"].as_str().unwrap().is_empty());
+    assert!(system["os"].is_object());
+    assert!(system["cpu"]["logical_cores"].as_u64().unwrap() > 0);
+    assert!(system["network"]["interfaces"]["items"].is_array());
+    assert!(system["filesystems"]["mounts"].is_array());
+    assert!(system["time"]["unix_seconds"].as_u64().unwrap() > 0);
+    assert!(system["toolchains"]["items"].is_array());
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let first_output = loop {

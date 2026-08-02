@@ -37,6 +37,7 @@ proxy 暴露 30 个工具。修改名称、参数、默认值、上限或结果�
 - `grep` 对单个普通文件或目录树中的普通 UTF-8 文件执行逐行 Rust 正则搜索，大小写敏感默认开启，可用最大 1 KiB 的 `glob` 过滤相对路径。正则最大 4 KiB，结果默认 200 条、最多 1,000 条，单文件默认扫描 1 MiB、最多 16 MiB，单次总计最多枚举 100,000 个目录项、递归 64 层、扫描 10,000 个文件或 64 MiB、输出 1 MiB；匹配文本最多保留 1 KiB。目录搜索不跟随符号链接，并跳过 `.git`、`.hg`、`.svn`、`.next`、`node_modules`、`target`、`dist`、`build`。
 - 文件传输必须校验长度和 SHA-256，成功前使用同目录临时文件，失败时不得留下目标半文件。
 - 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒。
+- `system_info` 保留主机、内核、运行时间、负载、内存、系统盘和温度字段，并返回 `os`、`cpu`、`identity`、`network`、`filesystems`、`time`、`init_system`、`toolchains`。Linux 必须有界解析 os-release、CPU/ABI/libc、用户组/umask/capabilities、网卡/IP/路由/DNS/监听端口、mount/文件系统/inode/只读状态、系统时间/时区/init 和 PATH 中的固定工具清单；不得执行外部诊断命令。网卡最多 128 个、地址最多 512 个、路由最多 256 条、监听端口最多 512 个、mount 最多 256 个、工具链最多 24 个，各集合必须报告 `available` 和 `truncated`。
 - `process_start` 不经过 shell，stdin 固定为空；后台任务默认超时 1 小时、最大 24 小时，同时最多保留 16 个。任务属于 agent 进程而非单个连接，可在 proxy 断线重连后继续查询，但不跨 agent 进程重启持久化。达到上限时先回收最早结束的任务；若全部仍在运行则拒绝启动。
 - 后台任务 stdout/stderr 各保留最近 256 KiB。`process_output` 使用绝对字节游标，每路默认返回 64 KiB、最多 256 KiB；游标落后于保留窗口时必须报告截断及最早可用游标。`process_wait` 默认等待 10 秒、最长 30 秒；`process_close` 只释放已结束任务，运行中的任务必须先 signal 并 wait。
 - `agent_info` 必须返回 Agent 版本、协议版本、构建 target/profile/Git revision、运行实例 ID/PID/启动时间、平台、支持操作、能力、限制和自更新路径。构建信息由 `crates/agent/build.rs` 注入；自检信息必须保持有界且可机器读取。
@@ -56,7 +57,7 @@ proxy 暴露 30 个工具。修改名称、参数、默认值、上限或结果�
 - `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
 - `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。
-- Windows `system_info` 返回主机、系统版本、运行时间、内存和系统盘信息；无 Unix load average 和统一温度接口，分别返回零值和空数组。macOS `system_info` 返回主机、内核、运行时间、内存和系统盘信息，并通过 `getloadavg` 提供真实负载；无统一温度接口，温度返回空数组。
+- Windows `system_info` 返回主机、系统版本、运行时间、内存、系统盘、CPU、网卡、当前用户名、系统时间和可用工具链；无 Unix load average 和统一温度接口，分别返回零值和空数组，Linux 专属集合标记为不可用。macOS `system_info` 返回主机、内核/系统版本、运行时间、CPU、用户组、网卡/IP、DNS、内存、根文件系统、时间和工具链，并通过 `getloadavg` 提供真实负载；无统一温度接口，温度返回空数组，尚未原生采集的路由和监听端口标记为不可用。
 - 不得为不支持的平台伪造空系统信息；应返回结构化错误。
 
 ## 修改要求

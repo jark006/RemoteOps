@@ -1613,26 +1613,7 @@ fn output_schema(name: &str) -> Value {
             }),
             &["job_id", "closed"],
         ),
-        "system_info" => strict_output(
-            json!({
-                "hostname":{"type":"string"},
-                "kernel":{"type":"object","properties":{"sysname":{"type":"string"},"release":{"type":"string"},"machine":{"type":"string"}},"required":["sysname","release","machine"],"additionalProperties":false},
-                "uptime_seconds":{"type":"number","minimum":0},
-                "load_average":{"type":"object","properties":{"one":{"type":"number"},"five":{"type":"number"},"fifteen":{"type":"number"}},"required":["one","five","fifteen"],"additionalProperties":false},
-                "memory":{"type":"object","properties":{"total_bytes":{"type":"integer","minimum":0},"available_bytes":{"type":"integer","minimum":0}},"required":["total_bytes","available_bytes"],"additionalProperties":false},
-                "root_filesystem":{"type":"object","properties":{"total_bytes":{"type":"integer","minimum":0},"available_bytes":{"type":"integer","minimum":0}},"required":["total_bytes","available_bytes"],"additionalProperties":false},
-                "temperatures":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"celsius":{"type":"number"}},"required":["name","celsius"],"additionalProperties":false}}
-            }),
-            &[
-                "hostname",
-                "kernel",
-                "uptime_seconds",
-                "load_average",
-                "memory",
-                "root_filesystem",
-                "temperatures",
-            ],
-        ),
+        "system_info" => system_info_output_schema(),
         "agent_info" => agent_info_output_schema(),
         "remote_probe" => remote_probe_output_schema(),
         "wait_remote" => strict_output(
@@ -1754,6 +1735,255 @@ fn output_schema(name: &str) -> Value {
         ),
         _ => json!({"type":"object"}),
     }
+}
+
+fn system_info_output_schema() -> Value {
+    let nullable_string = |max_length| json!({"type":["string","null"],"maxLength":max_length});
+    let account = || {
+        json!({
+            "type":"object",
+            "properties":{
+                "id":{"type":["integer","null"],"minimum":0},
+                "name":nullable_string(256)
+            },
+            "required":["id","name"],
+            "additionalProperties":false
+        })
+    };
+    let capability_set = || {
+        json!({
+            "type":"object",
+            "properties":{
+                "mask":{"type":"string","pattern":"^[0-9A-Fa-f]{1,16}$"},
+                "names":{"type":"array","maxItems":64,"items":{"type":"string","pattern":"^CAP_[A-Z0-9_]+$"}}
+            },
+            "required":["mask","names"],
+            "additionalProperties":false
+        })
+    };
+    let bounded_collection = |items: Value, max_items: usize| {
+        json!({
+            "type":"object",
+            "properties":{
+                "available":{"type":"boolean"},
+                "items":{"type":"array","maxItems":max_items,"items":items},
+                "truncated":{"type":"boolean"}
+            },
+            "required":["available","items","truncated"],
+            "additionalProperties":false
+        })
+    };
+    let interface_address = json!({
+        "type":"object",
+        "properties":{
+            "family":{"type":"string","enum":["ipv4","ipv6"]},
+            "address":{"type":"string","maxLength":64},
+            "prefix_length":{"type":"integer","minimum":0,"maximum":128},
+            "scope":{"type":"string","enum":["host","unspecified","multicast","link","global"]}
+        },
+        "required":["family","address","prefix_length","scope"],
+        "additionalProperties":false
+    });
+    let network_interface = json!({
+        "type":"object",
+        "properties":{
+            "name":{"type":"string","maxLength":256},
+            "index":{"type":["integer","null"],"minimum":0},
+            "up":{"type":"boolean"},
+            "loopback":{"type":"boolean"},
+            "point_to_point":{"type":"boolean"},
+            "mac_address":nullable_string(128),
+            "mtu":{"type":["integer","null"],"minimum":0},
+            "addresses":{"type":"array","maxItems":512,"items":interface_address}
+        },
+        "required":["name","index","up","loopback","point_to_point","mac_address","mtu","addresses"],
+        "additionalProperties":false
+    });
+    let route = json!({
+        "type":"object",
+        "properties":{
+            "family":{"type":"string","enum":["ipv4","ipv6"]},
+            "destination":{"type":"string","maxLength":128},
+            "gateway":nullable_string(64),
+            "interface":{"type":"string","maxLength":256},
+            "metric":{"type":"integer","minimum":0},
+            "flags":{"type":"integer","minimum":0}
+        },
+        "required":["family","destination","gateway","interface","metric","flags"],
+        "additionalProperties":false
+    });
+    let listening_port = json!({
+        "type":"object",
+        "properties":{
+            "protocol":{"type":"string","enum":["tcp","udp"]},
+            "family":{"type":"string","enum":["ipv4","ipv6"]},
+            "local_address":{"type":"string","maxLength":64},
+            "port":{"type":"integer","minimum":1,"maximum":65535}
+        },
+        "required":["protocol","family","local_address","port"],
+        "additionalProperties":false
+    });
+    let mount = json!({
+        "type":"object",
+        "properties":{
+            "source":{"type":"string","maxLength":1024},
+            "mount_point":{"type":"string","maxLength":1024},
+            "fs_type":nullable_string(128),
+            "total_bytes":{"type":["integer","null"],"minimum":0},
+            "available_bytes":{"type":["integer","null"],"minimum":0},
+            "total_inodes":{"type":["integer","null"],"minimum":0},
+            "available_inodes":{"type":["integer","null"],"minimum":0},
+            "read_only":{"type":["boolean","null"]}
+        },
+        "required":["source","mount_point","fs_type","total_bytes","available_bytes","total_inodes","available_inodes","read_only"],
+        "additionalProperties":false
+    });
+    let toolchain = json!({
+        "type":"object",
+        "properties":{
+            "name":{"type":"string","maxLength":64},
+            "path":{"type":"string","maxLength":1024}
+        },
+        "required":["name","path"],
+        "additionalProperties":false
+    });
+    strict_output(
+        json!({
+            "hostname":{"type":"string","maxLength":256},
+            "kernel":{"type":"object","properties":{"sysname":{"type":"string","maxLength":256},"release":{"type":"string","maxLength":256},"machine":{"type":"string","maxLength":256}},"required":["sysname","release","machine"],"additionalProperties":false},
+            "uptime_seconds":{"type":"number","minimum":0},
+            "load_average":{"type":"object","properties":{"one":{"type":"number"},"five":{"type":"number"},"fifteen":{"type":"number"}},"required":["one","five","fifteen"],"additionalProperties":false},
+            "memory":{"type":"object","properties":{"total_bytes":{"type":"integer","minimum":0},"available_bytes":{"type":"integer","minimum":0}},"required":["total_bytes","available_bytes"],"additionalProperties":false},
+            "root_filesystem":{"type":"object","properties":{"total_bytes":{"type":"integer","minimum":0},"available_bytes":{"type":"integer","minimum":0}},"required":["total_bytes","available_bytes"],"additionalProperties":false},
+            "temperatures":{"type":"array","maxItems":64,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":256},"celsius":{"type":"number"}},"required":["name","celsius"],"additionalProperties":false}},
+            "os":{
+                "type":"object",
+                "properties":{
+                    "id":nullable_string(4096),
+                    "id_like":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":128}},
+                    "name":nullable_string(4096),
+                    "pretty_name":nullable_string(4096),
+                    "version":nullable_string(4096),
+                    "version_id":nullable_string(4096),
+                    "version_codename":nullable_string(4096),
+                    "variant":nullable_string(4096),
+                    "variant_id":nullable_string(4096),
+                    "build_id":nullable_string(4096),
+                    "image_id":nullable_string(4096),
+                    "image_version":nullable_string(4096)
+                },
+                "required":["id","id_like","name","pretty_name","version","version_id","version_codename","variant","variant_id","build_id","image_id","image_version"],
+                "additionalProperties":false
+            },
+            "cpu":{
+                "type":"object",
+                "properties":{
+                    "model":nullable_string(512),
+                    "logical_cores":{"type":"integer","minimum":1},
+                    "physical_cores":{"type":["integer","null"],"minimum":1},
+                    "architecture":{"type":"string","maxLength":128},
+                    "byte_order":{"type":"string","enum":["little","big"]},
+                    "abi":{"type":"string","maxLength":128},
+                    "build_target":{"type":"string","maxLength":256},
+                    "libc":{"type":"object","properties":{"family":{"type":"string","maxLength":128},"version":nullable_string(256)},"required":["family","version"],"additionalProperties":false}
+                },
+                "required":["model","logical_cores","physical_cores","architecture","byte_order","abi","build_target","libc"],
+                "additionalProperties":false
+            },
+            "identity":{
+                "type":"object",
+                "properties":{
+                    "real_user":account(),
+                    "effective_user":account(),
+                    "real_group":account(),
+                    "effective_group":account(),
+                    "supplementary_groups":bounded_collection(account(), 128),
+                    "is_root":{"type":["boolean","null"]},
+                    "umask":nullable_string(16),
+                    "capabilities":{
+                        "type":["object","null"],
+                        "properties":{
+                            "inheritable":capability_set(),
+                            "permitted":capability_set(),
+                            "effective":capability_set(),
+                            "bounding":capability_set(),
+                            "ambient":capability_set(),
+                            "last_capability":{"type":"integer","minimum":0,"maximum":63}
+                        },
+                        "required":["inheritable","permitted","effective","bounding","ambient","last_capability"],
+                        "additionalProperties":false
+                    }
+                },
+                "required":["real_user","effective_user","real_group","effective_group","supplementary_groups","is_root","umask","capabilities"],
+                "additionalProperties":false
+            },
+            "network":{
+                "type":"object",
+                "properties":{
+                    "interfaces":bounded_collection(network_interface, 128),
+                    "routes":bounded_collection(route, 256),
+                    "dns":{
+                        "type":"object",
+                        "properties":{
+                            "available":{"type":"boolean"},
+                            "servers":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":256}},
+                            "search_domains":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":256}},
+                            "truncated":{"type":"boolean"}
+                        },
+                        "required":["available","servers","search_domains","truncated"],
+                        "additionalProperties":false
+                    },
+                    "listening_ports":bounded_collection(listening_port, 512)
+                },
+                "required":["interfaces","routes","dns","listening_ports"],
+                "additionalProperties":false
+            },
+            "filesystems":{
+                "type":"object",
+                "properties":{
+                    "available":{"type":"boolean"},
+                    "mounts":{"type":"array","maxItems":256,"items":mount},
+                    "truncated":{"type":"boolean"}
+                },
+                "required":["available","mounts","truncated"],
+                "additionalProperties":false
+            },
+            "time":{
+                "type":"object",
+                "properties":{
+                    "unix_seconds":{"type":"integer","minimum":0},
+                    "timezone":nullable_string(256),
+                    "utc_offset_seconds":{"type":["integer","null"],"minimum":-86400,"maximum":86400}
+                },
+                "required":["unix_seconds","timezone","utc_offset_seconds"],
+                "additionalProperties":false
+            },
+            "init_system":{
+                "type":"object",
+                "properties":{"name":nullable_string(256),"pid1_comm":nullable_string(256)},
+                "required":["name","pid1_comm"],
+                "additionalProperties":false
+            },
+            "toolchains":bounded_collection(toolchain, 24)
+        }),
+        &[
+            "hostname",
+            "kernel",
+            "uptime_seconds",
+            "load_average",
+            "memory",
+            "root_filesystem",
+            "temperatures",
+            "os",
+            "cpu",
+            "identity",
+            "network",
+            "filesystems",
+            "time",
+            "init_system",
+            "toolchains",
+        ],
+    )
 }
 
 fn agent_info_output_schema() -> Value {
@@ -1971,7 +2201,26 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|field| field == "temperatures")
+                .all(|field| system["outputSchema"]["properties"]
+                    .get(field.as_str().unwrap())
+                    .is_some())
+        );
+        assert_eq!(
+            system["outputSchema"]["properties"]["cpu"]["properties"]["byte_order"]["enum"],
+            json!(["little", "big"])
+        );
+        assert_eq!(
+            system["outputSchema"]["properties"]["network"]["properties"]["routes"]["properties"]["items"]
+                ["maxItems"],
+            256
+        );
+        assert_eq!(
+            system["outputSchema"]["properties"]["filesystems"]["properties"]["mounts"]["maxItems"],
+            256
+        );
+        assert_eq!(
+            system["outputSchema"]["properties"]["toolchains"]["properties"]["items"]["maxItems"],
+            24
         );
         let processes = tools.iter().find(|tool| tool["name"] == "pids").unwrap();
         assert_eq!(
