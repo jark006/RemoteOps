@@ -226,6 +226,12 @@ cargo zigbuild --target armv7-unknown-linux-musleabihf --release
 cargo zigbuild --target aarch64-unknown-linux-musl --release
 cargo zigbuild --target x86_64-unknown-linux-musl --release
 cargo zigbuild --target riscv64gc-unknown-linux-musl --release
+
+# 在 MacOS 安装工具链及编译
+rustup target add aarch64-apple-darwin
+rustup target add x86_64-apple-darwin
+cargo build --target aarch64-apple-darwin --release
+cargo build --target x86_64-apple-darwin --release
 ```
 
 ## ✅ 验证
