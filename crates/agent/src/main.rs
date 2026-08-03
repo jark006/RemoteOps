@@ -2,8 +2,7 @@ use std::env;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 
-use remote_ops_agent::service::{ConnectionAction, handle_connection};
-use remote_ops_agent::tools::jobs::JobManager;
+use remote_ops_agent::service::serve;
 use remote_ops_agent::tools::lifecycle;
 use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
 
@@ -59,16 +58,9 @@ fn main() {
     if let Some(path) = config.cleanup_update_helper.clone() {
         lifecycle::schedule_cleanup(vec![path]);
     }
-    let jobs = JobManager::new();
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => match handle_connection(stream, config.max_transfer_bytes, &jobs) {
-                Ok(ConnectionAction::Continue) => {}
-                Ok(ConnectionAction::RestartAgent) => return,
-                Err(error) => eprintln!("connection closed: {error}"),
-            },
-            Err(error) => eprintln!("accept failed: {error}"),
-        }
+    if let Err(error) = serve(listener, config.max_transfer_bytes) {
+        eprintln!("agent service failed: {error}");
+        std::process::exit(1);
     }
 }
 

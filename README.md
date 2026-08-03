@@ -164,6 +164,7 @@ proxy 当前暴露 38 个 MCP 工具：
 
 ### Agent 与设备生命周期
 
+- Agent 同一时刻只允许一个已认证 proxy 作为活动管理者。新的 proxy 完成认证后会接管空闲管理连接，并由 Agent 关闭旧连接，因此 Codex 使用 `/clear` 创建新会话后，新会话的 proxy 可以直接继续管理设备；旧 proxy 进程可能仍由 Codex 保留，但不再占用远端连接。如果当前管理者正在执行请求、传输或提交文件，新候选的首个请求会收到 `manager_busy` 且保证未执行；认证失败不会影响当前管理者。
 - `remote_status` 是被动快照，不会为确认设备在线而建立连接。`connection_state` 为 `cached` 或 `disconnected`，只表示 proxy 是否持有已认证会话；`lifecycle_state` 为 `ready`、`rebooting` 或 `updating`。结果还包含 `last_success_at_ms`、`last_error`、`last_probe` 和最近缓存的 `agent_info`。
 - `remote_probe` 会主动建立连接或复用缓存连接执行健康检查。`timeout_ms` 默认 5,000 ms，范围 100..=30,000 ms；结果始终给出 `reachable`、延迟、是否复用连接、生命周期状态，以及 Agent 信息或结构化错误。
 - `wait_remote` 支持 `online`、`offline` 和 `offline_then_online`。正常状态默认等待 `online`，重启或更新期间默认等待 `offline_then_online`；后者在观察到离线后重新在线，或 Agent `instance_id` 已变化时完成。总超时默认 120,000 ms、范围 1..=600,000 ms，轮询间隔默认 1,000 ms、范围 100..=10,000 ms，每次探测超时默认 5,000 ms、范围 100..=30,000 ms。

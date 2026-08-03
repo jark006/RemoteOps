@@ -13,8 +13,9 @@
 ## 架构边界
 
 - MCP JSON-RPC 只存在于 proxy 的 stdio 一侧，二进制文件内容不得编码进 MCP JSON。
-- proxy 主动连接一个远端 agent；首版协议串行处理请求，不支持复用或自动重放。
-- 认证后的连接不得因为空闲而关闭。握手、已开始帧、传输帧间隔和 socket 写入分别保持有界超时，并启用 TCP Keepalive；proxy 可在用户请求发送前通过内部 Request/Response 健康检查安全重连。
+- proxy 主动连接一个远端 agent；Agent 同一时刻只允许一个已认证 proxy 作为活动管理者，首版协议串行处理请求，不支持复用或自动重放。
+- 新 proxy 完成认证后可原子接管空闲活动管理连接，Agent 必须关闭被取代的旧连接；认证失败不得影响当前管理者。活动管理者从确认请求到完整响应发送期间均为 busy，此时新候选的首个请求必须返回 `manager_busy` 并保证未执行，不得中断或排队旧请求。候选连接和 handler 数量必须有界。
+- 认证后的活动连接不得因为空闲而关闭；内部所有权轮询不得改变该语义。握手、已开始帧、传输帧间隔和 socket 写入分别保持有界超时，并启用 TCP Keepalive；proxy 可在用户请求发送前通过内部 Request/Response 健康检查安全重连。
 - 控制消息使用 JSON，文件内容使用 `Chunk` 帧。修改 wire 类型或帧格式时必须提升协议版本并补兼容/拒绝测试。
 - proxy 和 agent 固定使用 `BUILTIN_PSK = b"JARK006_PSK"`，不得要求部署者配置 `REMOTE_OPS_PSK`。帧完整性与防重放保护仍须保留；协议不承诺认证安全或机密性。
 - stdout 是 proxy 的 MCP 协议通道，任何日志只能写 stderr。

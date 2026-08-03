@@ -1,13 +1,17 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use remote_ops_protocol::{
-    BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_TRANSFER_IDLE_TIMEOUT,
-    DownloadRequest, FrameType, INTERNAL_PING_OPERATION, ProtocolError, RemoteError, RemoteRequest,
-    RemoteResponse, Session, SessionOptions, TransferEnd, TransferMetadata, UploadRequest,
+    BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CONTROL_BYTES,
+    DEFAULT_TRANSFER_IDLE_TIMEOUT, DownloadRequest, FrameType, INTERNAL_PING_OPERATION,
+    ProtocolError, RemoteError, RemoteRequest, RemoteResponse, Session, SessionOptions,
+    TransferEnd, TransferMetadata, UploadRequest,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -26,6 +30,288 @@ use crate::tools::lifecycle;
 pub enum ConnectionAction {
     Continue,
     RestartAgent,
+}
+
+const MAX_PENDING_CONNECTIONS: usize = 4;
+const MAX_CONNECTION_HANDLERS: usize = MAX_PENDING_CONNECTIONS + 1;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MANAGED_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+type ServiceError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagementPhase {
+    Idle,
+    Busy,
+}
+
+struct ManagedConnection {
+    id: u64,
+    phase: ManagementPhase,
+    shutdown: TcpStream,
+}
+
+struct ConnectionState {
+    next_id: u64,
+    shutting_down: bool,
+    pending: HashMap<u64, TcpStream>,
+    active: Option<ManagedConnection>,
+}
+
+struct ConnectionManager {
+    state: Mutex<ConnectionState>,
+}
+
+struct CandidateConnection {
+    id: u64,
+    manager: Arc<ConnectionManager>,
+    registered: bool,
+}
+
+struct ManagementLease {
+    id: u64,
+    manager: Arc<ConnectionManager>,
+}
+
+struct RequestGuard {
+    id: u64,
+    manager: Arc<ConnectionManager>,
+}
+
+enum ClaimOutcome {
+    Active(ManagementLease),
+    Busy(CandidateConnection),
+    Unavailable,
+}
+
+impl ConnectionManager {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ConnectionState {
+                next_id: 1,
+                shutting_down: false,
+                pending: HashMap::new(),
+                active: None,
+            }),
+        }
+    }
+
+    fn register_candidate(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+    ) -> std::io::Result<Option<CandidateConnection>> {
+        let shutdown = stream.try_clone()?;
+        let mut state = lock(&self.state);
+        if state.shutting_down || state.pending.len() >= MAX_PENDING_CONNECTIONS {
+            return Ok(None);
+        }
+        let id = state.next_id;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("connection id space exhausted"))?;
+        state.pending.insert(id, shutdown);
+        Ok(Some(CandidateConnection {
+            id,
+            manager: Arc::clone(self),
+            registered: true,
+        }))
+    }
+
+    fn shutdown_all(&self) {
+        let streams = {
+            let mut state = lock(&self.state);
+            state.shutting_down = true;
+            let mut streams: Vec<_> = state.pending.drain().map(|(_, stream)| stream).collect();
+            if let Some(active) = state.active.take() {
+                streams.push(active.shutdown);
+            }
+            streams
+        };
+        for stream in streams {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl CandidateConnection {
+    fn claim(mut self) -> ClaimOutcome {
+        let (lease, superseded) = {
+            let mut state = lock(&self.manager.state);
+            if state.shutting_down || !state.pending.contains_key(&self.id) {
+                return ClaimOutcome::Unavailable;
+            }
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.phase == ManagementPhase::Busy)
+            {
+                drop(state);
+                return ClaimOutcome::Busy(self);
+            }
+            let shutdown = state
+                .pending
+                .remove(&self.id)
+                .expect("registered candidate");
+            let superseded = state.active.replace(ManagedConnection {
+                id: self.id,
+                phase: ManagementPhase::Idle,
+                shutdown,
+            });
+            self.registered = false;
+            (
+                ManagementLease {
+                    id: self.id,
+                    manager: Arc::clone(&self.manager),
+                },
+                superseded,
+            )
+        };
+        if let Some(superseded) = superseded {
+            let _ = superseded.shutdown.shutdown(Shutdown::Both);
+        }
+        ClaimOutcome::Active(lease)
+    }
+}
+
+impl Drop for CandidateConnection {
+    fn drop(&mut self) {
+        if self.registered {
+            lock(&self.manager.state).pending.remove(&self.id);
+        }
+    }
+}
+
+impl ManagementLease {
+    fn begin_request(&self) -> Option<RequestGuard> {
+        let mut state = lock(&self.manager.state);
+        let active = state.active.as_mut()?;
+        if active.id != self.id || active.phase != ManagementPhase::Idle {
+            return None;
+        }
+        active.phase = ManagementPhase::Busy;
+        Some(RequestGuard {
+            id: self.id,
+            manager: Arc::clone(&self.manager),
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        lock(&self.manager.state)
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == self.id)
+    }
+}
+
+impl Drop for ManagementLease {
+    fn drop(&mut self) {
+        let mut state = lock(&self.manager.state);
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == self.id)
+        {
+            state.active = None;
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        let mut state = lock(&self.manager.state);
+        if let Some(active) = state.active.as_mut()
+            && active.id == self.id
+            && active.phase == ManagementPhase::Busy
+        {
+            active.phase = ManagementPhase::Idle;
+        }
+    }
+}
+
+pub fn serve(listener: TcpListener, max_transfer_bytes: u64) -> Result<(), ServiceError> {
+    listener.set_nonblocking(true)?;
+    let manager = Arc::new(ConnectionManager::new());
+    let jobs = Arc::new(JobManager::new());
+    let (action_sender, action_receiver) = mpsc::channel();
+    let mut handlers = Vec::new();
+
+    loop {
+        if action_receiver
+            .try_iter()
+            .any(|action| action == ConnectionAction::RestartAgent)
+        {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("connection blocking mode setup failed: {error}");
+                    continue;
+                }
+                reap_finished_handlers(&mut handlers);
+                if handlers.len() >= MAX_CONNECTION_HANDLERS {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                }
+                let candidate = match manager.register_candidate(&stream) {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!("connection registration failed: {error}");
+                        continue;
+                    }
+                };
+                let jobs = Arc::clone(&jobs);
+                let action_sender = action_sender.clone();
+                handlers.push(thread::spawn(move || {
+                    match handle_registered_connection(stream, candidate, max_transfer_bytes, &jobs)
+                    {
+                        Ok(ConnectionAction::Continue) => {}
+                        Ok(action @ ConnectionAction::RestartAgent) => {
+                            let _ = action_sender.send(action);
+                        }
+                        Err(error) => eprintln!("connection closed: {error}"),
+                    }
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                reap_finished_handlers(&mut handlers);
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(error) => {
+                eprintln!("accept failed: {error}");
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+        }
+    }
+
+    manager.shutdown_all();
+    for handler in handlers {
+        let _ = handler.join();
+    }
+    Ok(())
+}
+
+fn reap_finished_handlers(handlers: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handlers.len() {
+        if handlers[index].is_finished() {
+            let handler = handlers.swap_remove(index);
+            let _ = handler.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Deserialize)]
@@ -55,20 +341,93 @@ pub fn handle_connection(
     stream: TcpStream,
     max_transfer_bytes: u64,
     jobs: &JobManager,
-) -> Result<ConnectionAction, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ConnectionAction, ServiceError> {
     let peer = stream
         .peer_addr()
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    let mut session = Session::accept(
+    let session = Session::accept(
         stream,
         BUILTIN_PSK,
         SessionOptions::agent(),
         DEFAULT_MAX_CONTROL_BYTES,
     )?;
+    handle_session(session, peer, max_transfer_bytes, jobs, None)
+}
+
+fn handle_registered_connection(
+    stream: TcpStream,
+    candidate: CandidateConnection,
+    max_transfer_bytes: u64,
+    jobs: &JobManager,
+) -> Result<ConnectionAction, ServiceError> {
+    let peer = stream
+        .peer_addr()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let session = Session::accept(
+        stream,
+        BUILTIN_PSK,
+        SessionOptions::agent(),
+        DEFAULT_MAX_CONTROL_BYTES,
+    )?;
+    match candidate.claim() {
+        ClaimOutcome::Active(lease) => {
+            handle_session(session, peer, max_transfer_bytes, jobs, Some(&lease))
+        }
+        ClaimOutcome::Busy(candidate) => reject_busy_candidate(session, candidate),
+        ClaimOutcome::Unavailable => Ok(ConnectionAction::Continue),
+    }
+}
+
+fn reject_busy_candidate(
+    mut session: Session,
+    _candidate: CandidateConnection,
+) -> Result<ConnectionAction, ServiceError> {
+    let frame = session.receive_with_idle_timeout(Some(DEFAULT_HANDSHAKE_TIMEOUT))?;
+    if frame.kind != FrameType::Request {
+        return Err(format!("expected request, received {:?}", frame.kind).into());
+    }
+    session.send_json(
+        FrameType::Error,
+        frame.request_id,
+        &RemoteError {
+            kind: "manager_busy".to_string(),
+            message: "another authenticated proxy is executing a request; retry later".to_string(),
+        },
+    )?;
+    Ok(ConnectionAction::Continue)
+}
+
+fn handle_session(
+    mut session: Session,
+    peer: String,
+    max_transfer_bytes: u64,
+    jobs: &JobManager,
+    lease: Option<&ManagementLease>,
+) -> Result<ConnectionAction, ServiceError> {
     loop {
-        let frame = match session.receive() {
+        let frame = match if lease.is_some() {
+            session.receive_with_idle_timeout(Some(MANAGED_IDLE_POLL_INTERVAL))
+        } else {
+            session.receive()
+        } {
             Ok(frame) => frame,
+            Err(ProtocolError::Io(error))
+                if lease.is_some()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                if lease.is_some_and(|lease| !lease.is_active()) {
+                    return Ok(ConnectionAction::Continue);
+                }
+                continue;
+            }
+            Err(_) if lease.is_some_and(|lease| !lease.is_active()) => {
+                return Ok(ConnectionAction::Continue);
+            }
             Err(ProtocolError::Io(error)) if is_quiet_disconnect(&error) => {
                 return Ok(ConnectionAction::Continue);
             }
@@ -77,6 +436,14 @@ pub fn handle_connection(
         if frame.kind != FrameType::Request {
             return Err(format!("expected request, received {:?}", frame.kind).into());
         }
+        let _request_guard = if let Some(lease) = lease {
+            let Some(guard) = lease.begin_request() else {
+                return Ok(ConnectionAction::Continue);
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let request: RemoteRequest = serde_json::from_slice(&frame.payload)?;
         if request.operation == INTERNAL_PING_OPERATION {
             session.send_json(
@@ -580,8 +947,60 @@ fn validate_sha256(value: &str) -> Result<(), AgentError> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_quiet_disconnect;
+    use super::*;
     use std::io::{Error, ErrorKind};
+
+    use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
+    use serde_json::{Value, json};
+
+    fn spawn_managed_handler(
+        listener: &TcpListener,
+        manager: Arc<ConnectionManager>,
+        jobs: Arc<JobManager>,
+    ) -> JoinHandle<Result<ConnectionAction, ServiceError>> {
+        let listener = listener.try_clone().unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let candidate = manager.register_candidate(&stream).unwrap().unwrap();
+            handle_registered_connection(stream, candidate, DEFAULT_MAX_TRANSFER_BYTES, &jobs)
+        })
+    }
+
+    fn connect_session(address: std::net::SocketAddr) -> Session {
+        Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(2)),
+            DEFAULT_MAX_CONTROL_BYTES,
+        )
+        .unwrap()
+    }
+
+    fn call_agent_info(session: &mut Session, request_id: u64) -> Value {
+        session
+            .send_json(
+                FrameType::Request,
+                request_id,
+                &RemoteRequest {
+                    operation: "agent_info".to_string(),
+                    arguments: json!({}),
+                },
+            )
+            .unwrap();
+        let response: RemoteResponse = session
+            .receive_json(FrameType::Response, request_id)
+            .unwrap();
+        assert!(response.ok);
+        response.result.unwrap()
+    }
+
+    fn connected_stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let connector = thread::spawn(move || TcpStream::connect(address).unwrap());
+        let (server, _) = listener.accept().unwrap();
+        (server, connector.join().unwrap())
+    }
 
     #[test]
     fn quiet_disconnects_only_include_normal_close_and_timeouts() {
@@ -601,5 +1020,108 @@ mod tests {
         ] {
             assert!(!is_quiet_disconnect(&Error::from(kind)), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn authenticated_candidate_takes_over_idle_manager() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let manager = Arc::new(ConnectionManager::new());
+        let jobs = Arc::new(JobManager::new());
+
+        let first_handler =
+            spawn_managed_handler(&listener, Arc::clone(&manager), Arc::clone(&jobs));
+        let mut first = connect_session(address);
+        assert_eq!(call_agent_info(&mut first, 1)["name"], "remote-ops-agent");
+        thread::sleep(MANAGED_IDLE_POLL_INTERVAL * 3);
+        assert_eq!(call_agent_info(&mut first, 2)["name"], "remote-ops-agent");
+
+        let second_handler =
+            spawn_managed_handler(&listener, Arc::clone(&manager), Arc::clone(&jobs));
+        let mut second = connect_session(address);
+        assert_eq!(call_agent_info(&mut second, 1)["name"], "remote-ops-agent");
+        assert_eq!(
+            first_handler.join().unwrap().unwrap(),
+            ConnectionAction::Continue
+        );
+
+        drop(second);
+        assert_eq!(
+            second_handler.join().unwrap().unwrap(),
+            ConnectionAction::Continue
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn failed_authentication_does_not_displace_active_manager() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let manager = Arc::new(ConnectionManager::new());
+        let jobs = Arc::new(JobManager::new());
+
+        let active_handler =
+            spawn_managed_handler(&listener, Arc::clone(&manager), Arc::clone(&jobs));
+        let mut active = connect_session(address);
+        assert_eq!(call_agent_info(&mut active, 1)["name"], "remote-ops-agent");
+
+        let rejected_handler =
+            spawn_managed_handler(&listener, Arc::clone(&manager), Arc::clone(&jobs));
+        let error = Session::connect(
+            address,
+            b"JARK006_BAD",
+            SessionOptions::proxy(Duration::from_secs(2)),
+            DEFAULT_MAX_CONTROL_BYTES,
+        )
+        .err()
+        .expect("authentication must fail");
+        assert!(matches!(error, ProtocolError::Authentication));
+        assert!(rejected_handler.join().unwrap().is_err());
+
+        assert_eq!(call_agent_info(&mut active, 2)["name"], "remote-ops-agent");
+        drop(active);
+        assert_eq!(
+            active_handler.join().unwrap().unwrap(),
+            ConnectionAction::Continue
+        );
+    }
+
+    #[test]
+    fn busy_manager_rejects_candidate_without_transferring_lease() {
+        let manager = Arc::new(ConnectionManager::new());
+        let (active_stream, _active_peer) = connected_stream_pair();
+        let active_candidate = manager.register_candidate(&active_stream).unwrap().unwrap();
+        let active_lease = match active_candidate.claim() {
+            ClaimOutcome::Active(lease) => lease,
+            _ => panic!("first candidate must become active"),
+        };
+        let request_guard = active_lease.begin_request().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let jobs = Arc::new(JobManager::new());
+        let rejected_handler =
+            spawn_managed_handler(&listener, Arc::clone(&manager), Arc::clone(&jobs));
+        let mut rejected = connect_session(address);
+        rejected
+            .send_json(
+                FrameType::Request,
+                7,
+                &RemoteRequest {
+                    operation: "agent_info".to_string(),
+                    arguments: json!({}),
+                },
+            )
+            .unwrap();
+        let error: RemoteError = rejected.receive_json(FrameType::Error, 7).unwrap();
+        assert_eq!(error.kind, "manager_busy");
+        assert_eq!(
+            rejected_handler.join().unwrap().unwrap(),
+            ConnectionAction::Continue
+        );
+        assert!(active_lease.is_active());
+
+        drop(request_guard);
+        assert!(active_lease.begin_request().is_some());
     }
 }
