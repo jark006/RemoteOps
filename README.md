@@ -200,6 +200,8 @@ target/release/remote-ops-agent
 
 Agent 的 `build.rs` 会在编译时注入 target、profile 和 Git revision；这些信息可通过 `agent_info.build` 查看，并用于自更新候选程序的兼容性检查。可设置 `REMOTE_OPS_GIT_REVISION` 显式指定 revision，否则构建脚本尝试读取当前 Git 提交，无法读取时使用 `unknown`。
 
+工作区的 `[profile.release]` 已针对 flash 资源受限平台（如 armv7）做了体积优化，且以性能优先为前提：开启全程序 LTO、单 codegen unit、`opt-level = "s"`（体积感知，保留内联/向量化等主要优化）并剥离符号表；SHA-256 与正则匹配路径单独保持最高优化级别，确保大文件传输和 `grep` 不受影响。代价是 release 构建时间变长、内存占用升高。例如 armv7 的 agent 体积可由约 2.6 MiB 降至约 2.0 MiB。
+
 可使用 `cargo-zigbuild` 针对 Linux 平台进行交叉编译：
 
 ```sh

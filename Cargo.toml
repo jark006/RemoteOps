@@ -7,8 +7,23 @@ version = "1.2.0"
 edition = "2024"
 license = "MIT"
 
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.regex]
+opt-level = 3
+
+[profile.release.package.regex-automata]
+opt-level = 3
+
 [workspace.dependencies]
-globset = "0.4"
+globset = { version = "0.4", default-features = false }
 if-addrs = "0.15"
 getrandom = "0.3"
 libc = "0.2"
