@@ -352,10 +352,10 @@ fn release_deployment_switches_atomically_and_rolls_back_failed_health() {
         expected_arch: Some(std::env::consts::ARCH.to_string()),
         min_free_bytes: 0,
         dependencies: vec!["true".to_string()],
-        stop: Some(command("/bin/true")),
-        start: command("/bin/true"),
+        stop: Some(command("true")),
+        start: command("true"),
         health: command(health),
-        rollback_start: Some(command("/bin/true")),
+        rollback_start: Some(command("true")),
         sync: SyncOptions {
             excludes: Vec::new(),
             max_files: 100,
@@ -370,7 +370,7 @@ fn release_deployment_switches_atomically_and_rolls_back_failed_health() {
     );
     let first = deployment::deploy_release(
         &mut client,
-        options(&local_v1.path().to_path_buf(), "v1", "/bin/true"),
+        options(&local_v1.path().to_path_buf(), "v1", "true"),
     )
     .unwrap();
     assert_eq!(first["status"], "deployed");
@@ -379,7 +379,7 @@ fn release_deployment_switches_atomically_and_rolls_back_failed_health() {
 
     let second = deployment::deploy_release(
         &mut client,
-        options(&local_v2.path().to_path_buf(), "v2", "/bin/false"),
+        options(&local_v2.path().to_path_buf(), "v2", "false"),
     )
     .unwrap();
     assert_eq!(second["status"], "rolled_back");
