@@ -109,7 +109,7 @@ proxy 当前暴露 38 个 MCP 工具：
 | `pids` | `filter?`, `cursor?`, `limit?` | Linux/Windows/macOS 进程分页；不可读取的 Windows/macOS 命令行返回空字符串。 |
 | `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。 |
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
-| `pkill` | `name`, `signal?` | 按平台进程名完整匹配并排除 agent 自身，默认 signal 15；Linux/macOS 名称分别最多 15/31 字节，Windows 最多 260 个 UTF-16 单元且 signal 仅接受 9/15。匹配超过 1024 个进程时不执行，返回 `matched`、`signaled_pids` 和 `failed_pids`。 |
+| `pkill` | `name`, `signal?` | 按平台进程名完整匹配（Windows 不区分大小写）并排除 agent 自身，默认 signal 15；Linux/macOS 名称分别最多 15/31 字节，Windows 最多 260 个 UTF-16 单元且 signal 仅接受 9/15。匹配超过 1024 个进程时不执行，返回 `matched`、`signaled_pids` 和 `failed_pids`。 |
 | `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。 |
 | `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。 |
 | `process_start` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 启动由 agent 管理的后台程序并立即返回 job ID；默认最长 1 小时，最大 24 小时。 |
@@ -132,7 +132,7 @@ proxy 当前暴露 38 个 MCP 工具：
 
 `mkdir`、`remove`、`move`、`copy`、`chmod` 和 `symlink` 都要求精确路径。`remove` 的递归模式和 `copy` 的目录递归模式最多处理 100,000 个条目，先拒绝特殊文件；递归复制不接受符号链接。`move` 不隐式退化为 copy-delete，遇到跨文件系统移动返回 `cross_filesystem`。覆盖目录始终被拒绝，覆盖非目录必须显式设置 `overwrite`。
 
-`sync_directory` 在 proxy 所在 PC 扫描普通文件和目录，拒绝符号链接、特殊文件及非 UTF-8 相对路径。manifest 默认最多 4,096 个条目、4 GiB、32 层，硬上限分别为 10,000 个、4 GiB、64 层；最多 64 个排除 glob，每个最多 1 KiB。Agent 将远端未变化文件复制进 staging，只传输大小或 SHA-256 不同的文件，并保留文件、目录及根目录 Unix mode。提交前逐项复核 staging，随后将旧目标改名为返回的 `backup_path`，不会静默删除备份。
+`sync_directory` 在 proxy 所在 PC 扫描普通文件和目录，拒绝符号链接、特殊文件及非 UTF-8 相对路径。manifest 默认最多 4,096 个条目、4 GiB、32 层，硬上限分别为 10,000 个、4 GiB、64 层；最多 64 个排除 glob，每个最多 1 KiB。Agent 将远端未变化文件复制进 staging，只传输大小或 SHA-256 不同的文件，并在远端支持时保留文件、目录及根目录 Unix mode；远端不支持（如 Windows Agent）时，proxy 会在 manifest 中省略 mode 并正常同步。提交前逐项复核 staging，随后将旧目标改名为返回的 `backup_path`，不会静默删除备份。
 
 `deploy_release` 仅在 Unix Agent 上支持。`release_id` 只能使用 ASCII 字母、数字、`.`、`_` 和 `-`；新版本同步到 `releases_path/release_id`。preflight 检查远端架构、所需磁盘空间、release/current 父目录写权限和最多 64 个依赖程序。`stop`、`start`、`health`、`rollback_start` 均采用与 `exec` 相同的不经过 shell 的结构化命令，单步最长 300 秒；`start` 和 `health` 必填。Agent 在同一请求内停止服务、原子替换 `current_path` symlink、启动并执行健康检查，启动或健康检查失败时切回旧 symlink，并按 `rollback_start`（默认复用 `start`）恢复旧服务。
 
@@ -229,11 +229,15 @@ cargo zigbuild --target aarch64-unknown-linux-musl --release
 cargo zigbuild --target x86_64-unknown-linux-musl --release
 cargo zigbuild --target riscv64gc-unknown-linux-musl --release
 
-# 在 MacOS 安装工具链及编译
+# 在 MacOS 安装工具链，并编译双架构的 Mac 及 Win
 rustup target add aarch64-apple-darwin
 rustup target add x86_64-apple-darwin
+rustup target add aarch64-pc-windows-gnullvm
+rustup target add x86_64-pc-windows-gnu
 cargo build --target aarch64-apple-darwin --release
 cargo build --target x86_64-apple-darwin --release
+cargo zigbuild --target aarch64-pc-windows-gnullvm --release
+cargo zigbuild --target x86_64-pc-windows-gnu --release
 ```
 
 ## ✅ 验证

@@ -357,7 +357,8 @@ impl RemoteClient {
                 "remote agent does not support self-update",
             ));
         }
-        let upload = self.upload(local_path, &staging_path, true, Some(0o755), true)?;
+        let upload_mode = agent_supports_unix_mode(&previous_agent).then_some(0o755);
+        let upload = self.upload(local_path, &staging_path, true, upload_mode, true)?;
         let sha256 = upload["sha256"]
             .as_str()
             .ok_or_else(|| ClientError::local("protocol", "upload response omitted SHA-256"))?
@@ -954,6 +955,10 @@ fn agent_instance_id(agent_info: &Value) -> Option<&str> {
     agent_info["runtime"]["instance_id"].as_str()
 }
 
+pub(crate) fn agent_supports_unix_mode(agent_info: &Value) -> bool {
+    agent_info["platform"]["family"] == "unix"
+}
+
 fn candidate_matches_agent(candidate: &Value, agent_info: &Value) -> bool {
     candidate["name"] == agent_info["name"]
         && candidate["version"] == agent_info["version"]
@@ -1231,6 +1236,18 @@ mod tests {
             DEFAULT_MAX_CONTROL_BYTES,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unix_mode_support_follows_remote_platform_family() {
+        use serde_json::json;
+        assert!(agent_supports_unix_mode(
+            &json!({"platform": {"family": "unix"}})
+        ));
+        assert!(!agent_supports_unix_mode(
+            &json!({"platform": {"family": "windows"}})
+        ));
+        assert!(!agent_supports_unix_mode(&json!({})));
     }
 
     #[test]

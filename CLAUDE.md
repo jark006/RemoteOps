@@ -36,7 +36,7 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - 单文件默认上限 4 GiB，chunk 上限 64 KiB；控制帧上限 2 MiB。
 - 远端协议版本为 3。上传请求必须携带完整 SHA-256，可选 `mode` 范围为 `0..=0o7777` 且只在 Unix Agent 生效；上传和下载的 `resume` 默认 false。续传必须校验 partial 文件的已有长度和前缀 SHA-256，最终仍校验完整长度和 SHA-256；前缀不匹配的下载安全回退到偏移 0。成功前使用同目录 partial 文件，失败时仅在启用续传时保留可恢复 partial，目标不得出现半文件。
 - `mkdir`、`remove`、`move`、`copy`、`chmod`、`symlink` 必须使用精确路径并区分普通文件、目录、符号链接和特殊文件。递归删除和复制最多检查 100,000 个条目；递归复制拒绝符号链接和特殊文件，递归删除不跟随符号链接并拒绝特殊文件。`move` 不得在跨文件系统时隐式 copy-delete；目录覆盖始终拒绝，非目录覆盖必须显式开启。
-- `sync_directory` 基于排序 manifest、大小和 SHA-256，只传变化普通文件；本地符号链接、特殊文件和非 UTF-8 相对路径必须拒绝。同步在目标同级 staging 构建，提交前逐项复核类型、大小和哈希，再将旧目标改名为 `backup_path` 并切换 staging；旧 backup 不得静默删除。保留文件、目录和同步根目录 Unix mode。manifest 默认最多 4,096 个条目、4 GiB、32 层，最大 10,000 个条目、4 GiB、64 层；排除 glob 最多 64 个、每个 1 KiB。
+- `sync_directory` 基于排序 manifest、大小和 SHA-256，只传变化普通文件；本地符号链接、特殊文件和非 UTF-8 相对路径必须拒绝。同步在目标同级 staging 构建，提交前逐项复核类型、大小和哈希，再将旧目标改名为 `backup_path` 并切换 staging；旧 backup 不得静默删除。远端 Agent 支持时保留文件、目录和同步根目录 Unix mode，不支持时 proxy 在 manifest 中省略 mode 并正常同步。manifest 默认最多 4,096 个条目、4 GiB、32 层，最大 10,000 个条目、4 GiB、64 层；排除 glob 最多 64 个、每个 1 KiB。
 - `deploy_release` 仅在 Unix Agent 上支持。`release_id` 限 1..=128 个 ASCII 字母、数字、`.`、`_`、`-`，release 必须是 `releases_path` 的直接子目录，`current_path` 必须不存在或为符号链接。preflight 必须验证架构、release/current 父目录写权限、可用磁盘和最多 64 个依赖。`stop` 可选，`start` 和 `health` 必填，`rollback_start` 默认复用 `start`；命令不经过 shell 且每步最多 300 秒。服务停止后原子切换 current symlink，启动或健康检查失败时必须在同一 Agent 请求内切回旧链接并恢复旧服务，返回 `deployed`、`stop_failed`、`rolled_back` 或 `rollback_failed` 结构化状态。
 - `apply_patch` 仅更新一个已存在的普通 UTF-8 文本文件，补丁路径必须与请求路径完全一致；补丁最大 256 KiB，目标文件最大 16 MiB，最多 128 个 hunk，不支持创建、删除、重命名或无上下文纯插入。旧侧上下文必须唯一匹配，可用 `expected_sha256` 检测冲突；整个补丁成功前不得修改目标，并保留 BOM、原有行尾和末尾换行状态。
 - `read_file_lines` 使用 1-based inclusive 行号，`start_line` 默认 1，未提供 `end_line` 时默认读取 200 行；单次最多 10,000 行、返回 1 MiB，并将为定位起始行而扫描的内容限制为 64 MiB。只接受非符号链接的普通文件，请求范围必须是 UTF-8。
@@ -62,7 +62,7 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
 - 后台任务在 Unix 使用独立进程组，在 Windows 使用 Job Object；`process_signal` 在 Unix 接受 1..=64，Windows 仅接受 9 或 15 且两者都终止整个 Job Object。Agent 的任务管理器释放时必须终止仍在运行的任务并回收工作线程。
 - `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
-- `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
+- `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配（Windows 不区分大小写）并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。
 - Windows `system_info` 返回主机、系统版本、运行时间、内存、系统盘、CPU、网卡、当前用户名、系统时间和可用工具链；无 Unix load average 和统一温度接口，分别返回零值和空数组，Linux 专属集合标记为不可用。macOS `system_info` 返回主机、内核/系统版本、运行时间、CPU、用户组、网卡/IP、DNS、内存、根文件系统、时间和工具链，并通过 `getloadavg` 提供真实负载；无统一温度接口，温度返回空数组，尚未原生采集的路由和监听端口标记为不可用。
 - 不得为不支持的平台伪造空系统信息；应返回结构化错误。

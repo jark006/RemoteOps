@@ -699,6 +699,29 @@ fn windows_process_entries() -> AgentResult<Vec<WindowsProcessEntry>> {
 }
 
 #[cfg(windows)]
+fn windows_process_name_matches(actual: &str, requested: &str) -> bool {
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let actual = actual.encode_utf16().collect::<Vec<_>>();
+    let requested = requested.encode_utf16().collect::<Vec<_>>();
+    let (Ok(actual_len), Ok(requested_len)) =
+        (i32::try_from(actual.len()), i32::try_from(requested.len()))
+    else {
+        return false;
+    };
+    // The slices remain alive for the duration of this length-bounded Windows API call.
+    unsafe {
+        CompareStringOrdinal(
+            actual.as_ptr(),
+            actual_len,
+            requested.as_ptr(),
+            requested_len,
+            1,
+        ) == CSTR_EQUAL
+    }
+}
+
+#[cfg(windows)]
 fn windows_process_command_line(pid: u32) -> Option<String> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -1027,7 +1050,7 @@ pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
     let own_pid = std::process::id();
     let mut matched_pids = Vec::new();
     for entry in windows_process_entries()? {
-        if entry.pid == own_pid || entry.name != name {
+        if entry.pid == own_pid || !windows_process_name_matches(&entry.name, name) {
             continue;
         }
         let pid = i32::try_from(entry.pid)
@@ -1271,8 +1294,8 @@ mod tests {
     }
 
     #[test]
-    fn windows_pkill_exactly_matches_executable_name_and_defaults_to_termination() {
-        let name = format!("rops-pk-{}.exe", std::process::id());
+    fn windows_pkill_matches_executable_name_case_insensitively_and_defaults_to_termination() {
+        let name = format!("rops-pk-\u{00e4}-{}.exe", std::process::id());
         let directory = tempfile::tempdir().unwrap();
         let child_executable = directory.path().join(&name);
         std::fs::copy(std::env::current_exe().unwrap(), &child_executable).unwrap();
@@ -1296,7 +1319,7 @@ mod tests {
 
         let result = crate::dispatch(
             "pkill",
-            serde_json::json!({"name": name}),
+            serde_json::json!({"name": name.to_uppercase()}),
             &crate::tools::jobs::JobManager::new(),
             remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
         )

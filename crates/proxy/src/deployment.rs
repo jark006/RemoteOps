@@ -11,7 +11,7 @@ use remote_ops_protocol::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::client::{ClientError, RemoteClient};
+use crate::client::{ClientError, RemoteClient, agent_supports_unix_mode};
 
 pub struct SyncOptions {
     pub excludes: Vec<String>,
@@ -51,7 +51,8 @@ pub fn sync_directory(
     remote_path: &str,
     options: SyncOptions,
 ) -> Result<Value, ClientError> {
-    let manifest = build_manifest(local_path, &options)?;
+    let include_modes = remote_supports_unix_mode(client)?;
+    let manifest = build_manifest(local_path, &options, include_modes)?;
     sync_manifest(client, remote_path, &options, &manifest)
 }
 
@@ -68,7 +69,8 @@ pub fn deploy_release(
     if let Some(command) = &options.rollback_start {
         validate_command(command)?;
     }
-    let manifest = build_manifest(&options.local_path, &options.sync)?;
+    let include_modes = remote_supports_unix_mode(client)?;
+    let manifest = build_manifest(&options.local_path, &options.sync, include_modes)?;
     let release_path = remote_join(&options.releases_path, &options.release_id);
     let required_bytes = manifest
         .total_bytes
@@ -230,7 +232,11 @@ fn abort_sync(client: &mut RemoteClient, finish: &SyncFinishRequest) {
     );
 }
 
-fn build_manifest(local_path: &str, options: &SyncOptions) -> Result<LocalManifest, ClientError> {
+fn build_manifest(
+    local_path: &str,
+    options: &SyncOptions,
+    include_modes: bool,
+) -> Result<LocalManifest, ClientError> {
     validate_local_path(local_path)?;
     let root = PathBuf::from(local_path);
     let metadata = fs::symlink_metadata(&root)
@@ -281,7 +287,7 @@ fn build_manifest(local_path: &str, options: &SyncOptions) -> Result<LocalManife
                     kind: "dir".to_string(),
                     size: 0,
                     sha256: None,
-                    mode: local_mode(&metadata),
+                    mode: manifest_mode(include_modes, &metadata),
                 });
                 stack.push((path, child_depth));
             } else if metadata.file_type().is_file() {
@@ -301,7 +307,7 @@ fn build_manifest(local_path: &str, options: &SyncOptions) -> Result<LocalManife
                     kind: "file".to_string(),
                     size: metadata.len(),
                     sha256: Some(sha256),
-                    mode: local_mode(&metadata),
+                    mode: manifest_mode(include_modes, &metadata),
                 });
             } else {
                 return Err(ClientError::local(
@@ -321,7 +327,7 @@ fn build_manifest(local_path: &str, options: &SyncOptions) -> Result<LocalManife
         }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let root_mode = local_mode(&metadata);
+    let root_mode = manifest_mode(include_modes, &metadata);
     let encoded = serde_json::to_vec(&(root_mode, &entries))
         .map_err(|error| ClientError::local("invalid_params", error.to_string()))?;
     let sha256 = format!("{:x}", Sha256::digest(encoded));
@@ -421,6 +427,19 @@ fn validate_local_path(path: &str) -> Result<(), ClientError> {
     }
 }
 
+fn remote_supports_unix_mode(client: &mut RemoteClient) -> Result<bool, ClientError> {
+    let agent_info = client.call("agent_info", serde_json::json!({}))?;
+    Ok(agent_supports_unix_mode(&agent_info))
+}
+
+fn manifest_mode(include_modes: bool, metadata: &fs::Metadata) -> Option<u32> {
+    if include_modes {
+        local_mode(metadata)
+    } else {
+        None
+    }
+}
+
 fn validate_release_id(release_id: &str) -> Result<(), ClientError> {
     if release_id.is_empty()
         || release_id.len() > MAX_RELEASE_ID_BYTES
@@ -485,6 +504,7 @@ mod tests {
                 max_total_bytes: 1024,
                 max_depth: 5,
             },
+            true,
         )
         .unwrap();
         assert_eq!(manifest.files, 2);
@@ -501,6 +521,38 @@ mod tests {
                 .all(|entry| !entry.path.starts_with("target"))
         );
         assert_eq!(manifest.sha256.len(), 64);
+    }
+
+    #[test]
+    fn manifest_omits_modes_when_remote_does_not_support_unix_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("nested/data"), "data").unwrap();
+        fs::write(directory.path().join("main"), "main").unwrap();
+        let manifest = build_manifest(
+            &directory.path().to_string_lossy(),
+            &SyncOptions {
+                excludes: Vec::new(),
+                max_files: 20,
+                max_total_bytes: 1024,
+                max_depth: 5,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(manifest.root_mode.is_none());
+        assert!(manifest.entries.iter().all(|entry| entry.mode.is_none()));
+    }
+
+    #[test]
+    fn unix_mode_support_follows_remote_platform_family() {
+        assert!(agent_supports_unix_mode(
+            &json!({"platform": {"family": "unix"}})
+        ));
+        assert!(!agent_supports_unix_mode(
+            &json!({"platform": {"family": "windows"}})
+        ));
+        assert!(!agent_supports_unix_mode(&json!({})));
     }
 
     #[test]
