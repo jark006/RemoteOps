@@ -10,7 +10,6 @@ Claude Code / Codex
        v
 remote-ops-proxy
        ^
-       |
        v
 remote-ops-agent
        v
@@ -187,37 +186,30 @@ proxy 当前暴露 38 个 MCP 工具：
 
 ## 🏗️ 构建
 
-### 🪟 在 Win 端开发
-
-构建 Win(x64/arm64), Linux(x64/arm64/arm32/riscv64gc) 共 6 个目标平台
-
-```sh
-# 安装 zig/zigbuild 及相关工具链
-winget install zig.zig
-cargo install --locked cargo-zigbuild
-rustup target add x86_64-pc-windows-gnullvm
-rustup target add aarch64-pc-windows-gnullvm
-rustup target add armv7-unknown-linux-musleabihf
-rustup target add aarch64-unknown-linux-musl
-rustup target add x86_64-unknown-linux-musl
-rustup target add riscv64gc-unknown-linux-musl
-
-# 编译
-cargo zigbuild --release --target x86_64-pc-windows-gnullvm
-cargo zigbuild --release --target aarch64-pc-windows-gnullvm
-cargo zigbuild --release --target armv7-unknown-linux-musleabihf
-cargo zigbuild --release --target aarch64-unknown-linux-musl
-cargo zigbuild --release --target x86_64-unknown-linux-musl
-cargo zigbuild --release --target riscv64gc-unknown-linux-musl
-```
-
-### 🍎 在 Mac 端开发
-
 构建 Win(x64/arm64), Mac(x64/arm64), Linux(x64/arm64/arm32/riscv64gc) 共 8 个目标平台
 
+### 1. 安装 RUST 开发环境
+
+https://rust-lang.org/zh-CN/learn/get-started/
+
+### 2. 安装 zig 以支持交叉编译
+
 ```sh
-# 安装 zig/zigbuild 及相关工具链
+# 在 Win 端开发
+winget install zig.zig
+
+# 在 Mac 端开发
 brew install zig
+
+# 在 Linux 端开发 (根据发行版选择)
+sudo snap install zig --classic --beta
+pacman -S zig
+dnf install zig
+```
+
+### 3. 安装 zigbuild 及相关工具链
+
+```sh
 cargo install --locked cargo-zigbuild
 rustup target add aarch64-apple-darwin
 rustup target add x86_64-apple-darwin
@@ -227,8 +219,10 @@ rustup target add armv7-unknown-linux-musleabihf
 rustup target add aarch64-unknown-linux-musl
 rustup target add x86_64-unknown-linux-musl
 rustup target add riscv64gc-unknown-linux-musl
+```
 
-# 编译
+### 4. 编译
+```sh
 cargo zigbuild --release --target aarch64-apple-darwin
 cargo zigbuild --release --target x86_64-apple-darwin
 cargo zigbuild --release --target x86_64-pc-windows-gnullvm
@@ -241,8 +235,7 @@ cargo zigbuild --release --target riscv64gc-unknown-linux-musl
 
 Agent 的 `build.rs` 会在编译时注入 target、profile 和 Git revision；这些信息可通过 `agent_info.build` 查看，并用于自更新候选程序的兼容性检查。可设置 `REMOTE_OPS_GIT_REVISION` 显式指定 revision，否则构建脚本尝试读取当前 Git 提交，无法读取时使用 `unknown`。
 
-工作区的 `[profile.release]` 已针对 flash 资源受限平台（如 armv7）做了体积优化，且以性能优先为前提：开启全程序 LTO、单 codegen unit、`opt-level = "s"`（体积感知，保留内联/向量化等主要优化）并剥离符号表；SHA-256 与正则匹配路径单独保持最高优化级别，确保大文件传输和 `grep` 不受影响。代价是 release 构建时间变长、内存占用升高。例如 armv7 的 agent 体积可由约 2.6 MiB 降至约 2.0 MiB。
-
+工作区的 `[profile.release]` 已针对 flash 资源受限平台（如 armv7）做了体积优化，且以性能优先为前提：开启全程序 LTO、单 codegen unit、`opt-level = "s"`（体积感知，保留内联/向量化等主要优化）并剥离符号表；SHA-256 与正则匹配路径单独保持最高优化级别，确保大文件传输和 `grep` 不受影响。
 
 
 ## ✅ 验证
