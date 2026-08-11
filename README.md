@@ -186,7 +186,7 @@ proxy 当前暴露 38 个 MCP 工具：
 
 ## 🏗️ 构建
 
-构建 Win(x64/arm64), Mac(x64/arm64), Linux(x64/arm64/arm32/riscv64gc) 共 8 个目标平台
+构建 Win(x64/arm64)、Mac(x64/arm64)、Linux(x64/arm64/arm32/riscv64gc/MIPS32r2) 共 9 个目标平台
 
 ### 1. 安装 RUST 开发环境
 
@@ -219,6 +219,8 @@ rustup target add armv7-unknown-linux-musleabihf
 rustup target add aarch64-unknown-linux-musl
 rustup target add x86_64-unknown-linux-musl
 rustup target add riscv64gc-unknown-linux-musl
+# MIPS32r2 是 Rust Tier 3 目标，需要从源码构建标准库。
+rustup toolchain install nightly --component rust-src
 ```
 
 ### 4. 编译
@@ -231,11 +233,19 @@ cargo zigbuild --release --target armv7-unknown-linux-musleabihf
 cargo zigbuild --release --target aarch64-unknown-linux-musl
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 cargo zigbuild --release --target riscv64gc-unknown-linux-musl
+
+# Ingenic XBurst / MIPS32r2：仅构建被控端 Agent。
+# 目标规格固定为 little-endian、o32、MIPS32r2、soft-float，并由 Zig 静态链接 musl。
+cargo +nightly build -p remote-ops-agent --release --target targets/mipsel-unknown-linux-musl.json -Z json-target-spec -Z build-std=std,panic_abort
 ```
 
 Agent 的 `build.rs` 会在编译时注入 target、profile 和 Git revision；这些信息可通过 `agent_info.build` 查看，并用于自更新候选程序的兼容性检查。可设置 `REMOTE_OPS_GIT_REVISION` 显式指定 revision，否则构建脚本尝试读取当前 Git 提交，无法读取时使用 `unknown`。
 
 工作区的 `[profile.release]` 已针对 flash 资源受限平台（如 armv7）做了体积优化，且以性能优先为前提：开启全程序 LTO、单 codegen unit、`opt-level = "s"`（体积感知，保留内联/向量化等主要优化）并剥离符号表；SHA-256 与正则匹配路径单独保持最高优化级别，确保大文件传输和 `grep` 不受影响。
+
+### Ingenic XBurst MIPS32r2 Linux 3.10.14
+
+`targets/mipsel-unknown-linux-musl.json` 产出的 Agent 位于 `target/mipsel-unknown-linux-musl/release/remote-ops-agent`。它是静态链接的 little-endian MIPS32r2/o32/soft-float ELF，不依赖设备固件中的 glibc 或 uClibc；不要对该目标使用 `cargo zigbuild`，因为 Zig 的 ABI 名称为 `mipsel-linux-musleabi`，由目标规格直接传给 Zig。
 
 
 ## ✅ 验证
@@ -247,6 +257,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-unknown-linux-musl
 cargo check -p remote-ops-agent --target aarch64-unknown-linux-musl
 cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabihf
+cargo +nightly build -p remote-ops-agent --release --target targets/mipsel-unknown-linux-musl.json -Z json-target-spec -Z build-std=std,panic_abort
 ```
 
 测试包含认证失败、协议版本拒绝、HMAC 标准向量、帧篡改与重放、MCP stdio 发现、后台任务增量输出与断线重连、Agent 生命周期与更新校验、跨多个 chunk 的二进制往返、前缀校验续传、只传变化文件的目录同步，以及 Unix 发布切换和健康检查失败回滚。

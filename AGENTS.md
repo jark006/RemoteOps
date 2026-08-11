@@ -60,6 +60,7 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - `agent_info` 和 proxy 生命周期编排工具不受目标平台限制。Windows 的 `reboot` 使用 `shutdown.exe /r /t 0 /f`，macOS 的 `reboot` 返回结构化 unsupported。
 - macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell，Git Bash 不存在时返回结构化 unsupported。Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
+- Ingenic XBurst 等小端 MIPS32r2 Linux 设备使用 `targets/mipsel-unknown-linux-musl.json` 构建 Agent；目标固定为 o32、soft-float 和静态 musl，因 Rust 为 Tier 3 目标，必须使用带 `rust-src` 的 Nightly `-Z json-target-spec -Z build-std=std,panic_abort` 构建，且不得通过 `cargo zigbuild` 直接映射该 Rust 三元组。
 - 后台任务在 Unix 使用独立进程组，在 Windows 使用 Job Object；`process_signal` 在 Unix 接受 1..=64，Windows 仅接受 9 或 15 且两者都终止整个 Job Object。Agent 的任务管理器释放时必须终止仍在运行的任务并回收工作线程。
 - `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
 - `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配（Windows 不区分大小写）并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
@@ -85,6 +86,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace --target x86_64-unknown-linux-musl
 cargo check -p remote-ops-agent --target aarch64-unknown-linux-musl
 cargo check -p remote-ops-agent --target armv7-unknown-linux-musleabihf
+cargo +nightly build -p remote-ops-agent --release --target targets/mipsel-unknown-linux-musl.json -Z json-target-spec -Z build-std=std,panic_abort
 ```
 
 涉及发布产物时，再执行对应目标的 release build 或 `cargo zigbuild`。
