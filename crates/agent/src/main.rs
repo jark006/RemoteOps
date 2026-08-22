@@ -34,6 +34,9 @@ fn main() {
         eprintln!("{message}");
         std::process::exit(2);
     });
+    // Record the runtime identity before any work so agent_info reports the
+    // real process start time instead of the first query time.
+    lifecycle::init_runtime_identity();
     lifecycle::configure_restart_args(vec![
         "--listen".to_string(),
         config.listen.clone(),

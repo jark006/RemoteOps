@@ -12,6 +12,7 @@ use serde_json::json;
 
 #[cfg(not(target_os = "linux"))]
 use crate::error::{AgentError, AgentResult};
+use crate::tools::timefmt::format_epoch_iso;
 
 #[cfg(target_os = "linux")]
 pub(super) const MAX_SYSTEM_FILE_BYTES: usize = 1024 * 1024;
@@ -362,6 +363,7 @@ pub(super) fn time_snapshot(timezone: Option<String>, utc_offset_seconds: Option
         .unwrap_or(0);
     json!({
         "unix_seconds": unix_seconds,
+        "iso": format_epoch_iso(unix_seconds as i64),
         "timezone": timezone.map(|value| value.chars().take(256).collect::<String>()),
         "utc_offset_seconds": utc_offset_seconds
     })

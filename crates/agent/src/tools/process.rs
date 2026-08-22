@@ -3,6 +3,8 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::error::{AgentError, AgentResult};
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use crate::tools::timefmt::format_epoch_iso;
 
 #[cfg(target_os = "linux")]
 pub fn pids(filter: Option<&str>, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
@@ -137,6 +139,15 @@ pub fn pids(_filter: Option<&str>, _cursor: Option<&str>, _limit: usize) -> Agen
 }
 
 #[cfg(target_os = "linux")]
+fn linux_boot_time() -> Option<u64> {
+    std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+#[cfg(target_os = "linux")]
 pub fn process_info(pid: i32) -> AgentResult<Value> {
     use std::fs;
     if pid <= 0 {
@@ -194,8 +205,11 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
     if clock_ticks <= 0 {
         return Err(AgentError::command("could not read system clock ticks"));
     }
+    let start_time_iso = linux_boot_time()
+        .map(|boot| boot + start_time_ticks / clock_ticks as u64)
+        .map(|epoch| format_epoch_iso(epoch as i64));
     Ok(
-        json!({"pid": pid, "ppid": ppid, "name": name, "state": state, "cmdline": cmdline, "uid": uid, "resident_bytes": rss_bytes, "virtual_bytes": virtual_memory_bytes, "start_time_ticks": start_time_ticks, "start_time_seconds": start_time_ticks as f64 / clock_ticks as f64}),
+        json!({"pid": pid, "ppid": ppid, "name": name, "state": state, "cmdline": cmdline, "uid": uid, "resident_bytes": rss_bytes, "virtual_bytes": virtual_memory_bytes, "start_time_ticks": start_time_ticks, "start_time_seconds": start_time_ticks as f64 / clock_ticks as f64, "start_time_iso": start_time_iso}),
     )
 }
 
@@ -255,6 +269,9 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
     let uptime_ticks = unsafe { GetTickCount64() }.saturating_mul(10_000);
     let boot_ticks = filetime_ticks(now).saturating_sub(uptime_ticks);
     let start_time_ticks = creation_ticks.saturating_sub(boot_ticks).min(uptime_ticks);
+    let creation_epoch_secs =
+        (filetime_ticks(creation) / 10_000_000).saturating_sub(11_644_473_600);
+    let start_time_iso = format_epoch_iso(creation_epoch_secs as i64);
 
     Ok(json!({
         "pid": pid,
@@ -266,7 +283,8 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
         "resident_bytes": memory.WorkingSetSize as u64,
         "virtual_bytes": virtual_bytes,
         "start_time_ticks": start_time_ticks,
-        "start_time_seconds": start_time_ticks as f64 / 10_000_000.0
+        "start_time_seconds": start_time_ticks as f64 / 10_000_000.0,
+        "start_time_iso": start_time_iso
     }))
 }
 
@@ -289,7 +307,8 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
         "resident_bytes": task.pti_resident_size,
         "virtual_bytes": task.pti_virtual_size,
         "start_time_ticks": start_time_ticks,
-        "start_time_seconds": start_time_ticks as f64 / 1_000_000.0
+        "start_time_seconds": start_time_ticks as f64 / 1_000_000.0,
+        "start_time_iso": format_epoch_iso(info.pbi_start_tvsec as i64)
     }))
 }
 

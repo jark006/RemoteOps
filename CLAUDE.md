@@ -40,14 +40,15 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - `deploy_release` 仅在 Unix Agent 上支持。`release_id` 限 1..=128 个 ASCII 字母、数字、`.`、`_`、`-`，release 必须是 `releases_path` 的直接子目录，`current_path` 必须不存在或为符号链接。preflight 必须验证架构、release/current 父目录写权限、可用磁盘和最多 64 个依赖。`stop` 可选，`start` 和 `health` 必填，`rollback_start` 默认复用 `start`；命令不经过 shell 且每步最多 300 秒。服务停止后原子切换 current symlink，启动或健康检查失败时必须在同一 Agent 请求内切回旧链接并恢复旧服务，返回 `deployed`、`stop_failed`、`rolled_back` 或 `rollback_failed` 结构化状态。
 - `apply_patch` 仅更新一个已存在的普通 UTF-8 文本文件，补丁路径必须与请求路径完全一致；补丁最大 256 KiB，目标文件最大 16 MiB，最多 128 个 hunk，不支持创建、删除、重命名或无上下文纯插入。旧侧上下文必须唯一匹配，可用 `expected_sha256` 检测冲突；整个补丁成功前不得修改目标，并保留 BOM、原有行尾和末尾换行状态。
 - `read_file_lines` 使用 1-based inclusive 行号，`start_line` 默认 1，未提供 `end_line` 时默认读取 200 行；单次最多 10,000 行、返回 1 MiB，并将为定位起始行而扫描的内容限制为 64 MiB。只接受非符号链接的普通文件，请求范围必须是 UTF-8。
-- `list_files` 对目录项排序并分页，`limit` 默认 200、最大 1,000；`recursive` 默认 false，递归时 `name` 为相对请求目录的 `/` 分隔路径，`max_depth` 默认 16、最大 64。可用最大 1 KiB 的 `pattern` glob 过滤相对路径；符号链接可列出但不遍历，单次最多扫描 100,000 个目录项、输出 1 MiB。
+- `list_files` 对目录项排序并分页，`limit` 默认 200、最大 1,000；`recursive` 默认 false，递归时 `name` 为相对请求目录的 `/` 分隔路径，`max_depth` 默认 16、最大 64。可用最大 1 KiB 的 `pattern` glob 过滤相对路径；符号链接可列出但不遍历，单次最多扫描 100,000 个目录项、输出 1 MiB。每个条目返回 `name`、`kind`、`size`、`mtime`（Unix epoch 秒）、`mtime_iso`（RFC 3339、Agent 本地时区）和 `mode_str`（`ls -l` 风格权限串）；原始值为精确计算用，`_iso`/`_str` 为派生展示字段。
+- `stat` 不跟随符号链接读取元数据，返回 `size`（字节）、`mtime`（Unix epoch 秒）、`mtime_iso`（RFC 3339、Agent 本地时区）、`mode`（原始 st_mode，平台无 Unix mode 时为 0）、`mode_str`（`ls -l` 风格的 10 字符类型与权限串）和 `kind`（`file`/`dir`/`symlink`/`other`）。`mtime`、`mode` 为原始值用于精确计算，`mtime_iso`、`mode_str` 为派生展示字段，任何修改都必须同步更新 proxy schema、测试和 README。
 - `grep` 对单个普通文件或目录树中的普通 UTF-8 文件执行逐行 Rust 正则搜索，大小写敏感默认开启，可用最大 1 KiB 的 `glob` 过滤相对路径。正则最大 4 KiB，结果默认 200 条、最多 1,000 条，单文件默认扫描 1 MiB、最多 16 MiB，单次总计最多枚举 100,000 个目录项、递归 64 层、扫描 10,000 个文件或 64 MiB、输出 1 MiB；匹配文本最多保留 1 KiB。目录搜索不跟随符号链接，并跳过 `.git`、`.hg`、`.svn`、`.next`、`node_modules`、`target`、`dist`、`build`。
 - 文件传输必须校验长度和 SHA-256，成功前使用同目录临时文件，失败时不得留下目标半文件。
 - 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒。
 - `system_info` 保留主机、内核、运行时间、负载、内存、系统盘和温度字段，并返回 `os`、`cpu`、`identity`、`network`、`filesystems`、`time`、`init_system`、`toolchains`。Linux 必须有界解析 os-release、CPU/ABI/libc、用户组/umask/capabilities、网卡/IP/路由/DNS/监听端口、mount/文件系统/inode/只读状态、系统时间/时区/init 和 PATH 中的固定工具清单；不得执行外部诊断命令。网卡最多 128 个、地址最多 512 个、路由最多 256 条、监听端口最多 512 个、mount 最多 256 个、工具链最多 24 个，各集合必须报告 `available` 和 `truncated`。
 - `process_start` 不经过 shell，stdin 固定为空；后台任务默认超时 1 小时、最大 24 小时，同时最多保留 16 个。任务属于 agent 进程而非单个连接，可在 proxy 断线重连后继续查询，但不跨 agent 进程重启持久化。达到上限时先回收最早结束的任务；若全部仍在运行则拒绝启动。
 - 后台任务 stdout/stderr 各保留最近 256 KiB。`process_output` 使用绝对字节游标，每路默认返回 64 KiB、最多 256 KiB；游标落后于保留窗口时必须报告截断及最早可用游标。`process_wait` 默认等待 10 秒、最长 30 秒；`process_close` 只释放已结束任务，运行中的任务必须先 signal 并 wait。
-- `agent_info` 必须返回 Agent 版本、协议版本、构建 target/profile/Git revision、运行实例 ID/PID/启动时间、平台、支持操作、能力、限制和自更新路径。构建信息由 `crates/agent/build.rs` 注入；自检信息必须保持有界且可机器读取。
+- `agent_info` 必须返回 Agent 版本、协议版本、构建 target/profile/Git revision、运行实例 ID/PID/启动时间、平台、支持操作、能力、限制和自更新路径；启动时间和 uptime 必须自进程启动起算（服务启动路径显式初始化运行身份），不得延迟到首次查询。构建信息由 `crates/agent/build.rs` 注入；自检信息必须保持有界且可机器读取。
 - `remote_status` 不得主动连接，必须返回 `connection_state`（`cached` 或 `disconnected`）、`lifecycle_state`（`ready`、`rebooting` 或 `updating`）、最近成功时间、最近错误、最近探测和缓存的 Agent 信息。`remote_probe` 主动连接或健康检查，返回可达性、延迟、连接复用情况、Agent 信息或结构化错误；探测超时默认 5 秒，范围 100..=30,000 ms。
 - `wait_remote` 支持 `online`、`offline`、`offline_then_online`；正常状态默认等待在线，重启或更新状态默认等待离线后再在线。`offline_then_online` 可通过实际观察到离线或 Agent 实例 ID 变化确认。总超时默认 120 秒、范围 1..=600,000 ms，轮询间隔默认 1 秒、范围 100..=10,000 ms，每次探测沿用 `remote_probe` 的默认值和范围。
 - `reboot` 延迟默认 1 秒、范围 250..=10,000 ms。Agent 必须先校验平台和权限，再确认请求并延迟执行；proxy 收到确认或在请求发出后观察到预期断开时丢弃会话并标记 `rebooting`，结果必须区分是否收到确认。除这些显式生命周期流程外，连接错误发生在请求发出后时仍按状态不确定处理，禁止自动重放。
@@ -62,7 +63,7 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - Windows 的 `exec` 使用 Job Object 管理命令进程树，超时必须终止命令及其后代，不得遗留持有输出管道的子进程。
 - Ingenic XBurst 等小端 MIPS32r2 Linux 设备使用 `targets/mipsel-unknown-linux-musl.json` 构建 Agent；目标固定为 o32、soft-float 和静态 musl，因 Rust 为 Tier 3 目标，必须使用带 `rust-src` 的 Nightly `-Z json-target-spec -Z build-std=std,panic_abort` 构建，且不得通过 `cargo zigbuild` 直接映射该 Rust 三元组。
 - 后台任务在 Unix 使用独立进程组，在 Windows 使用 Job Object；`process_signal` 在 Unix 接受 1..=64，Windows 仅接受 9 或 15 且两者都终止整个 Job Object。Agent 的任务管理器释放时必须终止仍在运行的任务并回收工作线程。
-- `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。
+- `pids`、`process_info` 支持 Linux、Windows 和 macOS；macOS 使用原生 libproc/sysctl 接口，无法读取的命令行返回空字符串。`process_info` 的 `start_time_seconds` 为开机后秒数，`start_time_iso` 为进程启动墙钟时间（RFC 3339、Agent 本地时区，Linux 无法确定时为 `null`）。
 - `pkill` 支持 Linux、Windows 和 macOS，按平台进程名完整匹配（Windows 不区分大小写）并排除 agent 自身 PID；Linux `/proc/<pid>/comm` 名称最多 15 字节，macOS `pbi_name` 名称最多 31 字节，Windows 快照名称最多 260 个 UTF-16 单元。默认 signal 15，Windows 仅接受 9 或 15；最多匹配 1024 个目标，超过上限时不得发送任何信号。
 - Windows 进程枚举遇到不可读取的进程时保留 PID 和可用字段，命令行返回空字符串；`process_info` 的 `state`、`uid` 返回 `null`。
 - Windows `system_info` 返回主机、系统版本、运行时间、内存、系统盘、CPU、网卡、当前用户名、系统时间和可用工具链；无 Unix load average 和统一温度接口，分别返回零值和空数组，Linux 专属集合标记为不可用。macOS `system_info` 返回主机、内核/系统版本、运行时间、CPU、用户组、网卡/IP、DNS、内存、根文件系统、时间和工具链，并通过 `getloadavg` 提供真实负载；无统一温度接口，温度返回空数组，尚未原生采集的路由和监听端口标记为不可用。

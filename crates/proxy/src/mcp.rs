@@ -2153,8 +2153,15 @@ fn output_schema(name: &str) -> Value {
             json!({
                 "entries":{"type":"array","items":{
                     "type":"object",
-                    "properties":{"name":{"type":"string"},"kind":{"type":"string","enum":["file","dir","symlink","other"]},"size":{"type":"integer","minimum":0}},
-                    "required":["name","kind","size"],"additionalProperties":false
+                    "properties":{
+                        "name":{"type":"string"},
+                        "kind":{"type":"string","enum":["file","dir","symlink","other"]},
+                        "size":{"type":"integer","minimum":0},
+                        "mtime":{"type":"integer","description":"Modification time as seconds since the Unix epoch"},
+                        "mtime_iso":{"type":"string","description":"Modification time as RFC 3339 in the Agent's local timezone"},
+                        "mode_str":{"type":"string","description":"lstat-style 10-character type and permission string"}
+                    },
+                    "required":["name","kind","size","mtime","mtime_iso","mode_str"],"additionalProperties":false
                 }},
                 "next_cursor":{"type":["string","null"]},
                 "truncated":{"type":"boolean"}
@@ -2191,11 +2198,13 @@ fn output_schema(name: &str) -> Value {
         "stat" => strict_output(
             json!({
                 "size":{"type":"integer","minimum":0},
-                "mtime":{"type":"integer"},
-                "mode":{"type":"integer","minimum":0},
+                "mtime":{"type":"integer","description":"Modification time as seconds since the Unix epoch"},
+                "mtime_iso":{"type":"string","description":"Modification time as RFC 3339 in the Agent's local timezone"},
+                "mode":{"type":"integer","minimum":0,"description":"Raw Unix st_mode (0 when the platform has no Unix mode)"},
+                "mode_str":{"type":"string","description":"lstat-style 10-character type and permission string"},
                 "kind":{"type":"string","enum":["file","dir","symlink","other"]}
             }),
-            &["size", "mtime", "mode", "kind"],
+            &["size", "mtime", "mtime_iso", "mode", "mode_str", "kind"],
         ),
         "file_hash" => strict_output(
             json!({
@@ -2362,7 +2371,8 @@ fn output_schema(name: &str) -> Value {
                 "resident_bytes":{"type":["integer","null"],"minimum":0},
                 "virtual_bytes":{"type":["integer","null"],"minimum":0},
                 "start_time_ticks":{"type":"integer","minimum":0},
-                "start_time_seconds":{"type":"number","minimum":0}
+                "start_time_seconds":{"type":"number","minimum":0},
+                "start_time_iso":{"type":["string","null"],"description":"Process start time as RFC 3339 in the Agent's local timezone"}
             }),
             &[
                 "pid",
@@ -2375,6 +2385,7 @@ fn output_schema(name: &str) -> Value {
                 "virtual_bytes",
                 "start_time_ticks",
                 "start_time_seconds",
+                "start_time_iso",
             ],
         ),
         "kill" => strict_output(
@@ -2807,10 +2818,11 @@ fn system_info_output_schema() -> Value {
                 "type":"object",
                 "properties":{
                     "unix_seconds":{"type":"integer","minimum":0},
+                    "iso":{"type":"string","description":"Current time as RFC 3339 in the Agent's local timezone"},
                     "timezone":nullable_string(256),
                     "utc_offset_seconds":{"type":["integer","null"],"minimum":-86400,"maximum":86400}
                 },
-                "required":["unix_seconds","timezone","utc_offset_seconds"],
+                "required":["unix_seconds","iso","timezone","utc_offset_seconds"],
                 "additionalProperties":false
             },
             "init_system":{
@@ -2863,9 +2875,10 @@ fn agent_info_output_schema() -> Value {
                     "instance_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},
                     "pid":{"type":"integer","minimum":1},
                     "started_at_ms":{"type":"integer","minimum":0},
+                    "started_at_iso":{"type":"string","description":"Agent start time as RFC 3339 in the Agent's local timezone"},
                     "uptime_ms":{"type":"integer","minimum":0}
                 },
-                "required":["instance_id","pid","started_at_ms","uptime_ms"],
+                "required":["instance_id","pid","started_at_ms","started_at_iso","uptime_ms"],
                 "additionalProperties":false
             },
             "platform":{

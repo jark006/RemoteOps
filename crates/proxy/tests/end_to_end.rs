@@ -59,7 +59,11 @@ fn background_job_output_survives_proxy_reconnect() {
     assert!(system["network"]["interfaces"]["items"].is_array());
     assert!(system["filesystems"]["mounts"].is_array());
     assert!(system["time"]["unix_seconds"].as_u64().unwrap() > 0);
+    assert!(system["time"]["iso"].as_str().unwrap().len() >= 19);
     assert!(system["toolchains"]["items"].is_array());
+
+    let agent = first_client.call("agent_info", json!({})).unwrap();
+    assert!(agent["runtime"]["started_at_iso"].as_str().unwrap().len() >= 19);
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let first_output = loop {
@@ -179,6 +183,18 @@ fn binary_file_round_trip_crosses_multiple_chunks() {
 
         let stat = client.call("stat", json!({"path": remote_file})).unwrap();
         assert_eq!(stat["size"], 150_000);
+        assert_eq!(stat["kind"], "file");
+        let mode_str = stat["mode_str"].as_str().unwrap();
+        assert_eq!(mode_str.len(), 10);
+        assert!(mode_str.starts_with('-'));
+        let iso = stat["mtime_iso"].as_str().unwrap().as_bytes();
+        assert!(iso.len() >= 25, "unexpected mtime_iso length");
+        assert_eq!(iso[4], b'-');
+        assert_eq!(iso[7], b'-');
+        assert_eq!(iso[10], b'T');
+        assert_eq!(iso[13], b':');
+        assert_eq!(iso[16], b':');
+        assert!(iso[19] == b'+' || iso[19] == b'-');
 
         let download = client
             .download(
@@ -444,6 +460,11 @@ fn file_discovery_tools_cross_the_remote_connection() {
         assert_eq!(listing["entries"].as_array().unwrap().len(), 2);
         assert_eq!(listing["entries"][0]["name"], "src/main.rs");
         assert_eq!(listing["entries"][1]["name"], "src/nested/lib.rs");
+        for entry in listing["entries"].as_array().unwrap() {
+            assert!(entry["mtime"].as_i64().is_some());
+            assert!(entry["mtime_iso"].as_str().unwrap().len() >= 19);
+            assert_eq!(entry["mode_str"].as_str().unwrap().len(), 10);
+        }
     }
     server.join().unwrap();
 }

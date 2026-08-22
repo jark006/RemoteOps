@@ -93,9 +93,9 @@ proxy 当前暴露 38 个 MCP 工具：
 | `tail_text` | `path`, `lines?`, `max_bytes?` | 有界读取文件尾，最多 10,000 行或 1 MiB。 |
 | `write_text` | `path`, `content` | 原子写入远端文本。 |
 | `apply_patch` | `path`, `patch`, `expected_sha256?` | 对单个远端 UTF-8 文本文件原子应用上下文补丁。 |
-| `list_files` | `path`, `cursor?`, `limit?`, `recursive?`, `pattern?`, `max_depth?` | 排序、过滤并分页列出远端目录；可递归返回相对路径。 |
+| `list_files` | `path`, `cursor?`, `limit?`, `recursive?`, `pattern?`, `max_depth?` | 排序、过滤并分页列出远端目录；可递归返回相对路径。每个条目返回 `name`、`kind`、`size`、`mtime`、`mtime_iso`（RFC 3339、Agent 本地时区）和 `mode_str`（`ls -l` 风格权限串）。 |
 | `grep` | `path`, `pattern`, `glob?`, `case_sensitive?`, `max_results?`, `max_file_bytes?` | 对远端普通 UTF-8 文件执行有界逐行 Rust 正则搜索。 |
-| `stat` | `path` | 不跟随符号链接读取元数据。 |
+| `stat` | `path` | 不跟随符号链接读取元数据；返回 `size`、`mtime`、`mtime_iso`（RFC 3339、Agent 本地时区）、`mode`、`mode_str`（`ls -l` 风格权限串）和 `kind`。 |
 | `file_hash` | `path`, `max_bytes?` | 计算最大 64 MiB 文件的 SHA-256。 |
 | `mkdir` | `path`, `recursive?`, `mode?` | 创建精确指定的远端目录；可显式递归创建父目录并设置 Unix mode。 |
 | `remove` | `path`, `recursive?` | 删除一个精确路径；目录默认只允许空目录，递归删除必须显式开启。 |
@@ -106,7 +106,7 @@ proxy 当前暴露 38 个 MCP 工具：
 | `sync_directory` | `local_path`, `remote_path`, `excludes?`, `max_files?`, `max_total_bytes?`, `max_depth?` | 生成 manifest，只上传变化文件，在远端 staging 完整校验后切换目录并保留旧树。 |
 | `deploy_release` | `local_path`, `releases_path`, `current_path`, `release_id`, `start`, `health`, ... | Unix 发布事务：preflight、同步独立 release、原子切换 symlink、启动和健康检查，失败自动回滚。 |
 | `pids` | `filter?`, `cursor?`, `limit?` | Linux/Windows/macOS 进程分页；不可读取的 Windows/macOS 命令行返回空字符串。 |
-| `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。 |
+| `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。`start_time_seconds` 为开机后秒数，`start_time_iso` 为进程启动墙钟时间（RFC 3339、Agent 本地时区，Linux 无法确定时为 `null`）。 |
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
 | `pkill` | `name`, `signal?` | 按平台进程名完整匹配（Windows 不区分大小写）并排除 agent 自身，默认 signal 15；Linux/macOS 名称分别最多 15/31 字节，Windows 最多 260 个 UTF-16 单元且 signal 仅接受 9/15。匹配超过 1024 个进程时不执行，返回 `matched`、`signaled_pids` 和 `failed_pids`。 |
 | `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。 |
@@ -116,7 +116,7 @@ proxy 当前暴露 38 个 MCP 工具：
 | `process_wait` | `job_id`, `wait_ms?` | 有界等待后台任务退出，默认 10 秒，最长 30 秒。 |
 | `process_signal` | `job_id`, `signal?` | 向 Unix 任务进程组发送信号；Windows 接受 9/15 并终止整个 Job Object。 |
 | `process_close` | `job_id` | 释放已结束任务及其保留输出；运行中的任务必须先 signal 并 wait。 |
-| `system_info` | 无 | 有界读取系统、CPU、身份权限、网络、文件系统、时间、init 和工具链画像。 |
+| `system_info` | 无 | 有界读取系统、CPU、身份权限、网络、文件系统、时间（含 RFC 3339 的 `time.iso`）、init 和工具链画像。 |
 | `upload_file` | `local_path`, `remote_path`, `overwrite?`, `mode?`, `resume?` | 从 proxy 所在 PC 上传一个普通文件，可设置 Unix mode 并校验续传。 |
 | `download_file` | `remote_path`, `local_path`, `overwrite?`, `resume?` | 下载一个普通文件到 proxy 所在 PC，可校验续传。 |
 | `remote_status` | 无 | 被动查询地址、缓存连接、生命周期状态，以及最近一次成功、错误、探测和 Agent 信息，不主动连接。 |

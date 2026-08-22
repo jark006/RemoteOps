@@ -13,6 +13,7 @@ use remote_ops_protocol::{
 };
 
 use crate::error::{AgentError, AgentResult};
+use crate::tools::timefmt::format_epoch_iso;
 
 pub const READ_TEXT_MAX_BYTES: usize = 1024 * 1024;
 pub const READ_FILE_LINES_MAX_BYTES: usize = 1024 * 1024;
@@ -730,7 +731,14 @@ pub fn list_files(
         if page.len() == limit {
             break;
         }
-        let listed_entry = json!({"name": entry.name, "kind": entry.kind, "size": entry.size});
+        let listed_entry = json!({
+            "name": entry.name,
+            "kind": entry.kind,
+            "size": entry.size,
+            "mtime": entry.mtime,
+            "mtime_iso": format_epoch_iso(entry.mtime),
+            "mode_str": ls_mode_string(entry.mode),
+        });
         let encoded_bytes = serde_json::to_vec(&listed_entry)
             .map_err(|err| AgentError::command(format!("encode list result: {err}")))?
             .len()
@@ -761,6 +769,8 @@ struct ListEntry {
     name: String,
     kind: &'static str,
     size: u64,
+    mtime: i64,
+    mode: u32,
 }
 
 fn collect_grep_files(
@@ -888,6 +898,8 @@ fn collect_list_entries(
                 name,
                 kind: file_kind(&metadata),
                 size: metadata.len(),
+                mtime: metadata_mtime(&metadata),
+                mode: existing_mode(&metadata),
             });
         }
         if recursive && depth < max_depth && metadata.file_type().is_dir() {
@@ -986,15 +998,25 @@ fn validate_path(path: &str) -> AgentResult<()> {
 pub fn stat(path: &str) -> AgentResult<Value> {
     let metadata =
         fs::symlink_metadata(path).map_err(|err| AgentError::io(format!("stat {path}"), err))?;
-    let mtime = metadata
+    let mtime = metadata_mtime(&metadata);
+    let mode = existing_mode(&metadata);
+    Ok(json!({
+        "size": metadata.len(),
+        "mtime": mtime,
+        "mtime_iso": format_epoch_iso(mtime),
+        "mode": mode,
+        "mode_str": ls_mode_string(mode),
+        "kind": file_kind(&metadata),
+    }))
+}
+
+fn metadata_mtime(metadata: &fs::Metadata) -> i64 {
+    metadata
         .modified()
         .ok()
         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|value| value.as_secs() as i64)
-        .unwrap_or(0);
-    Ok(
-        json!({"size": metadata.len(), "mtime": mtime, "mode": existing_mode(&metadata), "kind": file_kind(&metadata)}),
-    )
+        .unwrap_or(0)
 }
 
 pub fn file_hash(path: &str, max_bytes: u64) -> AgentResult<Value> {
@@ -1176,6 +1198,45 @@ fn file_kind(metadata: &fs::Metadata) -> &'static str {
     } else {
         "other"
     }
+}
+
+/// Render a raw Unix `st_mode` value as the 10-character string used by `ls -l`
+/// (for example `-rwxr-xr-x`, `drwxr-x---`, `lrwxrwxrwx`). setuid/setgid/sticky
+/// overwrite the execute slot with `s`/`S`/`t`/`T` exactly as `ls` does.
+fn ls_mode_string(mode: u32) -> String {
+    let file_type = match mode & 0o170000 {
+        0o140000 => 's', // socket
+        0o120000 => 'l', // symlink
+        0o100000 => '-', // regular file
+        0o060000 => 'b', // block device
+        0o040000 => 'd', // directory
+        0o020000 => 'c', // character device
+        0o010000 => 'p', // fifo
+        _ => '-',
+    };
+    let mut text = String::with_capacity(10);
+    text.push(file_type);
+    let permissions = mode & 0o777;
+    let setid = [0o4000u32, 0o2000u32, 0o1000u32];
+    for (index, override_bits) in setid.iter().enumerate() {
+        let shift = 6 - 3 * index as u32;
+        let group = (permissions >> shift) & 0o7;
+        for (bit, ch) in [(0o4u32, 'r'), (0o2u32, 'w'), (0o1u32, 'x')] {
+            text.push(if group & bit != 0 { ch } else { '-' });
+        }
+        if mode & override_bits != 0 {
+            let exec = group & 0o1 != 0;
+            text.pop();
+            text.push(if index < 2 {
+                if exec { 's' } else { 'S' }
+            } else if exec {
+                't'
+            } else {
+                'T'
+            });
+        }
+    }
+    text
 }
 
 #[cfg(unix)]
@@ -1469,5 +1530,67 @@ mod tests {
 
         assert!(error.message.contains("not a symlink"));
         assert_eq!(fs::read_to_string(target).unwrap(), "before\n");
+    }
+
+    #[test]
+    fn ls_mode_string_formats_type_permissions_and_special_bits() {
+        assert_eq!(ls_mode_string(0o100755), "-rwxr-xr-x");
+        assert_eq!(ls_mode_string(0o40750), "drwxr-x---");
+        assert_eq!(ls_mode_string(0o120777), "lrwxrwxrwx");
+        assert_eq!(ls_mode_string(0o010600), "prw-------");
+        assert_eq!(ls_mode_string(0o104755), "-rwsr-xr-x");
+        assert_eq!(ls_mode_string(0o102644), "-rw-r-Sr--");
+        assert_eq!(ls_mode_string(0o101777), "-rwxrwxrwt");
+        assert_eq!(ls_mode_string(0o101744), "-rwxr--r-T");
+        assert_eq!(ls_mode_string(0), "----------");
+    }
+
+    #[test]
+    fn stat_result_includes_derived_display_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.txt");
+        fs::write(&path, b"payload").unwrap();
+
+        let result = stat(&path.to_string_lossy()).unwrap();
+
+        assert_eq!(result["size"], 7);
+        assert_eq!(result["kind"], "file");
+        let mtime = result["mtime"].as_i64().unwrap();
+        assert_eq!(
+            result["mtime_iso"].as_str().unwrap(),
+            format_epoch_iso(mtime)
+        );
+        let mode_str = result["mode_str"].as_str().unwrap();
+        assert_eq!(mode_str.len(), 10);
+        #[cfg(unix)]
+        assert!(mode_str.starts_with('-'));
+        #[cfg(not(unix))]
+        assert_eq!(mode_str, "----------");
+    }
+
+    #[test]
+    fn list_files_entries_carry_time_and_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sample.txt");
+        fs::write(&path, b"payload").unwrap();
+
+        let result = list_files(
+            &directory.path().to_string_lossy(),
+            None,
+            10,
+            false,
+            None,
+            1,
+        )
+        .unwrap();
+        let entry = &result["entries"][0];
+        assert_eq!(entry["name"], "sample.txt");
+        assert_eq!(entry["size"], 7);
+        let mtime = entry["mtime"].as_i64().unwrap();
+        assert_eq!(
+            entry["mtime_iso"].as_str().unwrap(),
+            format_epoch_iso(mtime)
+        );
+        assert_eq!(entry["mode_str"].as_str().unwrap().len(), 10);
     }
 }

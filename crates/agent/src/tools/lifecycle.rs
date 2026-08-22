@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::{AgentError, AgentResult};
+use crate::tools::timefmt::format_epoch_iso;
 
 use super::command;
 
@@ -72,7 +73,9 @@ struct RuntimeIdentity {
     started: Instant,
 }
 
-static RUNTIME_IDENTITY: LazyLock<RuntimeIdentity> = LazyLock::new(|| {
+static RUNTIME_IDENTITY: LazyLock<RuntimeIdentity> = LazyLock::new(runtime_identity);
+
+fn runtime_identity() -> RuntimeIdentity {
     let mut random = [0u8; 16];
     if getrandom::fill(&mut random).is_err() {
         let fallback = format!("{}:{}", unix_time_ms(), std::process::id());
@@ -83,7 +86,14 @@ static RUNTIME_IDENTITY: LazyLock<RuntimeIdentity> = LazyLock::new(|| {
         started_at_ms: unix_time_ms(),
         started: Instant::now(),
     }
-});
+}
+
+/// Force the runtime identity to be recorded at process start instead of on
+/// first use, so `started_at_ms` and `uptime_ms` reflect the real process
+/// lifetime. Called from the service startup path in `main`.
+pub fn init_runtime_identity() {
+    LazyLock::force(&RUNTIME_IDENTITY);
+}
 
 static RESTART_ARGS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -111,6 +121,7 @@ pub fn agent_info(max_transfer_bytes: u64) -> Value {
             "instance_id": RUNTIME_IDENTITY.instance_id,
             "pid": std::process::id(),
             "started_at_ms": RUNTIME_IDENTITY.started_at_ms,
+            "started_at_iso": format_epoch_iso((RUNTIME_IDENTITY.started_at_ms / 1000) as i64),
             "uptime_ms": u64::try_from(RUNTIME_IDENTITY.started.elapsed().as_millis()).unwrap_or(u64::MAX)
         },
         "platform": {
@@ -760,6 +771,26 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|operation| operation == "agent_info")
+        );
+    }
+
+    #[test]
+    fn runtime_identity_is_initialized_on_demand_with_monotonic_uptime() {
+        init_runtime_identity();
+        let identity = &*RUNTIME_IDENTITY;
+        // The recorded start time must not be later than "now" at any later
+        // observation, and uptime must grow monotonically from it.
+        assert!(identity.started_at_ms <= unix_time_ms());
+        let first = agent_info(1);
+        thread::sleep(Duration::from_millis(5));
+        let second = agent_info(1);
+        assert_eq!(
+            first["runtime"]["started_at_ms"],
+            second["runtime"]["started_at_ms"]
+        );
+        assert!(
+            second["runtime"]["uptime_ms"].as_u64().unwrap()
+                >= first["runtime"]["uptime_ms"].as_u64().unwrap()
         );
     }
 
