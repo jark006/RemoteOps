@@ -73,6 +73,7 @@ pub fn exec(
 }
 
 fn run(mut command: Command, timeout_ms: u64) -> AgentResult<Value> {
+    let started = Instant::now();
     if timeout_ms > MAX_TIMEOUT_MS {
         return Err(AgentError::invalid(format!(
             "timeout_ms must be in range 0..={MAX_TIMEOUT_MS}"
@@ -142,6 +143,7 @@ fn run(mut command: Command, timeout_ms: u64) -> AgentResult<Value> {
         "stderr": String::from_utf8_lossy(&stderr),
         "exit_code": status.code(),
         "timed_out": timed_out,
+        "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated
     }))
@@ -381,8 +383,14 @@ mod tests {
                 .map(|line| line.parse::<u32>().unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(pids.len(), 2, "helper should record parent and grandchild");
+            // Job Object termination is asynchronous on Windows; under load the
+            // kernel may lag a moment before the processes fully disappear.
+            let exited = Instant::now() + Duration::from_secs(10);
             for pid in pids {
-                assert!(!process_is_running(pid), "process {pid} survived timeout");
+                while process_is_running(pid) {
+                    assert!(Instant::now() < exited, "process {pid} survived timeout");
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
         }
 

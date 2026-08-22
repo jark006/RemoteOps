@@ -22,7 +22,7 @@
 
 ## 工具契约
 
-proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
+proxy 暴露 39 个工具。修改名称、参数、默认值、上限或结果字段时，必须同步更新 schema、测试、README 和本文件。
 
 - 兼容工具：`read_text`、`read_file_lines`、`tail_text`、`write_text`、`apply_patch`、`list_files`、`grep`、`stat`、`file_hash`、`pids`、`process_info`、`kill`、`sh_exec`、`exec`、`system_info`。
 - 进程工具：`pkill`。
@@ -32,6 +32,7 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - 目录同步与发布工具：`sync_directory`、`deploy_release`。
 - Agent 生命周期工具：`agent_info`、`reboot`。
 - proxy 本地管理与生命周期编排工具：`remote_status`、`set_remote`、`remote_probe`、`wait_remote`、`agent_update`。`remote_status` 被动查询地址、缓存连接和生命周期状态；`set_remote` 可单独设置 IPv4 或端口，配置仅在当前进程内生效；其余工具负责主动探测、等待状态变化和编排 Agent 自更新。
+- 批量执行工具：`batch` 在一次往返内按顺序执行至多 16 个只读与诊断工具（`read_text`、`read_file_lines`、`tail_text`、`list_files`、`grep`、`stat`、`file_hash`、`pids`、`process_info`、`system_info`、`agent_info`、`remote_status`、`sh_exec`、`exec`），子结果按输入顺序返回 `{tool, ok, result|error}`；包含写操作时整体拒绝并返回 `invalid_params`。batch 为纯 proxy 实现，不新增协议操作，旧 Agent 无需升级。
 - `upload_file`、`download_file`、`sync_directory` 和 `deploy_release` 的 `local_path` 均属于 proxy 所在 PC。
 - 单文件默认上限 4 GiB，chunk 上限 64 KiB；控制帧上限 2 MiB。
 - 远端协议版本为 3。上传请求必须携带完整 SHA-256，可选 `mode` 范围为 `0..=0o7777` 且只在 Unix Agent 生效；上传和下载的 `resume` 默认 false。续传必须校验 partial 文件的已有长度和前缀 SHA-256，最终仍校验完整长度和 SHA-256；前缀不匹配的下载安全回退到偏移 0。成功前使用同目录 partial 文件，失败时仅在启用续传时保留可恢复 partial，目标不得出现半文件。
@@ -44,7 +45,7 @@ proxy 暴露 38 个工具。修改名称、参数、默认值、上限或结果�
 - `stat` 不跟随符号链接读取元数据，返回 `size`（字节）、`mtime`（Unix epoch 秒）、`mtime_iso`（RFC 3339、Agent 本地时区）、`mode`（原始 st_mode，平台无 Unix mode 时为 0）、`mode_str`（`ls -l` 风格的 10 字符类型与权限串）和 `kind`（`file`/`dir`/`symlink`/`other`）。`mtime`、`mode` 为原始值用于精确计算，`mtime_iso`、`mode_str` 为派生展示字段，任何修改都必须同步更新 proxy schema、测试和 README。
 - `grep` 对单个普通文件或目录树中的普通 UTF-8 文件执行逐行 Rust 正则搜索，大小写敏感默认开启，可用最大 1 KiB 的 `glob` 过滤相对路径。正则最大 4 KiB，结果默认 200 条、最多 1,000 条，单文件默认扫描 1 MiB、最多 16 MiB，单次总计最多枚举 100,000 个目录项、递归 64 层、扫描 10,000 个文件或 64 MiB、输出 1 MiB；匹配文本最多保留 1 KiB。目录搜索不跟随符号链接，并跳过 `.git`、`.hg`、`.svn`、`.next`、`node_modules`、`target`、`dist`、`build`。
 - 文件传输必须校验长度和 SHA-256，成功前使用同目录临时文件，失败时不得留下目标半文件。
-- 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒。
+- 工具输出必须有界。命令 stdout/stderr 各限制为 256 KiB，命令超时最大 300 秒；`sh_exec` 和 `exec` 结果包含 `duration_ms`（毫秒）。`read_text`、`tail_text` 不得向返回文本追加任何截断标记，截断状态只通过 metadata 的 `truncated` 字段报告。
 - `system_info` 保留主机、内核、运行时间、负载、内存、系统盘和温度字段，并返回 `os`、`cpu`、`identity`、`network`、`filesystems`、`time`、`init_system`、`toolchains`。Linux 必须有界解析 os-release、CPU/ABI/libc、用户组/umask/capabilities、网卡/IP/路由/DNS/监听端口、mount/文件系统/inode/只读状态、系统时间/时区/init 和 PATH 中的固定工具清单；不得执行外部诊断命令。网卡最多 128 个、地址最多 512 个、路由最多 256 条、监听端口最多 512 个、mount 最多 256 个、工具链最多 24 个，各集合必须报告 `available` 和 `truncated`。
 - `process_start` 不经过 shell，stdin 固定为空；后台任务默认超时 1 小时、最大 24 小时，同时最多保留 16 个。任务属于 agent 进程而非单个连接，可在 proxy 断线重连后继续查询，但不跨 agent 进程重启持久化。达到上限时先回收最早结束的任务；若全部仍在运行则拒绝启动。
 - 后台任务 stdout/stderr 各保留最近 256 KiB。`process_output` 使用绝对字节游标，每路默认返回 64 KiB、最多 256 KiB；游标落后于保留窗口时必须报告截断及最早可用游标。`process_wait` 默认等待 10 秒、最长 30 秒；`process_close` 只释放已结束任务，运行中的任务必须先 signal 并 wait。

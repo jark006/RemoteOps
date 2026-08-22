@@ -109,8 +109,8 @@ proxy 当前暴露 38 个 MCP 工具：
 | `process_info` | `pid` | Linux/Windows/macOS 进程详情；Windows 的 `state`、`uid` 返回 `null`。`start_time_seconds` 为开机后秒数，`start_time_iso` 为进程启动墙钟时间（RFC 3339、Agent 本地时区，Linux 无法确定时为 `null`）。 |
 | `kill` | `pid`, `signal?` | Unix 发送数字信号；Windows 接受 9/15 并强制终止进程。默认 15。 |
 | `pkill` | `name`, `signal?` | 按平台进程名完整匹配（Windows 不区分大小写）并排除 agent 自身，默认 signal 15；Linux/macOS 名称分别最多 15/31 字节，Windows 最多 260 个 UTF-16 单元且 signal 仅接受 9/15。匹配超过 1024 个进程时不执行，返回 `matched`、`signaled_pids` 和 `failed_pids`。 |
-| `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。 |
-| `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。 |
+| `sh_exec` | `command`, `timeout_ms?` | Unix 通过 `/bin/sh -c` 执行；Windows 通过固定路径 Git Bash 执行，不存在时返回 unsupported。最长 300 秒。结果含 `duration_ms`。 |
+| `exec` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 不经过 shell 执行程序。结果含 `duration_ms`。 |
 | `process_start` | `program`, `args?`, `cwd?`, `env?`, `timeout_ms?` | 启动由 agent 管理的后台程序并立即返回 job ID；默认最长 1 小时，最大 24 小时。 |
 | `process_output` | `job_id`, `stdout_cursor?`, `stderr_cursor?`, `max_bytes?` | 按绝对字节游标增量读取后台任务的 stdout/stderr。 |
 | `process_wait` | `job_id`, `wait_ms?` | 有界等待后台任务退出，默认 10 秒，最长 30 秒。 |
@@ -126,6 +126,7 @@ proxy 当前暴露 38 个 MCP 工具：
 | `wait_remote` | `wait_for?`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 有界轮询远端，等待 `online`、`offline` 或 `offline_then_online`。 |
 | `reboot` | `delay_ms?` | 请求 Agent 延迟重启设备，并将 proxy 生命周期状态切换为 `rebooting`。 |
 | `agent_update` | `local_path`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 上传并验证 Agent 候选程序，原子替换、重启验证，失败时自动回滚。 |
+| `batch` | `calls` | 在一次往返内按顺序执行至多 16 个只读与诊断工具（含 `sh_exec`/`exec`），子结果按输入顺序返回 `{tool, ok, result\|error}`；写操作整体拒绝。纯 proxy 实现，旧 Agent 无需升级。 |
 
 `upload_file` 和 `download_file` 的 `overwrite` 默认为 `true`，`resume` 默认为 `false`。续传开启后，接收端保留同目录 partial 文件，双方先校验已传前缀的 SHA-256，再从确认的字节偏移继续；远端内容变化导致下载前缀不匹配时会安全回退到偏移 0。最终仍校验完整长度和 SHA-256，成功前不会暴露半文件。`upload_file.mode` 范围为 `0..=0o7777`，只在 Unix Agent 上支持。单文件传输拒绝目录、符号链接和特殊文件。
 

@@ -518,13 +518,114 @@ fn proxy_binary_speaks_mcp_stdio_without_connecting_for_discovery() {
         .collect();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 38);
+    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 39);
     assert_eq!(
         lines[2]["result"]["structuredContent"]["address"],
         "192.168.43.106:8022"
     );
     assert_eq!(lines[2]["result"]["structuredContent"]["connected"], false);
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn batch_runs_readonly_tools_in_order_and_rejects_mutating_calls() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let jobs = JobManager::new();
+        handle_connection(stream, DEFAULT_MAX_TRANSFER_BYTES, &jobs).unwrap();
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("sample.txt"), b"payload").unwrap();
+    let sample = root.path().join("sample.txt");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_remote-ops-proxy"))
+        .args(["--timeout-ms", "100"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":"2025-06-18", "capabilities":{},
+                "clientInfo":{"name":"test","version":"1"}
+            }
+        })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"set_remote","arguments":{"ip":"127.0.0.1","port":address.port()}}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"batch","arguments":{"calls":[
+            {"tool":"stat","arguments":{"path": sample}},
+            {"tool":"list_files","arguments":{"path": root.path()}},
+            {"tool":"agent_info","arguments":{}}
+        ]}}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"batch","arguments":{"calls":[
+            {"tool":"write_text","arguments":{"path":"x.txt","content":"y"}}
+        ]}}})
+    )
+    .unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let lines: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4);
+
+    assert_eq!(
+        lines[1]["result"]["structuredContent"]["address"],
+        format!("127.0.0.1:{}", address.port())
+    );
+    let results = &lines[2]["result"]["structuredContent"]["results"];
+    assert_eq!(results.as_array().unwrap().len(), 3);
+    assert_eq!(results[0]["tool"], "stat");
+    assert_eq!(results[0]["ok"], true);
+    assert_eq!(results[0]["result"]["size"], 7);
+    assert_eq!(results[0]["result"]["kind"], "file");
+    assert_eq!(results[1]["tool"], "list_files");
+    assert_eq!(results[1]["ok"], true);
+    assert_eq!(results[1]["result"]["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(results[2]["tool"], "agent_info");
+    assert_eq!(results[2]["ok"], true);
+    assert_eq!(results[2]["result"]["protocol_version"], PROTOCOL_VERSION);
+
+    assert_eq!(lines[3]["error"]["code"], -32602);
+    assert!(
+        lines[3]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not allowed in batch")
+    );
+    drop(root);
+    server.join().unwrap();
 }
 
 #[test]

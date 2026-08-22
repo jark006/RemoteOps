@@ -90,8 +90,24 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
         return rpc_error(id, -32602, "unknown tool");
     }
 
-    let result = match name {
-        "upload_file" => decode_transfer::<UploadArgs>(&arguments)
+    if name == "batch" {
+        let result = decode_transfer::<BatchArgs>(&arguments)
+            .and_then(validate_batch_args)
+            .and_then(|args| execute_batch(client, args));
+        return finish_tool_call(id, name, result);
+    }
+
+    let result = execute_single_tool(client, name, &arguments);
+    finish_tool_call(id, name, result)
+}
+
+fn execute_single_tool(
+    client: &mut RemoteClient,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, ClientError> {
+    match name {
+        "upload_file" => decode_transfer::<UploadArgs>(arguments)
             .and_then(validate_upload_args)
             .and_then(|args| {
                 client.upload(
@@ -102,7 +118,7 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
                     args.resume,
                 )
             }),
-        "download_file" => decode_transfer::<DownloadArgs>(&arguments)
+        "download_file" => decode_transfer::<DownloadArgs>(arguments)
             .and_then(validate_download_args)
             .and_then(|args| {
                 client.download(
@@ -112,25 +128,25 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
                     args.resume,
                 )
             }),
-        "mkdir" => decode_transfer::<MkdirArgs>(&arguments)
+        "mkdir" => decode_transfer::<MkdirArgs>(arguments)
             .and_then(validate_mkdir_args)
-            .and_then(|_| client.call(name, arguments)),
-        "remove" => decode_transfer::<RemoveArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "remove" => decode_transfer::<RemoveArgs>(arguments)
             .and_then(validate_remove_args)
-            .and_then(|_| client.call(name, arguments)),
-        "move" => decode_transfer::<MoveArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "move" => decode_transfer::<MoveArgs>(arguments)
             .and_then(validate_move_args)
-            .and_then(|_| client.call(name, arguments)),
-        "copy" => decode_transfer::<CopyArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "copy" => decode_transfer::<CopyArgs>(arguments)
             .and_then(validate_copy_args)
-            .and_then(|_| client.call(name, arguments)),
-        "chmod" => decode_transfer::<ChmodArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "chmod" => decode_transfer::<ChmodArgs>(arguments)
             .and_then(validate_chmod_args)
-            .and_then(|_| client.call(name, arguments)),
-        "symlink" => decode_transfer::<SymlinkArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "symlink" => decode_transfer::<SymlinkArgs>(arguments)
             .and_then(validate_symlink_args)
-            .and_then(|_| client.call(name, arguments)),
-        "sync_directory" => decode_transfer::<SyncDirectoryArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "sync_directory" => decode_transfer::<SyncDirectoryArgs>(arguments)
             .and_then(validate_sync_directory_args)
             .and_then(|args| {
                 deployment::sync_directory(
@@ -140,19 +156,18 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
                     args.sync_options(),
                 )
             }),
-        "deploy_release" => decode_transfer::<DeployReleaseArgs>(&arguments)
+        "deploy_release" => decode_transfer::<DeployReleaseArgs>(arguments)
             .and_then(validate_deploy_release_args)
             .and_then(|args| deployment::deploy_release(client, args.into_options())),
-        "remote_status" => decode_transfer::<EmptyArgs>(&arguments).map(|_| client.remote_status()),
-        "set_remote" => decode_transfer::<SetRemoteArgs>(&arguments)
+        "remote_status" => decode_transfer::<EmptyArgs>(arguments).map(|_| client.remote_status()),
+        "set_remote" => decode_transfer::<SetRemoteArgs>(arguments)
             .and_then(|args| client.set_remote(args.ip, args.port)),
-        "agent_info" => {
-            decode_transfer::<EmptyArgs>(&arguments).and_then(|_| client.call(name, arguments))
-        }
-        "remote_probe" => decode_transfer::<RemoteProbeArgs>(&arguments)
+        "agent_info" => decode_transfer::<EmptyArgs>(arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "remote_probe" => decode_transfer::<RemoteProbeArgs>(arguments)
             .and_then(validate_remote_probe_args)
             .map(|args| client.remote_probe(args.timeout_ms)),
-        "wait_remote" => decode_transfer::<WaitRemoteArgs>(&arguments)
+        "wait_remote" => decode_transfer::<WaitRemoteArgs>(arguments)
             .and_then(validate_wait_remote_args)
             .map(|args| {
                 client.wait_remote(
@@ -162,10 +177,10 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
                     args.probe_timeout_ms,
                 )
             }),
-        "reboot" => decode_transfer::<RebootArgs>(&arguments)
+        "reboot" => decode_transfer::<RebootArgs>(arguments)
             .and_then(validate_reboot_args)
             .and_then(|args| client.reboot(args.delay_ms)),
-        "agent_update" => decode_transfer::<AgentUpdateArgs>(&arguments)
+        "agent_update" => decode_transfer::<AgentUpdateArgs>(arguments)
             .and_then(validate_agent_update_args)
             .and_then(|args| {
                 client.agent_update(
@@ -175,38 +190,41 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
                     args.probe_timeout_ms,
                 )
             }),
-        "pkill" => decode_transfer::<PkillArgs>(&arguments)
+        "pkill" => decode_transfer::<PkillArgs>(arguments)
             .and_then(validate_pkill_args)
-            .and_then(|_| client.call(name, arguments)),
-        "apply_patch" => decode_transfer::<ApplyPatchArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "apply_patch" => decode_transfer::<ApplyPatchArgs>(arguments)
             .and_then(validate_apply_patch_args)
-            .and_then(|_| client.call(name, arguments)),
-        "read_file_lines" => decode_transfer::<ReadFileLinesArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "read_file_lines" => decode_transfer::<ReadFileLinesArgs>(arguments)
             .and_then(validate_read_file_lines_args)
-            .and_then(|_| client.call(name, arguments)),
-        "grep" => decode_transfer::<GrepArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "grep" => decode_transfer::<GrepArgs>(arguments)
             .and_then(validate_grep_args)
-            .and_then(|_| client.call(name, arguments)),
-        "list_files" => decode_transfer::<ListFilesArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "list_files" => decode_transfer::<ListFilesArgs>(arguments)
             .and_then(validate_list_files_args)
-            .and_then(|_| client.call(name, arguments)),
-        "process_start" => decode_transfer::<ProcessStartArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "process_start" => decode_transfer::<ProcessStartArgs>(arguments)
             .and_then(validate_process_start_args)
-            .and_then(|_| client.call(name, arguments)),
-        "process_output" => decode_transfer::<ProcessOutputArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "process_output" => decode_transfer::<ProcessOutputArgs>(arguments)
             .and_then(validate_process_output_args)
-            .and_then(|_| client.call(name, arguments)),
-        "process_wait" => decode_transfer::<ProcessWaitArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "process_wait" => decode_transfer::<ProcessWaitArgs>(arguments)
             .and_then(validate_process_wait_args)
-            .and_then(|_| client.call(name, arguments)),
-        "process_signal" => decode_transfer::<ProcessSignalArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "process_signal" => decode_transfer::<ProcessSignalArgs>(arguments)
             .and_then(validate_process_signal_args)
-            .and_then(|_| client.call(name, arguments)),
-        "process_close" => decode_transfer::<JobIdArgs>(&arguments)
+            .and_then(|_| client.call(name, arguments.clone())),
+        "process_close" => decode_transfer::<JobIdArgs>(arguments)
             .and_then(validate_job_id_args)
-            .and_then(|_| client.call(name, arguments)),
-        _ => client.call(name, arguments),
-    };
+            .and_then(|_| client.call(name, arguments.clone())),
+        _ => client.call(name, arguments.clone()),
+    }
+}
+
+fn finish_tool_call(id: Value, name: &str, result: Result<Value, ClientError>) -> Value {
     match result {
         Ok(value) => rpc_result(id, successful_tool_result(name, value)),
         Err(error) if error.kind == "invalid_params" => rpc_error(id, -32602, &error.message),
@@ -218,6 +236,85 @@ fn call_tool(id: Value, params: Option<&Value>, client: &mut RemoteClient) -> Va
             }),
         ),
     }
+}
+
+/// Tools that may run inside a `batch` call: read-only inspection plus the
+/// diagnostic command runners. Everything that mutates remote state stays
+/// single-shot so its result is observed before the next destructive step.
+const BATCH_ALLOWED_TOOLS: &[&str] = &[
+    "read_text",
+    "read_file_lines",
+    "tail_text",
+    "list_files",
+    "grep",
+    "stat",
+    "file_hash",
+    "pids",
+    "process_info",
+    "system_info",
+    "agent_info",
+    "remote_status",
+    "sh_exec",
+    "exec",
+];
+
+const BATCH_MAX_CALLS: usize = 16;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchCall {
+    tool: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchArgs {
+    calls: Vec<BatchCall>,
+}
+
+fn validate_batch_args(args: BatchArgs) -> Result<BatchArgs, ClientError> {
+    if args.calls.is_empty() || args.calls.len() > BATCH_MAX_CALLS {
+        return Err(ClientError {
+            kind: "invalid_params".to_string(),
+            message: format!("calls must contain 1..={BATCH_MAX_CALLS} entries"),
+        });
+    }
+    for call in &args.calls {
+        if !BATCH_ALLOWED_TOOLS.contains(&call.tool.as_str()) {
+            return Err(ClientError {
+                kind: "invalid_params".to_string(),
+                message: format!(
+                    "tool {:?} is not allowed in batch; batch supports read-only and diagnostic tools only",
+                    call.tool
+                ),
+            });
+        }
+        if !call.arguments.is_object() {
+            return Err(ClientError {
+                kind: "invalid_params".to_string(),
+                message: format!("arguments for tool {:?} must be an object", call.tool),
+            });
+        }
+    }
+    Ok(args)
+}
+
+fn execute_batch(client: &mut RemoteClient, args: BatchArgs) -> Result<Value, ClientError> {
+    let mut results = Vec::with_capacity(args.calls.len());
+    for call in args.calls {
+        let entry = match execute_single_tool(client, &call.tool, &call.arguments) {
+            Ok(value) => json!({"tool": call.tool, "ok": true, "result": value}),
+            Err(error) => json!({
+                "tool": call.tool,
+                "ok": false,
+                "error": {"kind": error.kind, "message": error.message}
+            }),
+        };
+        results.push(entry);
+    }
+    Ok(json!({"results": results}))
 }
 
 fn successful_tool_result(name: &str, value: Value) -> Value {
@@ -1229,6 +1326,7 @@ pub fn tool_names() -> &'static [&'static str] {
         "wait_remote",
         "reboot",
         "agent_update",
+        "batch",
     ]
 }
 
@@ -1237,7 +1335,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "read_text",
             "Read text",
-            "Read bounded text from a remote file",
+            "Read bounded text from a remote file (max 1 MiB per call). Truncation is reported via metadata.truncated and next_offset; continue from metadata.offset to read more.",
             props(&[
                 ("path", string_prop("Remote file path")),
                 ("offset", integer_prop_default(0, None, 0, "Byte offset")),
@@ -1330,7 +1428,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_files",
             "List files",
-            "List, filter, and optionally recurse through a remote directory with pagination",
+            "List, filter, and optionally recurse through a remote directory with sorted cursor pagination. Entries include name, kind, size, mtime (epoch seconds), mtime_iso (RFC 3339 local time), and mode_str (ls-style permissions).",
             props(&[
                 ("path", string_prop("Remote directory path")),
                 (
@@ -1362,7 +1460,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "grep",
             "Search text",
-            "Search regular UTF-8 files with a Rust regular expression",
+            "Search regular UTF-8 files with a Rust regular expression. Matches include path, 1-based line and column, and the matched line text; result reports files_scanned/skipped and truncated.",
             props(&[
                 ("path", string_prop("Remote file or directory path")),
                 (
@@ -1399,7 +1497,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "stat",
             "File status",
-            "Read remote path metadata without following symlinks",
+            "Read remote path metadata without following symlinks. Returns size (bytes), mtime (epoch seconds), mtime_iso (RFC 3339 local time), mode (raw st_mode; 0 when the platform has no Unix mode), mode_str (ls-style permissions), and kind (file/dir/symlink/other).",
             props(&[("path", string_prop("Remote path"))]),
             &["path"],
             (true, false, true),
@@ -1653,7 +1751,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "process_info",
             "Process information",
-            "Read bounded Linux, Windows, or macOS process details",
+            "Read bounded Linux, Windows, or macOS process details: cmdline, state, uid, memory, start_time_seconds (seconds since boot) and start_time_iso (wall-clock RFC 3339 local time).",
             props(&[("pid", integer_prop(1, None, "Process ID"))]),
             &["pid"],
             (true, false, true),
@@ -1702,7 +1800,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "sh_exec",
             "Run shell command",
-            "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows",
+            "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows. Returns stdout, stderr, exit_code, timed_out, duration_ms, and truncation flags.",
             props(&[
                 ("command", string_prop("Shell command")),
                 (
@@ -1716,7 +1814,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "exec",
             "Run program",
-            "Run a remote program without a shell",
+            "Run a remote program without a shell. Returns stdout, stderr, exit_code, timed_out, duration_ms, and truncation flags.",
             props(&[
                 ("program", string_prop("Program path or name")),
                 ("args", json!({"type":"array","items":{"type":"string"}})),
@@ -2022,6 +2120,31 @@ pub fn tool_definitions() -> Vec<Value> {
             &["local_path"],
             (false, true, false),
         ),
+        tool(
+            "batch",
+            "Batch tool calls",
+            "Run 1..=16 read-only or diagnostic tool calls in order within one round trip and get every result back at once. Each call is {tool, arguments}; results keep input order as {tool, ok, result} or {tool, ok, error}. Allowed tools: read_text, read_file_lines, tail_text, list_files, grep, stat, file_hash, pids, process_info, system_info, agent_info, remote_status, sh_exec, exec. Mutating tools are rejected.",
+            props(&[(
+                "calls",
+                json!({
+                    "type":"array",
+                    "minItems":1,
+                    "maxItems":16,
+                    "description":"Tool calls executed in order; each entry is {tool, arguments}",
+                    "items":{
+                        "type":"object",
+                        "properties":{
+                            "tool":{"type":"string","enum":BATCH_ALLOWED_TOOLS},
+                            "arguments":{"type":"object","default":{},"description":"Arguments object forwarded to the tool"}
+                        },
+                        "required":["tool"],
+                        "additionalProperties":false
+                    }
+                }),
+            )]),
+            &["calls"],
+            (false, false, false),
+        ),
     ]
 }
 
@@ -2044,7 +2167,7 @@ fn tool(
         "name": name, "title": title, "description": description,
         "inputSchema": input_schema,
         "outputSchema": output_schema(name),
-        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start" | "reboot" | "agent_update" | "deploy_release")}
+        "annotations": {"readOnlyHint": read_only, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": matches!(name, "sh_exec" | "exec" | "process_start" | "reboot" | "agent_update" | "deploy_release" | "batch")}
     })
 }
 
@@ -2205,6 +2328,21 @@ fn output_schema(name: &str) -> Value {
                 "kind":{"type":"string","enum":["file","dir","symlink","other"]}
             }),
             &["size", "mtime", "mtime_iso", "mode", "mode_str", "kind"],
+        ),
+        "batch" => strict_output(
+            json!({
+                "results":{"type":"array","maxItems":16,"items":{
+                    "type":"object",
+                    "properties":{
+                        "tool":{"type":"string"},
+                        "ok":{"type":"boolean"},
+                        "result":{"type":"object","description":"Tool result when ok is true"},
+                        "error":{"type":"object","description":"{kind, message} when ok is false"}
+                    },
+                    "required":["tool","ok"],"additionalProperties":false
+                }}
+            }),
+            &["results"],
         ),
         "file_hash" => strict_output(
             json!({
@@ -3048,7 +3186,7 @@ mod tests {
     #[test]
     fn exposes_compatible_tools_plus_transfers() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 38);
+        assert_eq!(tools.len(), 39);
         assert_eq!(
             tools
                 .iter()
@@ -3171,7 +3309,7 @@ mod tests {
         let shell = tools.iter().find(|tool| tool["name"] == "sh_exec").unwrap();
         assert_eq!(
             shell["description"],
-            "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows"
+            "Run a bounded command through /bin/sh or fixed-path Git Bash on Windows. Returns stdout, stderr, exit_code, timed_out, duration_ms, and truncation flags."
         );
         let process_start = tools
             .iter()

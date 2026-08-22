@@ -59,10 +59,7 @@ pub fn read_text(path: &str, offset: u64, max_bytes: usize) -> AgentResult<Value
         .map_err(|err| AgentError::io(format!("read {path}"), err))?;
     let next_offset = offset + bytes.len() as u64;
     let truncated = next_offset < size;
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if truncated {
-        text.push_str("\n[truncated]");
-    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     Ok(json!({
         "text": text,
         "metadata": {"offset": offset, "bytes_read": bytes.len(), "next_offset": next_offset, "truncated": truncated}
@@ -204,11 +201,8 @@ pub fn tail_text(path: &str, lines: usize, max_bytes: usize) -> AgentResult<Valu
     let text = String::from_utf8_lossy(&bytes);
     let parts: Vec<&str> = text.lines().collect();
     let start = parts.len().saturating_sub(lines);
-    let mut selected = parts[start..].join("\n");
+    let selected = parts[start..].join("\n");
     let truncated = scan < size || start > 0;
-    if truncated {
-        selected.push_str("\n[truncated]");
-    }
     Ok(json!({
         "text": selected,
         "metadata": {"bytes_scanned": scan, "lines_returned": parts.len() - start, "truncated": truncated}
