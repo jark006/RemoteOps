@@ -11,6 +11,7 @@ if-addrs.workspace = true
 libc.workspace = true
 regex.workspace = true
 remote-ops-protocol = { path = "../protocol" }
+remote-ops-version = { path = "../version" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,6 +30,9 @@ windows-sys = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+[build-dependencies]
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

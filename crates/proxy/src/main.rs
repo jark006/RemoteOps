@@ -6,6 +6,7 @@ use std::time::Duration;
 use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
 use remote_ops_proxy::client::RemoteClient;
 use remote_ops_proxy::mcp::handle_message;
+use remote_ops_version::{requests_version, version_text};
 use serde_json::{Value, json};
 
 struct Config {
@@ -15,6 +16,10 @@ struct Config {
 }
 
 fn main() {
+    if requests_version(env::args().skip(1)) {
+        print!("{}", version_text("remote-ops-proxy"));
+        return;
+    }
     let config = parse_args().unwrap_or_else(|message| {
         eprintln!("{message}");
         std::process::exit(2);
@@ -73,7 +78,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Config, Str
             }
             "--timeout-ms" => timeout_ms = parse_u64(args.next(), "--timeout-ms")?,
             "--max-transfer-bytes" => max_transfer_bytes = parse_u64(args.next(), "--max-transfer-bytes")?,
-            "--help" | "-h" => return Err("usage: remote-ops-proxy [--remote IPv4:PORT] [--timeout-ms 310000] [--max-transfer-bytes 4294967296]".to_string()),
+            "--help" | "-h" => return Err("usage: remote-ops-proxy [--remote IPv4:PORT] [--timeout-ms 310000] [--max-transfer-bytes 4294967296] [--version]".to_string()),
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }

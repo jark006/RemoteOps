@@ -1,0 +1,8 @@
+[package]
+name = "remote-ops-version"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+chrono.workspace = true

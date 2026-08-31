@@ -40,6 +40,12 @@ nohup ./remote-ops-agent --listen 0.0.0.0:8022 > /dev/null 2>&1 &
 .\remote-ops-agent.exe --listen 0.0.0.0:8022
 ```
 
+查看版本：
+
+```sh
+./remote-ops-agent --version
+```
+
 ## 🔧 配置 MCP proxy
 
 通用 MCP 客户端配置示例如下，可以直接把以下内容丢给AI让他自己配置，然后重启 Claude Code 或 Codex 即可生效：
@@ -72,6 +78,7 @@ proxy 参数：
 --remote IPv4:PORT           可选，默认 192.168.43.106:8022，也可随时在对话中叫 AI 设定 remote-ops 的受控端 IP
 --timeout-ms N               等待远端操作响应的 I/O 超时，默认 310000
 --max-transfer-bytes N       单文件上限，默认 4294967296（4 GiB）
+--version / -v               打印版本及项目地址后退出
 ```
 
 ## 💬 开始对话

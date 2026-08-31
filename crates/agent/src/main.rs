@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use remote_ops_agent::service::serve;
 use remote_ops_agent::tools::lifecycle;
 use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
+use remote_ops_version::{requests_version, version_text};
 
 struct Config {
     listen: String,
@@ -28,6 +29,10 @@ fn main() {
             eprintln!("agent update failed: {error}");
             std::process::exit(1);
         }
+        return;
+    }
+    if requests_version(arguments.iter().cloned()) {
+        print!("{}", version_text("remote-ops-agent"));
         return;
     }
     let config = parse_args_from(arguments).unwrap_or_else(|message| {
@@ -144,7 +149,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Config, Str
                     })?));
             }
             "--help" | "-h" => return Err(
-                "usage: remote-ops-agent [--listen 0.0.0.0:8022] [--max-transfer-bytes 4294967296]"
+                "usage: remote-ops-agent [--listen 0.0.0.0:8022] [--max-transfer-bytes 4294967296] [--version]"
                     .to_string(),
             ),
             _ => return Err(format!("unknown argument: {arg}")),

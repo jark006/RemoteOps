@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "crates/agent", "crates/proxy"]
+members = ["crates/protocol", "crates/agent", "crates/proxy", "crates/version"]
 resolver = "2"
 
 [workspace.package]
@@ -23,6 +23,7 @@ opt-level = 3
 opt-level = 3
 
 [workspace.dependencies]
+chrono = "0.4"
 globset = { version = "0.4", default-features = false }
 if-addrs = "0.15"
 getrandom = "0.3"
