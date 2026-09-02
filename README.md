@@ -227,6 +227,7 @@ rustup target add armv7-unknown-linux-musleabihf
 rustup target add aarch64-unknown-linux-musl
 rustup target add x86_64-unknown-linux-musl
 rustup target add riscv64gc-unknown-linux-musl
+rustup target add loongarch64-unknown-linux-musl
 # MIPS32r2 是 Rust Tier 3 目标，需要从源码构建标准库。
 rustup toolchain install nightly --component rust-src
 ```
@@ -241,6 +242,7 @@ cargo zigbuild --release --target armv7-unknown-linux-musleabihf
 cargo zigbuild --release --target aarch64-unknown-linux-musl
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 cargo zigbuild --release --target riscv64gc-unknown-linux-musl
+cargo zigbuild --release --target loongarch64-unknown-linux-musl
 
 # Ingenic XBurst / MIPS32r2：仅构建被控端 Agent。
 # 目标规格固定为 little-endian、o32、MIPS32r2、soft-float，并由 Zig 静态链接 musl。

@@ -16,6 +16,8 @@ cargo zigbuild -q -r --target x86_64-unknown-linux-musl
 Write-Output "Build x86_64-unknown-linux-musl Done!"
 cargo zigbuild -q -r --target riscv64gc-unknown-linux-musl
 Write-Output "Build riscv64gc-unknown-linux-musl Done!"
+cargo zigbuild -q -r --target loongarch64-unknown-linux-musl
+Write-Output "Build loongarch64-unknown-linux-musl Done!"
 cargo +nightly build -p remote-ops-agent -q -r --target targets/mipsel-unknown-linux-musl.json -Z json-target-spec -Z build-std=std,panic_abort
 Write-Output "Build mipsel-unknown-linux-musl Done!"
 
@@ -39,6 +41,7 @@ $collectTargets = @(
     @{ triple = "aarch64-unknown-linux-musl";    suffix = "arm64-linux" },
     @{ triple = "x86_64-unknown-linux-musl";     suffix = "x64-linux" },
     @{ triple = "riscv64gc-unknown-linux-musl";  suffix = "riscv64gc-linux" },
+    @{ triple = "loongarch64-unknown-linux-musl"; suffix = "loongarch64-linux" },
     @{ triple = "mipsel-unknown-linux-musl";     suffix = "mipsel-linux" }
 )
 
