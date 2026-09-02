@@ -2543,13 +2543,15 @@ fn output_schema(name: &str) -> Value {
         "sh_exec" | "exec" => strict_output(
             json!({
                 "stdout":{"type":"string"},"stderr":{"type":"string"},"exit_code":{"type":["integer","null"]},
-                "timed_out":{"type":"boolean"},"stdout_truncated":{"type":"boolean"},"stderr_truncated":{"type":"boolean"}
+                "timed_out":{"type":"boolean"},"duration_ms":{"type":"integer","minimum":0},
+                "stdout_truncated":{"type":"boolean"},"stderr_truncated":{"type":"boolean"}
             }),
             &[
                 "stdout",
                 "stderr",
                 "exit_code",
                 "timed_out",
+                "duration_ms",
                 "stdout_truncated",
                 "stderr_truncated",
             ],
@@ -3182,6 +3184,24 @@ fn strict_output(properties: Value, required: &[&str]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_output_schemas_require_duration_ms() {
+        for name in ["sh_exec", "exec"] {
+            let schema = output_schema(name);
+            assert_eq!(
+                schema["properties"]["duration_ms"],
+                json!({"type":"integer","minimum":0})
+            );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("duration_ms")),
+                "{name} must require duration_ms because every successful command result includes it"
+            );
+        }
+    }
 
     #[test]
     fn exposes_compatible_tools_plus_transfers() {

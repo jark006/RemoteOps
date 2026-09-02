@@ -338,7 +338,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remote-ops-agent"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "remote-ops-protocol"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "remote-ops-proxy"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "chrono",
  "globset",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "remote-ops-version"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "chrono",
 ]
