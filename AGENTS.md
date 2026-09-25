@@ -8,6 +8,7 @@
 - `crates/proxy`：PC 端 MCP stdio server、本地文件 I/O 和远端连接客户端。
 - `crates/agent`：远端监听服务、文件传输落盘和平台工具实现。
 - `crates/proxy/tests/end_to_end.rs`：真实双端连接、二进制往返和 stdio 测试。
+- `deploy/remote-ops-agent.service`：Linux 下 systemd 部署的推荐单元，包含自更新必需的 `KillMode` 与 `Restart` 设置。
 
 ## 架构边界
 
@@ -52,11 +53,11 @@ proxy 暴露 39 个工具。修改名称、参数、默认值、上限或结果�
 - `remote_status` 不得主动连接，必须返回 `connection_state`（`cached` 或 `disconnected`）、`lifecycle_state`（`ready`、`rebooting` 或 `updating`）、最近成功时间、最近错误、最近探测和缓存的 Agent 信息。`remote_probe` 主动连接或健康检查，返回可达性、延迟、连接复用情况、Agent 信息或结构化错误；探测超时默认 5 秒，范围 100..=30,000 ms。复用已缓存会话时健康检查最多使用一半探测预算，必须为失败后的重连留出时间，不得因预算耗尽而放弃重连并误报不可达。
 - `wait_remote` 支持 `online`、`offline`、`offline_then_online`；正常状态默认等待在线，重启或更新状态默认等待离线后再在线。`offline_then_online` 可通过实际观察到离线或 Agent 实例 ID 变化确认。用于比较的上一个实例 ID 在 `rebooting`/`updating` 编排状态下取自生命周期状态，否则取自最近缓存的 `agent_info`，保证 `ready` 状态下也能识别被替换的 Agent，不得因为没有编排状态而无法确认实例变化。总超时默认 120 秒、范围 1..=600,000 ms，轮询间隔默认 1 秒、范围 100..=10,000 ms，每次探测沿用 `remote_probe` 的默认值和范围。
 - `reboot` 延迟默认 1 秒、范围 250..=10,000 ms。Agent 必须先校验平台和权限，再确认请求并延迟执行；proxy 收到确认或在请求发出后观察到预期断开时丢弃会话并标记 `rebooting`，结果必须区分是否收到确认。除这些显式生命周期流程外，连接错误发生在请求发出后时仍按状态不确定处理，禁止自动重放。
-- `agent_update` 的 `local_path` 属于 proxy 所在 PC。proxy 必须先主动探测，将普通候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选必须通过 `--self-check`，且协议版本和构建 target 与当前 Agent 兼容。独立 helper 等待旧 Agent 退出后原子替换可执行文件并保留 rollback 文件；新 Agent 成功绑定监听并稳定运行后才能清理备份，启动失败必须恢复旧程序并重启。结果必须明确区分 `updated`、`rolled_back`、`timed_out` 和 `unconfirmed`；等待及探测参数范围与 `wait_remote` 相同。
+- `agent_update` 的 `local_path` 属于 proxy 所在 PC。proxy 必须先主动探测，将普通候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选必须通过 `--self-check`，且协议版本和构建 target 与当前 Agent 兼容。独立 helper 等待旧 Agent 退出后原子替换可执行文件并保留 rollback 文件；新 Agent 成功绑定监听并稳定运行后才能清理备份，启动失败必须恢复旧程序并重启。Agent 必须把监督自身的 systemd 单元名写入更新 manifest（无监督者时为空）；helper 验证新二进制健康后必须把 Agent 交回该单元（停止自己直接启动的临时实例并 `systemctl restart <unit>`、确认单元 active），回滚重启同样必须经该单元，保证更新后的 Agent 仍受监督且不与单元竞争监听端口。结果必须明确区分 `updated`、`rolled_back`、`timed_out` 和 `unconfirmed`；等待及探测参数范围与 `wait_remote` 相同。
 
 ## 平台行为
 
-- Linux 提供全部工具；`reboot` 使用 `reboot(2)` 并要求 Agent 以 root 运行。
+- Linux 提供全部工具；`reboot` 使用 `reboot(2)` 并要求 Agent 以 root 运行。以 systemd 托管时必须采用 `deploy/remote-ops-agent.service` 的 `KillMode=process` 与 `Restart=on-failure`：前者保证自更新时 helper 不被 unit 连带杀死，后者保证退出码 0 的自更新退出不会与 helper 竞争重启；缺失这两项时 `agent_update` 必然回滚且二进制不会被替换。
 - Windows/macOS 提供通用文件工具、基础文件变更、可恢复文件传输、目录同步和 `exec`；Unix 还提供 `chmod`、Unix mode 和 `deploy_release`。Windows 还提供 `kill` 和 `system_info`，其 `chmod` 和带 mode 的创建/上传返回结构化 unsupported。
 - `agent_info` 和 proxy 生命周期编排工具不受目标平台限制。Windows 的 `reboot` 使用 `shutdown.exe /r /t 0 /f`，macOS 的 `reboot` 返回结构化 unsupported。
 - macOS/Unix 可提供 `sh_exec`、`kill` 和 `system_info`；Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell，Git Bash 不存在时返回结构化 unsupported。Windows 的 `kill` 仅接受 signal 9 或 15，两者均强制终止进程。

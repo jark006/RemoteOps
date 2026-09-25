@@ -1,0 +1,37 @@
+# Recommended systemd unit for remote-ops-agent on Linux.
+#
+# Two settings are required for the Agent's self update (`agent_update`) to work
+# under systemd. Without them the update silently rolls back:
+#
+#   KillMode=process    A self update makes the Agent exit so the helper can
+#                       replace the binary. With the default
+#                       `KillMode=control-group`, systemd also kills the helper
+#                       in the same cgroup, so nothing ever installs the new
+#                       binary.
+#   Restart=on-failure  The Agent exits with status 0 for a self update, so the
+#                       unit must not race the helper by restarting itself. The
+#                       helper asks systemd to restart the unit once the new
+#                       binary is proven healthy.
+#
+# The Agent must run as root on Linux: `reboot` uses reboot(2) and file tools
+# must be able to set ownership and modes.
+[Unit]
+Description=RemoteOps Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root
+ExecStart=/usr/bin/remote-ops-agent --listen 0.0.0.0:8022
+Restart=on-failure
+RestartSec=3
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=15
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

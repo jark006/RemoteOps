@@ -40,6 +40,16 @@ nohup ./remote-ops-agent --listen 0.0.0.0:8022 > /dev/null 2>&1 &
 .\remote-ops-agent.exe --listen 0.0.0.0:8022
 ```
 
+用 systemd 托管（Linux、开机自启推荐），直接采用仓库内的 `deploy/remote-ops-agent.service`：
+
+```sh
+sudo install -m 644 deploy/remote-ops-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now remote-ops-agent
+```
+
+> ⚠️ 该单元必须保留 `KillMode=process` 与 `Restart=on-failure`。自更新时 Agent 会退出（退出码 0）以便 helper 替换可执行文件：默认的 `KillMode=control-group` 会把同一 cgroup 里的 helper 一起杀掉，`Restart=always` 则会与 helper 竞争重启并抢监听端口。缺少这两项时 `agent_update` 会一路报告 `rolled_back` 且二进制根本不会被替换。
+
 查看版本：
 
 ```sh
@@ -176,7 +186,7 @@ proxy 当前暴露 38 个 MCP 工具：
 - `remote_probe` 会主动建立连接或复用缓存连接执行健康检查。`timeout_ms` 默认 5,000 ms，范围 100..=30,000 ms；结果始终给出 `reachable`、延迟、是否复用连接、生命周期状态，以及 Agent 信息或结构化错误。
 - `wait_remote` 支持 `online`、`offline` 和 `offline_then_online`。正常状态默认等待 `online`，重启或更新期间默认等待 `offline_then_online`；后者在观察到离线后重新在线，或 Agent `instance_id` 已变化时完成。已知的上一个实例 ID 在 `rebooting`/`updating` 时取自编排状态，否则取自最近缓存的 `agent_info`，因此在 `ready` 状态下也能识别被替换（例如被服务管理器重启）的 Agent，无需先观察到离线。`remote_probe` 复用缓存会话时，健康检查最多使用一半探测预算，保证失败后仍有时间重连。总超时默认 120,000 ms、范围 1..=600,000 ms，轮询间隔默认 1,000 ms、范围 100..=10,000 ms，每次探测超时默认 5,000 ms、范围 100..=30,000 ms。
 - `reboot` 的延迟默认 1,000 ms，范围 250..=10,000 ms。Agent 先确认请求再延迟执行，proxy 随后丢弃缓存会话并进入 `rebooting`；如果响应恰好因重启断开而丢失，结果会通过 `acknowledged` 和 `disconnect_observed` 区分。可继续使用 `wait_remote` 等待设备恢复。普通请求在发送后发生连接错误时仍不会自动重放。
-- `agent_update` 的 `local_path` 指向 proxy 所在 PC 上的候选 Agent 普通文件。proxy 先探测现有 Agent，将候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选程序通过 `--self-check` 校验协议版本和构建 target 后，由独立 helper 等待旧 Agent 退出、原子替换程序并重启。新 Agent 成功监听且通过稳定性检查后删除备份；启动失败则恢复旧程序并重启。结果以 `updated`、`rolled_back`、`timed_out` 或 `unconfirmed` 明确报告状态。等待和探测参数范围与 `wait_remote` 相同。
+- `agent_update` 的 `local_path` 指向 proxy 所在 PC 上的候选 Agent 普通文件。proxy 先探测现有 Agent，将候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选程序通过 `--self-check` 校验协议版本和构建 target 后，由独立 helper 等待旧 Agent 退出、原子替换程序并重启。helper 先直接启动候选程序验证其健康，通过后再交回监督者：Agent 被 systemd 托管时，helper 会停掉这个临时实例并 `systemctl restart` 对应单元，使更新后的 Agent 仍受系统管理；无监督者时保持直接启动。新 Agent 成功监听且通过稳定性检查后删除备份；启动失败则恢复旧程序并重启。结果以 `updated`、`rolled_back`、`timed_out` 或 `unconfirmed` 明确报告状态。等待和探测参数范围与 `wait_remote` 相同。
 - Linux 的 `reboot` 调用系统 `reboot(2)`，Agent 必须以 root 运行；Windows 使用 `shutdown.exe /r /t 0 /f`；macOS 返回结构化 `unsupported`。`agent_info` 会据实报告 `reboot` 和 `self_update` 能力。
 
 ⚠️ 被控端 Windows 的 `sh_exec` 固定使用 `C:\Program Files\Git\bin\bash.exe --noprofile --norc -c`，不搜索 PATH 或回退到其他 shell；该文件不存在或不是普通文件时返回 unsupported。

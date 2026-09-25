@@ -26,6 +26,10 @@ use super::command;
 pub const SELF_CHECK_TIMEOUT_MS: u64 = 10_000;
 const UPDATE_START_TIMEOUT: Duration = Duration::from_secs(20);
 const UPDATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+// Consecutive active observations required before a supervised restart counts as
+// stable, spaced far enough apart to catch an Agent that exits after forking.
+const STABILIZE_CHECKS: u32 = 3;
+const STABILIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub const SUPPORTED_OPERATIONS: &[&str] = &[
     "read_text",
@@ -107,6 +111,47 @@ struct UpdateManifest {
     health: PathBuf,
     helper: PathBuf,
     restart_args: Vec<String>,
+    // Systemd unit supervising the Agent, when there is one. The helper hands the
+    // restarted Agent back to that unit so the final process stays supervised.
+    #[serde(default)]
+    unit: Option<String>,
+}
+
+// The updater starts the candidate Agent directly to verify it before committing.
+// A supervisor would otherwise restart the unit in parallel and race for the
+// listening port, so the helper asks the supervisor to restart once the new
+// binary is proven healthy.
+fn systemd_unit_of_self() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let contents = fs::read_to_string("/proc/self/cgroup").ok()?;
+        parse_systemd_unit(&contents)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+// Only Linux reads its own cgroup, but the parser is exercised on every target.
+#[cfg(any(target_os = "linux", test))]
+fn parse_systemd_unit(cgroup_contents: &str) -> Option<String> {
+    cgroup_contents
+        .lines()
+        .flat_map(|line| line.rsplit(':').next().unwrap_or("").split('/'))
+        .find(|part| part.len() > ".service".len() && part.ends_with(".service"))
+        .map(str::to_string)
+}
+
+fn systemctl_path() -> Option<PathBuf> {
+    [
+        "/usr/bin/systemctl",
+        "/bin/systemctl",
+        "/usr/sbin/systemctl",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
 }
 
 pub fn agent_info(max_transfer_bytes: u64) -> Value {
@@ -306,6 +351,7 @@ fn prepare_agent_update_inner(
         health,
         helper: helper.clone(),
         restart_args: restart_args.to_vec(),
+        unit: systemd_unit_of_self(),
     };
     if let Err(error) = write_manifest(&manifest_path, &manifest) {
         let _ = fs::remove_file(&helper);
@@ -394,17 +440,17 @@ pub fn schedule_cleanup(paths: Vec<PathBuf>) {
 fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), String> {
     let _ = fs::remove_file(&manifest.health);
     if let Err(error) = fs::rename(&manifest.target, &manifest.backup) {
-        let _ = spawn_restarted_agent(manifest, false);
+        restart_agent(manifest);
         return Err(format!("move current agent to rollback path: {error}"));
     }
     if let Err(error) = fs::rename(&manifest.staged, &manifest.target) {
         let _ = fs::rename(&manifest.backup, &manifest.target);
-        let _ = spawn_restarted_agent(manifest, false);
+        restart_agent(manifest);
         return Err(format!("activate staged agent: {error}"));
     }
     if let Err(error) = sync_parent(&manifest.target) {
         rollback_files(manifest)?;
-        let _ = spawn_restarted_agent(manifest, false);
+        restart_agent(manifest);
         return Err(format!("sync agent directory: {error}"));
     }
 
@@ -412,7 +458,7 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
         Ok(child) => child,
         Err(error) => {
             rollback_files(manifest)?;
-            let _ = spawn_restarted_agent(manifest, false);
+            restart_agent(manifest);
             return Err(format!("start updated agent: {error}"));
         }
     };
@@ -422,14 +468,23 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
             thread::sleep(Duration::from_millis(500));
             match child.try_wait() {
                 Ok(None) => {
+                    if let Err(error) = hand_over_to_supervisor(manifest, &mut child) {
+                        rollback_files(manifest)?;
+                        restart_agent(manifest);
+                        let _ = fs::remove_file(manifest_path);
+                        return Err(error);
+                    }
                     let _ = fs::remove_file(&manifest.backup);
                     let _ = fs::remove_file(&manifest.health);
+                    // A supervisor restart drops --cleanup-update-helper, so the
+                    // helper also retires its own executable.
+                    let _ = fs::remove_file(&manifest.helper);
                     let _ = fs::remove_file(manifest_path);
                     return Ok(());
                 }
                 Ok(Some(status)) => {
                     rollback_files(manifest)?;
-                    let _ = spawn_restarted_agent(manifest, false);
+                    restart_agent(manifest);
                     let _ = fs::remove_file(manifest_path);
                     return Err(format!(
                         "updated agent exited during health stabilization: {status}"
@@ -439,7 +494,7 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
                     let _ = child.kill();
                     let _ = child.wait();
                     rollback_files(manifest)?;
-                    let _ = spawn_restarted_agent(manifest, false);
+                    restart_agent(manifest);
                     let _ = fs::remove_file(manifest_path);
                     return Err(format!("stabilize updated agent: {error}"));
                 }
@@ -448,7 +503,7 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
         match child.try_wait() {
             Ok(Some(status)) => {
                 rollback_files(manifest)?;
-                let _ = spawn_restarted_agent(manifest, false);
+                restart_agent(manifest);
                 let _ = fs::remove_file(manifest_path);
                 return Err(format!(
                     "updated agent exited before health check: {status}"
@@ -459,7 +514,7 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
                 let _ = child.kill();
                 let _ = child.wait();
                 rollback_files(manifest)?;
-                let _ = spawn_restarted_agent(manifest, false);
+                restart_agent(manifest);
                 let _ = fs::remove_file(manifest_path);
                 return Err(format!("wait for updated agent: {error}"));
             }
@@ -468,8 +523,7 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
             let _ = child.kill();
             let _ = child.wait();
             rollback_files(manifest)?;
-            spawn_restarted_agent(manifest, false)
-                .map_err(|error| format!("restart rollback agent: {error}"))?;
+            restart_agent(manifest);
             let _ = fs::remove_file(manifest_path);
             return Err("updated agent did not become healthy before timeout".to_string());
         }
@@ -493,6 +547,81 @@ fn spawn_restarted_agent(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
+}
+
+/// Hand the verified Agent over to its supervisor.
+///
+/// The updater starts the candidate directly so it can prove the new binary
+/// healthy before committing. Leaving that instance in place would leave the
+/// Agent unsupervised and racing its unit for the listening port, so the helper
+/// stops it and asks the supervisor to start the installed binary instead.
+fn hand_over_to_supervisor(
+    manifest: &UpdateManifest,
+    child: &mut std::process::Child,
+) -> Result<(), String> {
+    let Some(unit) = manifest.unit.as_deref() else {
+        return Ok(());
+    };
+    let Some(systemctl) = systemctl_path() else {
+        return Ok(());
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let status = Command::new(&systemctl)
+        .args(["restart", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("restart {unit}: {error}"))?;
+    if !status.success() {
+        return Err(format!("restart {unit}: systemctl exited with {status}"));
+    }
+    // `Type=simple` reports the unit active as soon as it forks, so require the
+    // restarted Agent to stay active across a short window before the previous
+    // binary is discarded: one that cannot bind the port exits again immediately.
+    let deadline = Instant::now() + UPDATE_START_TIMEOUT;
+    let mut stabilized = 0;
+    while stabilized < STABILIZE_CHECKS {
+        if Instant::now() >= deadline {
+            return Err(format!("{unit} did not stabilize after restart"));
+        }
+        if unit_is_active(&systemctl, unit) {
+            stabilized += 1;
+        } else {
+            stabilized = 0;
+        }
+        thread::sleep(STABILIZE_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+/// Restart the restored Agent on rollback paths so it runs under the same
+/// supervisor it had before the update attempt.
+fn restart_agent(manifest: &UpdateManifest) {
+    if let Some(unit) = manifest.unit.as_deref()
+        && let Some(systemctl) = systemctl_path()
+    {
+        let _ = Command::new(systemctl)
+            .args(["restart", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return;
+    }
+    let _ = spawn_restarted_agent(manifest, false);
+}
+
+fn unit_is_active(systemctl: &Path, unit: &str) -> bool {
+    Command::new(systemctl)
+        .args(["is-active", "--quiet", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn rollback_files(manifest: &UpdateManifest) -> Result<(), String> {
@@ -817,5 +946,41 @@ mod tests {
             assert!(validate_sha256(invalid).is_err());
         }
         assert!(validate_sha256(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn supervised_units_are_recognized_from_cgroup_paths() {
+        for (cgroup, expected) in [
+            (
+                "0::/system.slice/remote-ops-agent.service\n",
+                Some("remote-ops-agent.service"),
+            ),
+            (
+                "1:name=systemd:/system.slice/remote-ops-agent.service\n",
+                Some("remote-ops-agent.service"),
+            ),
+            ("0::/system.slice/foo.service/nested\n", Some("foo.service")),
+            ("0::/\n", None),
+            ("0::/user.slice/user-1000.slice/session-3.scope\n", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                parse_systemd_unit(cgroup).as_deref(),
+                expected,
+                "cgroup {cgroup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_manifest_without_a_unit_stays_readable() {
+        // Manifests written before the unit field existed must still parse so a
+        // staged update from an older Agent keeps working.
+        let manifest: UpdateManifest = serde_json::from_str(
+            r#"{"parent_pid":1,"target":"/a","staged":"/b","backup":"/c",
+                "failed":"/d","health":"/e","helper":"/f","restart_args":[]}"#,
+        )
+        .unwrap();
+        assert!(manifest.unit.is_none());
     }
 }
