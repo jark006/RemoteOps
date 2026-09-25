@@ -30,7 +30,7 @@ proxy 暴露 39 个工具。修改名称、参数、默认值、上限或结果�
 - 基础文件变更工具：`mkdir`、`remove`、`move`、`copy`、`chmod`、`symlink`。
 - 目录同步与发布工具：`sync_directory`、`deploy_release`。
 - Agent 生命周期工具：`agent_info`、`reboot`。
-- proxy 本地管理与生命周期编排工具：`remote_status`、`set_remote`、`remote_probe`、`wait_remote`、`agent_update`。`remote_status` 被动查询地址、缓存连接和生命周期状态；`set_remote` 可单独设置 IPv4 或端口，配置仅在当前进程内生效；其余工具负责主动探测、等待状态变化和编排 Agent 自更新。
+- proxy 本地管理与生命周期编排工具：`remote_status`、`set_remote`、`remote_probe`、`wait_remote`、`agent_update`。`remote_status` 被动查询地址、缓存连接和生命周期状态；`set_remote` 可单独设置 IPv4 或端口，配置仅在当前进程内生效，并且必须总是丢弃缓存会话（含地址未变化时），作为确定性的重连手段，但地址未变化时不得清除观测和生命周期状态；其余工具负责主动探测、等待状态变化和编排 Agent 自更新。
 - 批量执行工具：`batch` 在一次往返内按顺序执行至多 16 个只读与诊断工具（`read_text`、`read_file_lines`、`tail_text`、`list_files`、`grep`、`stat`、`file_hash`、`pids`、`process_info`、`system_info`、`agent_info`、`remote_status`、`sh_exec`、`exec`），子结果按输入顺序返回 `{tool, ok, result|error}`；包含写操作时整体拒绝并返回 `invalid_params`。batch 为纯 proxy 实现，不新增协议操作，旧 Agent 无需升级。
 - `upload_file`、`download_file`、`sync_directory` 和 `deploy_release` 的 `local_path` 均属于 proxy 所在 PC。
 - 单文件默认上限 4 GiB，chunk 上限 64 KiB；控制帧上限 2 MiB。
@@ -49,8 +49,8 @@ proxy 暴露 39 个工具。修改名称、参数、默认值、上限或结果�
 - `process_start` 不经过 shell，stdin 固定为空；后台任务默认超时 1 小时、最大 24 小时，同时最多保留 16 个。任务属于 agent 进程而非单个连接，可在 proxy 断线重连后继续查询，但不跨 agent 进程重启持久化。达到上限时先回收最早结束的任务；若全部仍在运行则拒绝启动。
 - 后台任务 stdout/stderr 各保留最近 256 KiB。`process_output` 使用绝对字节游标，每路默认返回 64 KiB、最多 256 KiB；游标落后于保留窗口时必须报告截断及最早可用游标。`process_wait` 默认等待 10 秒、最长 30 秒；`process_close` 只释放已结束任务，运行中的任务必须先 signal 并 wait。
 - `agent_info` 必须返回 Agent 版本、协议版本、构建 target/profile/Git revision、运行实例 ID/PID/启动时间、平台、支持操作、能力、限制和自更新路径；启动时间和 uptime 必须自进程启动起算（服务启动路径显式初始化运行身份），不得延迟到首次查询。构建信息由 `crates/agent/build.rs` 注入；自检信息必须保持有界且可机器读取。
-- `remote_status` 不得主动连接，必须返回 `connection_state`（`cached` 或 `disconnected`）、`lifecycle_state`（`ready`、`rebooting` 或 `updating`）、最近成功时间、最近错误、最近探测和缓存的 Agent 信息。`remote_probe` 主动连接或健康检查，返回可达性、延迟、连接复用情况、Agent 信息或结构化错误；探测超时默认 5 秒，范围 100..=30,000 ms。
-- `wait_remote` 支持 `online`、`offline`、`offline_then_online`；正常状态默认等待在线，重启或更新状态默认等待离线后再在线。`offline_then_online` 可通过实际观察到离线或 Agent 实例 ID 变化确认。总超时默认 120 秒、范围 1..=600,000 ms，轮询间隔默认 1 秒、范围 100..=10,000 ms，每次探测沿用 `remote_probe` 的默认值和范围。
+- `remote_status` 不得主动连接，必须返回 `connection_state`（`cached` 或 `disconnected`）、`lifecycle_state`（`ready`、`rebooting` 或 `updating`）、最近成功时间、最近错误、最近探测和缓存的 Agent 信息。`remote_probe` 主动连接或健康检查，返回可达性、延迟、连接复用情况、Agent 信息或结构化错误；探测超时默认 5 秒，范围 100..=30,000 ms。复用已缓存会话时健康检查最多使用一半探测预算，必须为失败后的重连留出时间，不得因预算耗尽而放弃重连并误报不可达。
+- `wait_remote` 支持 `online`、`offline`、`offline_then_online`；正常状态默认等待在线，重启或更新状态默认等待离线后再在线。`offline_then_online` 可通过实际观察到离线或 Agent 实例 ID 变化确认。用于比较的上一个实例 ID 在 `rebooting`/`updating` 编排状态下取自生命周期状态，否则取自最近缓存的 `agent_info`，保证 `ready` 状态下也能识别被替换的 Agent，不得因为没有编排状态而无法确认实例变化。总超时默认 120 秒、范围 1..=600,000 ms，轮询间隔默认 1 秒、范围 100..=10,000 ms，每次探测沿用 `remote_probe` 的默认值和范围。
 - `reboot` 延迟默认 1 秒、范围 250..=10,000 ms。Agent 必须先校验平台和权限，再确认请求并延迟执行；proxy 收到确认或在请求发出后观察到预期断开时丢弃会话并标记 `rebooting`，结果必须区分是否收到确认。除这些显式生命周期流程外，连接错误发生在请求发出后时仍按状态不确定处理，禁止自动重放。
 - `agent_update` 的 `local_path` 属于 proxy 所在 PC。proxy 必须先主动探测，将普通候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选必须通过 `--self-check`，且协议版本和构建 target 与当前 Agent 兼容。独立 helper 等待旧 Agent 退出后原子替换可执行文件并保留 rollback 文件；新 Agent 成功绑定监听并稳定运行后才能清理备份，启动失败必须恢复旧程序并重启。结果必须明确区分 `updated`、`rolled_back`、`timed_out` 和 `unconfirmed`；等待及探测参数范围与 `wait_remote` 相同。
 

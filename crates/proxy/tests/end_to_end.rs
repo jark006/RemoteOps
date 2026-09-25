@@ -760,36 +760,38 @@ fn context_checked_patch_is_applied_over_the_remote_protocol() {
 
 #[test]
 fn remote_can_switch_between_authenticated_endpoints() {
-    fn responder(listener: TcpListener, expected_request_id: u64, marker: &'static str) {
-        let (stream, _) = listener.accept().unwrap();
-        let mut session = Session::accept(
-            stream,
-            BUILTIN_PSK,
-            SessionOptions::agent(),
-            DEFAULT_MAX_CONTROL_BYTES,
-        )
-        .unwrap();
-        let request: RemoteRequest = session
-            .receive_json(FrameType::Request, expected_request_id)
-            .unwrap();
-        assert_eq!(request.operation, "marker");
-        session
-            .send_json(
-                FrameType::Response,
-                expected_request_id,
-                &RemoteResponse::success(json!({"marker": marker})),
+    fn responder(listener: TcpListener, expected_request_ids: &[u64], marker: &'static str) {
+        for expected_request_id in expected_request_ids {
+            let (stream, _) = listener.accept().unwrap();
+            let mut session = Session::accept(
+                stream,
+                BUILTIN_PSK,
+                SessionOptions::agent(),
+                DEFAULT_MAX_CONTROL_BYTES,
             )
             .unwrap();
+            let request: RemoteRequest = session
+                .receive_json(FrameType::Request, *expected_request_id)
+                .unwrap();
+            assert_eq!(request.operation, "marker");
+            session
+                .send_json(
+                    FrameType::Response,
+                    *expected_request_id,
+                    &RemoteResponse::success(json!({"marker": marker})),
+                )
+                .unwrap();
+        }
     }
 
     let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let first_address = first_listener.local_addr().unwrap();
     let first_remote: SocketAddrV4 = first_address.to_string().parse().unwrap();
-    let first_server = thread::spawn(move || responder(first_listener, 1, "first"));
+    let first_server = thread::spawn(move || responder(first_listener, &[1, 2], "first"));
     let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let second_address = second_listener.local_addr().unwrap();
     let second_remote: SocketAddrV4 = second_address.to_string().parse().unwrap();
-    let second_server = thread::spawn(move || responder(second_listener, 2, "second"));
+    let second_server = thread::spawn(move || responder(second_listener, &[3], "second"));
 
     let mut client = RemoteClient::new(
         first_remote,
@@ -800,10 +802,14 @@ fn remote_can_switch_between_authenticated_endpoints() {
     assert_eq!(client.call("marker", json!({})).unwrap()["marker"], "first");
     assert_eq!(client.remote_status()["connected"], true);
 
+    // Re-pointing at the same address drops the cached session, so the next call
+    // reconnects to the same endpoint.
     let unchanged = client
         .set_remote(Some(*first_remote.ip()), Some(first_remote.port()))
         .unwrap();
-    assert_eq!(unchanged["connected"], true);
+    assert_eq!(unchanged["connected"], false);
+    assert_eq!(unchanged["address"], first_address.to_string());
+    assert_eq!(client.call("marker", json!({})).unwrap()["marker"], "first");
 
     let switched = client
         .set_remote(Some(*second_remote.ip()), Some(second_remote.port()))

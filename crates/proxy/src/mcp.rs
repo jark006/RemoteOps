@@ -1985,7 +1985,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "set_remote",
             "Set remote",
-            "Change the remote IPv4 address, port, or both for subsequent calls; at least one must be provided",
+            "Change the remote IPv4 address, port, or both for subsequent calls; at least one must be provided. Always drops the cached session so the next call reconnects, including when the address is unchanged",
             props(&[
                 (
                     "ip",
@@ -2007,7 +2007,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "remote_probe",
             "Probe remote",
-            "Actively connect or health-check the configured remote and return latency and Agent information",
+            "Actively connect or health-check the configured remote and return latency and Agent information. Reconnects within the probe timeout when a cached session is stale or half open",
             props(&[(
                 "timeout_ms",
                 integer_prop_default(
@@ -2023,7 +2023,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "wait_remote",
             "Wait for remote",
-            "Wait for the remote to become offline, online, or cycle offline then online with a healthy Agent",
+            "Wait for the remote to become offline, online, or cycle offline then online with a healthy Agent. offline_then_online also completes when the Agent instance changes, even without an observed outage",
             props(&[
                 (
                     "wait_for",

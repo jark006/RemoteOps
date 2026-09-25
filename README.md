@@ -127,7 +127,7 @@ proxy 当前暴露 38 个 MCP 工具：
 | `upload_file` | `local_path`, `remote_path`, `overwrite?`, `mode?`, `resume?` | 从 proxy 所在 PC 上传一个普通文件，可设置 Unix mode 并校验续传。 |
 | `download_file` | `remote_path`, `local_path`, `overwrite?`, `resume?` | 下载一个普通文件到 proxy 所在 PC，可校验续传。 |
 | `remote_status` | 无 | 被动查询地址、缓存连接、生命周期状态，以及最近一次成功、错误、探测和 Agent 信息，不主动连接。 |
-| `set_remote` | `ip?`, `port?` | 动态设置远端 IPv4 或端口；至少提供一项，未提供部分保持不变。 |
+| `set_remote` | `ip?`, `port?` | 动态设置远端 IPv4 或端口；至少提供一项，未提供部分保持不变。总是丢弃缓存会话（即使地址未变化），使下一次调用重新建立连接。 |
 | `agent_info` | 无 | 查询 Agent 版本、协议、构建信息、运行实例、平台、能力和限制。 |
 | `remote_probe` | `timeout_ms?` | 主动连接或健康检查远端，返回可达性、延迟、Agent 信息或结构化错误。 |
 | `wait_remote` | `wait_for?`, `timeout_ms?`, `poll_interval_ms?`, `probe_timeout_ms?` | 有界轮询远端，等待 `online`、`offline` 或 `offline_then_online`。 |
@@ -172,9 +172,9 @@ proxy 当前暴露 38 个 MCP 工具：
 ### Agent 与设备生命周期
 
 - Agent 同一时刻只允许一个已认证 proxy 作为活动管理者。新的 proxy 完成认证后会接管空闲管理连接，并由 Agent 关闭旧连接，因此 Codex 使用 `/clear` 创建新会话后，新会话的 proxy 可以直接继续管理设备；旧 proxy 进程可能仍由 Codex 保留，但不再占用远端连接。如果当前管理者正在执行请求、传输或提交文件，新候选的首个请求会收到 `manager_busy` 且保证未执行；认证失败不会影响当前管理者。
-- `remote_status` 是被动快照，不会为确认设备在线而建立连接。`connection_state` 为 `cached` 或 `disconnected`，只表示 proxy 是否持有已认证会话；`lifecycle_state` 为 `ready`、`rebooting` 或 `updating`。结果还包含 `last_success_at_ms`、`last_error`、`last_probe` 和最近缓存的 `agent_info`。
+- `remote_status` 是被动快照，不会为确认设备在线而建立连接。`connection_state` 为 `cached` 或 `disconnected`，只表示 proxy 是否持有已认证会话，`cached` 不代表该会话仍然可用；确认连通性请用 `remote_probe`。`lifecycle_state` 为 `ready`、`rebooting` 或 `updating`。结果还包含 `last_success_at_ms`、`last_error`、`last_probe` 和最近缓存的 `agent_info`。`set_remote` 总是丢弃缓存会话，是会话卡死或半开时的确定性恢复手段。
 - `remote_probe` 会主动建立连接或复用缓存连接执行健康检查。`timeout_ms` 默认 5,000 ms，范围 100..=30,000 ms；结果始终给出 `reachable`、延迟、是否复用连接、生命周期状态，以及 Agent 信息或结构化错误。
-- `wait_remote` 支持 `online`、`offline` 和 `offline_then_online`。正常状态默认等待 `online`，重启或更新期间默认等待 `offline_then_online`；后者在观察到离线后重新在线，或 Agent `instance_id` 已变化时完成。总超时默认 120,000 ms、范围 1..=600,000 ms，轮询间隔默认 1,000 ms、范围 100..=10,000 ms，每次探测超时默认 5,000 ms、范围 100..=30,000 ms。
+- `wait_remote` 支持 `online`、`offline` 和 `offline_then_online`。正常状态默认等待 `online`，重启或更新期间默认等待 `offline_then_online`；后者在观察到离线后重新在线，或 Agent `instance_id` 已变化时完成。已知的上一个实例 ID 在 `rebooting`/`updating` 时取自编排状态，否则取自最近缓存的 `agent_info`，因此在 `ready` 状态下也能识别被替换（例如被服务管理器重启）的 Agent，无需先观察到离线。`remote_probe` 复用缓存会话时，健康检查最多使用一半探测预算，保证失败后仍有时间重连。总超时默认 120,000 ms、范围 1..=600,000 ms，轮询间隔默认 1,000 ms、范围 100..=10,000 ms，每次探测超时默认 5,000 ms、范围 100..=30,000 ms。
 - `reboot` 的延迟默认 1,000 ms，范围 250..=10,000 ms。Agent 先确认请求再延迟执行，proxy 随后丢弃缓存会话并进入 `rebooting`；如果响应恰好因重启断开而丢失，结果会通过 `acknowledged` 和 `disconnect_observed` 区分。可继续使用 `wait_remote` 等待设备恢复。普通请求在发送后发生连接错误时仍不会自动重放。
 - `agent_update` 的 `local_path` 指向 proxy 所在 PC 上的候选 Agent 普通文件。proxy 先探测现有 Agent，将候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选程序通过 `--self-check` 校验协议版本和构建 target 后，由独立 helper 等待旧 Agent 退出、原子替换程序并重启。新 Agent 成功监听且通过稳定性检查后删除备份；启动失败则恢复旧程序并重启。结果以 `updated`、`rolled_back`、`timed_out` 或 `unconfirmed` 明确报告状态。等待和探测参数范围与 `wait_remote` 相同。
 - Linux 的 `reboot` 调用系统 `reboot(2)`，Agent 必须以 root 运行；Windows 使用 `shutdown.exe /r /t 0 /f`；macOS 返回结构化 `unsupported`。`agent_info` 会据实报告 `reboot` 和 `self_update` 能力。

@@ -148,10 +148,17 @@ impl RemoteClient {
             ip.unwrap_or(*self.remote.ip()),
             port.unwrap_or(self.remote.port()),
         );
-        if remote != self.remote {
-            self.remote = remote;
-            self.session = None;
-            self.last_activity = None;
+        let address_changed = remote != self.remote;
+        self.remote = remote;
+        // Re-pointing always drops the cached session so the next operation dials
+        // a fresh connection. This is the deterministic recovery lever for a
+        // wedged or half-open session, so it must not depend on the address
+        // actually changing. Observation and lifecycle state are preserved when
+        // the address is unchanged, so in-flight reboot/update orchestration and
+        // instance-change detection survive the reset.
+        self.session = None;
+        self.last_activity = None;
+        if address_changed {
             self.last_success_at_ms = None;
             self.last_error = None;
             self.last_probe = None;
@@ -204,7 +211,13 @@ impl RemoteClient {
         let previous_instance_id = self
             .lifecycle_state
             .previous_instance_id()
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| {
+                self.last_agent_info
+                    .as_ref()
+                    .and_then(agent_instance_id)
+                    .map(str::to_string)
+            });
         let started = Instant::now();
         let deadline = started + Duration::from_millis(timeout_ms);
         let mut attempts = 0u64;
@@ -735,8 +748,13 @@ impl RemoteClient {
     fn probe(&mut self, timeout: Duration) -> Value {
         let started = Instant::now();
         let connection_reused = self.session.is_some();
+        // A reused session only spends half the budget on its health check. A
+        // stale or half-open connection must never be able to consume the whole
+        // probe timeout, because that would leave nothing for the reconnect that
+        // recovers it and report the remote unreachable while it is healthy.
+        let reused_timeout = (timeout / 2).max(Duration::from_millis(1));
         let first = if self.session.is_some() {
-            self.ping_current_session(timeout)
+            self.ping_current_session(reused_timeout)
         } else {
             self.ensure_connected_with(timeout)
                 .and_then(|_| self.ping_current_session(timeout))
@@ -1317,6 +1335,113 @@ mod tests {
         let error = client.call("mutating-operation", json!({})).unwrap_err();
         assert_eq!(error.kind, "connection_uncertain");
         assert!(!client.remote_status()["connected"].as_bool().unwrap());
+        server.join().unwrap();
+    }
+
+    fn agent_identity(instance_id: &str) -> Value {
+        json!({
+            "name": "remote-ops-agent",
+            "runtime": {"instance_id": instance_id},
+            "supported_operations": []
+        })
+    }
+
+    fn answer_ping(session: &mut Session, instance_id: &str) {
+        let frame = session.receive().unwrap();
+        assert_eq!(frame.kind, FrameType::Request);
+        let ping: RemoteRequest = serde_json::from_slice(&frame.payload).unwrap();
+        assert_eq!(ping.operation, INTERNAL_PING_OPERATION);
+        session
+            .send_json(
+                FrameType::Response,
+                frame.request_id,
+                &RemoteResponse::success(agent_identity(instance_id)),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn offline_then_online_detects_a_replaced_agent_while_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_session(&listener);
+            answer_ping(&mut first, "instance-1");
+            drop(first);
+
+            let mut second = accept_session(&listener);
+            answer_ping(&mut second, "instance-2");
+            // Stay alive so the probe reporting the new instance never observes
+            // the remote going offline.
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(2), DEFAULT_MAX_TRANSFER_BYTES);
+        let probe = client.remote_probe(1_000);
+        assert_eq!(probe["agent_info"]["runtime"]["instance_id"], "instance-1");
+
+        // The cached session is gone; the next probe reaches a different instance.
+        client.session = None;
+        client.last_activity = None;
+        let waited = client.wait_remote(Some("offline_then_online"), 2_000, 100, 1_000);
+        assert!(waited["reached"].as_bool().unwrap(), "{waited}");
+        assert!(!waited["observed_offline"].as_bool().unwrap(), "{waited}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_reconnects_when_a_reused_session_goes_half_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut first = accept_session(&listener);
+            answer_ping(&mut first, "instance-1");
+
+            // Never answer again on the first session: the peer is half open, so
+            // only a fresh connection can make progress.
+            let mut second = accept_session(&listener);
+            answer_ping(&mut second, "instance-1");
+            drop(first);
+        });
+
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(2), DEFAULT_MAX_TRANSFER_BYTES);
+        assert!(client.remote_probe(1_000)["reachable"].as_bool().unwrap());
+
+        let probe = client.remote_probe(1_000);
+        assert!(probe["reachable"].as_bool().unwrap(), "{probe}");
+        assert!(probe["connection_reused"].as_bool().unwrap(), "{probe}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn set_remote_resets_the_cached_session_for_the_same_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = match listener.local_addr().unwrap() {
+            SocketAddr::V4(address) => address,
+            SocketAddr::V6(_) => unreachable!("bound an IPv4 listener"),
+        };
+        let server = thread::spawn(move || {
+            let mut session = accept_session(&listener);
+            answer_ping(&mut session, "instance-1");
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let mut client =
+            RemoteClient::new(address, Duration::from_secs(2), DEFAULT_MAX_TRANSFER_BYTES);
+        assert!(client.remote_probe(1_000)["reachable"].as_bool().unwrap());
+        assert_eq!(client.remote_status()["connection_state"], "cached");
+
+        let status = client
+            .set_remote(Some(*address.ip()), Some(address.port()))
+            .unwrap();
+        assert_eq!(status["connection_state"], "disconnected");
+        assert!(!status["connected"].as_bool().unwrap());
+        // Observation state survives a same-address re-point so in-flight
+        // orchestration and instance-change detection keep working.
+        assert_eq!(status["agent_info"]["runtime"]["instance_id"], "instance-1");
+        assert!(status["last_success_at_ms"].as_u64().is_some());
         server.join().unwrap();
     }
 }
