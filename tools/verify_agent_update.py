@@ -12,6 +12,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -22,11 +23,14 @@ def main():
     parser.add_argument("--agent", type=Path, required=True)
     parser.add_argument("--proxy", type=Path, required=True)
     parser.add_argument("--systemd", action="store_true", help="Linux root: create an isolated transient test unit with the recommended policy")
+    parser.add_argument("--defer-reap", action="store_true", help="Linux: leave the old Agent as a zombie until the update completes")
     args = parser.parse_args()
     source = args.agent.resolve(strict=True)
     proxy_binary = args.proxy.resolve(strict=True)
     if args.systemd and (os.name == "nt" or os.geteuid() != 0):
         parser.error("--systemd requires Linux root")
+    if args.defer_reap and (not sys.platform.startswith("linux") or args.systemd):
+        parser.error("--defer-reap requires unsupervised Linux")
     with tempfile.TemporaryDirectory(prefix="remote-ops-update-") as temporary:
         root = Path(temporary)
         agent_path = root / ("agent.exe" if os.name == "nt" else "agent")
@@ -48,7 +52,7 @@ def main():
                 old_pid = old.pid
             # Reap the old Agent immediately after it exits, including Unix
             # zombies that kill(pid,0) would otherwise continue to report alive.
-            reaper = threading.Thread(target=old.wait, daemon=True) if old else None
+            reaper = threading.Thread(target=old.wait, daemon=True) if old and not args.defer_reap else None
             if reaper:
                 reaper.start()
             proxy = subprocess.Popen([str(proxy_binary), "--remote", f"127.0.0.1:{port}"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
@@ -83,6 +87,11 @@ def main():
                 assert current_pid != old_pid
                 assert hashlib.sha256(agent_path.read_bytes()).hexdigest() == hashlib.sha256(source.read_bytes()).hexdigest()
                 cases = ["updated-identical-binary"]
+                if args.defer_reap:
+                    state = Path(f"/proc/{old_pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+                    assert state == "Z", state
+                    old.wait(timeout=5)
+                    cases.append("updated-with-unreaped-parent")
                 if os.name != "nt":
                     check = json.loads(subprocess.check_output([str(source), "--self-check"], text=True))
                     script = "#!/bin/sh\nif [ \"$1\" = --self-check ]; then\ncat <<'REMOTE_OPS_FIXTURE'\n" + json.dumps(check) + "\nREMOTE_OPS_FIXTURE\nexit 0\nfi\nexit 37\n"
@@ -116,6 +125,12 @@ def main():
                         pass
                 if reaper:
                     reaper.join(timeout=5)
+                elif old:
+                    try:
+                        old.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        old.kill()
+                        old.wait(timeout=5)
                 # Give the helper's short-lived cleanup process time to exit.
                 time.sleep(0.3)
 

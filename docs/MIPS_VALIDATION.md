@@ -29,3 +29,13 @@ Linux workspace 166 项测试通过、1 项需指定独立远端的 live 用例�
 所有测试目录已删除，8 个后台任务均已 wait/close，未残留匹配测试路径的进程。`/tmp` 使用量从测试中约 7,380 KiB 恢复至 428 KiB，可用内存约 35,408 KiB。原 `/system/remote-ops-agent` 保持 PID 878、实例 `2ddfbabac17b90cc463d6ef1e6ad9c71`，未替换；因此原服务仍有上述只读信息误报，修复已在临时副本验证。
 
 未执行设备的真实 root reboot，只测试参数越界拒绝。此次真机内核为 4.4.94，不能据此承诺其他内核（例如 3.10.14）或固件上的行为。机器可读用例、调用记录及构建/回归日志位于 `target/validation/live-tools-20261109/` 的 mips 相关文件。
+
+## 2.0.1 正式升级中发现的退出检测问题
+
+首次正式更新时，原 Agent PID 878 已退出但父进程是停在输入状态的 BusyBox 交互式 shell，未及时 wait。helper 的 kill(pid,0) 对 Z 状态仍返回成功，最终回执为 unconfirmed，detail 为旧 PID 未退出；替换尚未开始，原文件和候选均完整保留。设备 Telnet 与业务端口持续可达，通过现有维护入口恢复旧 Agent 并由包装 shell wait/reap，恢复 RemoteOps 通道。
+
+2.0.1 追加修复：Linux 存活检测有界读取 `/proc/<pid>/stat`，Z/X/x 状态视为已退出；真实运行进程继续阻止 helper 替换，不可读取 procfs 时保守退回 kill 探测。增加真实子进程退出但刻意不 wait 的 Linux 回归，确认 PID 仍存在时 helper 等待即可完成。旧版 helper 的首次迁移限制见迁移说明，后续更新由修复版处理。
+
+`tools/verify_agent_update.py --defer-reap` 在 Linux 上故意延迟回收旧 Agent，直到完整 agent_update 成功且收到最终回执后才 wait；同时验证当时 `/proc/<pid>/stat` 为 Z，随后仍执行候选启动失败回滚。该入口避免测试夹具提前回收进程掩盖实际故障。
+
+追加修复的 Linux workspace 167 项测试通过；Linux/Windows Clippy、三项 Linux musl 交叉检查、fmt/diff 检查和发布脚本 12 项测试通过。独立 Linux release 产物的 --defer-reap 实测同时通过 updated-identical-binary、updated-with-unreaped-parent 和 startup-failure-rolled-back 三种情形。

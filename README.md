@@ -3,7 +3,7 @@
 RemoteOps 是一个面向远程系统维护和嵌入式 Linux 开发的 MCP 工具。
 在 PC 端部署 `remote-ops-proxy` 并配置 MCP，远端设备部署 `remote-ops-agent`，则 PC 端的 Claude Code / Codex 即可远程控制远端设备。
 
-2.0.1 使用远端协议 v4，修复嵌入式 Linux 只读文件系统被误报为可写的问题，可从 2.0.0 通过 `agent_update` 升级。连接后可通过 `environment` 发现实际 shell 与工具。工具反馈默认 compact，需要完整诊断时传 `response_mode: "full"`。从 1.x 升级请先阅读 [迁移说明](docs/MIGRATING_V2.md)，proxy 和 Agent 必须配套升级。MIPS 真机验证见 [验收记录](docs/MIPS_VALIDATION.md)。
+2.0.1 使用远端协议 v4，修复嵌入式 Linux 只读文件系统误报和自更新将僵尸进程误判为仍运行的问题，可从 2.0.0 通过 `agent_update` 升级。旧版由交互式 shell 启动时，首次升级需保证启动者能及时 wait/reap，详情见 [迁移说明](docs/MIGRATING_V2.md)。连接后可通过 `environment` 发现实际 shell 与工具。工具反馈默认 compact，需要完整诊断时传 `response_mode: "full"`。从 1.x 升级请先阅读迁移说明，proxy 和 Agent 必须配套升级。MIPS 真机验证见 [验收记录](docs/MIPS_VALIDATION.md)。
 
 ```text
 Claude Code / Codex

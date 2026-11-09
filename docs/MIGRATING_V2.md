@@ -2,6 +2,8 @@
 
 当前版本为 2.0.1，远端协议保持 v4；已有 2.0.0 且支持 update_receipts 的 Agent 可直接通过 agent_update 升级。2.0.1 修复 Linux mountinfo 的 superblock 只读选项识别，不改变工具输入、输出字段或 wire 格式。
 
+2.0.1 同时修复 Linux 更新 helper 等待未回收 zombie 进程超时的问题。首次从 2.0.0 升级仍使用旧 helper：若 Agent 是交互式 shell 的前台任务，shell 停在输入状态时可能不及时 reap，需先确保由能 wait/reap 的启动者运行（例如 systemd，或后台包装 shell 执行 `agent & wait $!`）。若回执为 unconfirmed，detail 指出旧 PID 未退出且进程实际是 Z，检查恢复路径并通过现有维护入口重启旧 Agent 后再完成迁移；不要把超时当作候选已安装，也不要盲目重复更新。2.0.1 helper 在有界 procfs 读取中将 Z/X/x 识别为已退出，procfs 不可读取时仍保守探测。
+
 2.0 的 proxy 与 Agent 使用远端协议 v4，拒绝连接 v3。文件内容仍使用二进制 Chunk，不进入 MCP JSON。固定连接值、单管理连接和请求不自动重放的边界保持一致。
 
 ## 安装顺序

@@ -975,6 +975,17 @@ fn wait_for_parent_exit(pid: u32) -> Result<(), String> {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
+    // An exited Linux process may remain as a zombie until its original parent
+    // reaps it (notably an interactive BusyBox shell). kill(pid, 0) still succeeds
+    // for that PID, but it can no longer execute or own the listening socket.
+    #[cfg(target_os = "linux")]
+    if let Some((contents, false)) =
+        super::system::bounded_text(format!("/proc/{pid}/stat"), 16 * 1024)
+        && let Some((_, fields)) = contents.rsplit_once(") ")
+        && matches!(fields.split_whitespace().next(), Some("Z" | "X" | "x"))
+    {
+        return false;
+    }
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
@@ -1173,6 +1184,33 @@ mod tests {
             second["runtime"]["uptime_ms"].as_u64().unwrap()
                 >= first["runtime"]["uptime_ms"].as_u64().unwrap()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_parent_exit_accepts_an_unreaped_linux_zombie() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read ignored || :"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(process_is_alive(pid), "running children must remain alive");
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_is_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let detected_exit = !process_is_alive(pid);
+        let pid_still_exists = unsafe { libc::kill(pid as i32, 0) } == 0;
+        let update_wait = detected_exit.then(|| wait_for_parent_exit(pid));
+        child.wait().unwrap();
+        assert!(
+            pid_still_exists,
+            "fixture must remain unreaped during detection"
+        );
+        assert!(detected_exit, "a zombie must not block the update helper");
+        assert!(update_wait.unwrap().is_ok());
     }
 
     #[test]

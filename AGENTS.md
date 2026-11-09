@@ -71,6 +71,7 @@ proxy 暴露 40 个工具。修改名称、参数、默认值、上限或结果�
 - `reboot` 延迟默认 1 秒、范围 250..=10,000 ms。Agent 必须先校验平台和权限，再确认请求并延迟执行；proxy 收到确认或在请求发出后观察到预期断开时丢弃会话并标记 `rebooting`，结果必须区分是否收到确认。除这些显式生命周期流程外，连接错误发生在请求发出后时仍按状态不确定处理，禁止自动重放。
 - `agent_update` 的 `local_path` 属于 proxy 所在 PC。proxy 必须先主动探测，将普通候选文件上传到 Agent 公布的固定 staging 路径并校验 SHA-256；候选必须通过 `--self-check`，且协议版本和构建 target 与当前 Agent 兼容。独立 helper 等待旧 Agent 退出后原子替换可执行文件并保留 rollback 文件；新 Agent 成功绑定监听并稳定运行后才能清理备份，启动失败必须恢复旧程序并重启。Agent 必须把监督自身的 systemd 单元名写入更新 manifest（无监督者时为空）；helper 验证新二进制健康后必须把 Agent 交回该单元（停止自己直接启动的临时实例并 `systemctl restart <unit>`、确认单元 active），回滚重启同样必须经该单元，保证更新后的 Agent 仍受监督且不与单元竞争监听端口。结果必须明确区分 `updated`、`rolled_back`、`timed_out` 和 `unconfirmed`；等待及探测参数范围与 `wait_remote` 相同。
 - 自更新必须要求 Agent 的 update_receipts 能力。helper 使用 attempt_id/candidate_sha256/previous_instance_id 关联本次尝试，在 target.update-result.json 原子记录 pending 和最终 updated/rolled_back/rollback_failed/unconfirmed（最多 16 KiB）；agent_info.update.last_result 返回该回执，agent_update 结果增加 update_receipt。proxy 必须等待回执完成，临时候选上线不能当作更新完成；缺失/不匹配回执不确认成功。helper 在旧进程退出后复核候选哈希；回滚失败保留 backup/manifest 并提供路径。systemd 单元属性不符合 KillMode=process/Restart=on-failure 时，在退出旧 Agent 前拒绝更新；systemctl 操作必须限时，监督者丢失时不能静默退化为无监督运行。
+- Linux helper 等待旧 Agent 退出时，必须有界读取 `/proc/<pid>/stat` 并识别 zombie/dead 状态；交互式 BusyBox shell 未 wait 的僵尸 PID 仍通过 kill(pid,0)，不能据此阻止更新。procfs 不可读取时保守退回存活探测。
 
 ## 平台行为
 
