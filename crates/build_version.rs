@@ -58,7 +58,7 @@ pub fn emit_version_env() {
     println!("cargo:rustc-env=REMOTE_OPS_APP_VERSION_CODE={version_code}");
 
     let dirty_output = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=normal"])
         .current_dir(&workspace)
         .output()
         .ok()

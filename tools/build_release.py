@@ -45,7 +45,7 @@ def sha256_file(path):
 def source_manifest(root):
     """Hash explicit source roots, including untracked new implementation files."""
     files = []
-    for name in ["Cargo.toml", "Cargo.lock", ".cargo", "rust-toolchain.toml", "rust-toolchain", "crates", "targets", "tools", "deploy",
+    for name in ["Cargo.toml", "Cargo.lock", ".gitignore", ".cargo", "rust-toolchain.toml", "rust-toolchain", "crates", "targets", "tools", "deploy",
                  "docs", "README.md", "AGENTS.md", "buildAll.ps1", "LICENSE"]:
         start = root / name
         require(start.exists() or not start.is_symlink(), f"dangling source symlink: {start}")
@@ -221,7 +221,9 @@ def build_release(root, targets, output, toolchain=None, native=False):
     matrix = json.loads((root / "targets/releases.json").read_text(encoding="utf-8"))
     manifest["complete_matrix"] = {t["target"] for t in targets} == {t["target"] for t in matrix}
     output.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix="." + output.name + "-", dir=output.parent))
+    # Keep the directory beside the output for an atomic rename, with a stable
+    # ignored name so root-level builds do not contaminate Git dirty metadata.
+    staging = Path(tempfile.mkdtemp(prefix=".remote-ops-release-", dir=output.parent))
     try:
         for target in targets:
             artifacts = compile_target(root, target, toolchain, native, env)

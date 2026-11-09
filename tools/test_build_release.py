@@ -3,7 +3,9 @@
 import io
 import json
 from pathlib import Path
+import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -49,7 +51,34 @@ class ReleaseTests(unittest.TestCase):
 
     def assert_no_release(self):
         self.assertFalse(self.output.exists())
-        self.assertEqual(list(self.root.glob(".out-*")), [])
+        self.assertEqual(list(self.root.glob(".remote-ops-release-*")), [])
+
+    @unittest.skipUnless(shutil.which("git"), "requires Git")
+    def test_root_output_staging_keeps_git_worktree_clean_between_targets(self):
+        # The second compiler invocation runs after staging contains the first
+        # binary. That temporary file must not mark a clean release as dirty.
+        second = dict(TARGET, target="test-second-mac", suffix="second-mac")
+        (self.root / "targets/releases.json").write_text(json.dumps([TARGET, second]), encoding="utf-8")
+        ignore = (release.ROOT / ".gitignore").read_text(encoding="utf-8")
+        (self.root / ".gitignore").write_text(ignore + "\n/artifact\n/out/\n", encoding="utf-8")
+        git = ["git", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false",
+               "-c", "core.excludesFile=" + str(self.root / ".git/no-excludes"),
+               "-c", "core.hooksPath=" + str(self.root / ".git/no-hooks"),
+               "-c", "user.name=Release Test", "-c", "user.email=release-test@example.invalid"]
+        for arguments in [["init", "-q"], ["add", "."], ["commit", "-q", "-m", "fixture"]]:
+            subprocess.run(git + arguments, cwd=self.root, check=True, capture_output=True)
+        calls = []
+
+        def compiler(*args):
+            status = subprocess.check_output(git + ["status", "--porcelain", "--untracked-files=all"], cwd=self.root, text=True)
+            self.assertEqual(status, "", "release staging dirtied the source worktree")
+            calls.append(args[1]["target"])
+            return self.artifact(*args)
+
+        with patch.object(release, "checked_output", side_effect=self.checked_output), \
+                patch.object(release, "compile_target", side_effect=compiler):
+            release.build_release(self.root, [TARGET, second], self.output, native=True)
+        self.assertEqual(calls, [TARGET["target"], second["target"]])
 
     def test_success_hashes_binary_and_manifest(self):
         result = self.build()

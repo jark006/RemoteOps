@@ -100,6 +100,7 @@ proxy 暴露 40 个工具。修改名称、参数、默认值、上限或结果�
 
 - 发布版本取自 workspace；协议 v4 的配套发布版本为 2.0.0，跨 v3 升级流程见 `docs/MIGRATING_V2.md`。
 - `targets/releases.json` 是发布目标的唯一矩阵；`buildAll.ps1` 调用 `tools/build_release.py`。发布必须只收集 Cargo 报告的 executable，校验架构/ABI/内嵌构建来源与 SHA-256；任何失败或构建期间源码变化均不得交付完成目录。不得从固定 target 路径回退收集旧文件，不得覆盖已有发布目录。
+- 构建 staging 使用与输出同级的 `.remote-ops-release-*` 目录，必须由 `.gitignore` 忽略，避免 `-Output Releases` 的临时文件使后续 target 被标记为 dirty；Git dirty 检测显式检查未跟踪文件，不受用户 status.showUntrackedFiles 配置影响。
 - 构建源码来源标记由 `crates/build_version.rs` 注入，两个二进制的 `--version` 第二行保留该标记，便于不执行跨平台程序即验证来源。开发构建允许 `unknown`/`development`，发布构建必须匹配本次来源哈希和唯一 build ID。
 
 ```sh

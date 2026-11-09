@@ -146,6 +146,8 @@ python3 tools/verify_agent_update.py --systemd --agent /absolute/agent --proxy /
 
 完整 workspace 测试：Windows 163、Linux 165、Mac 163 项通过，另有需显式指定远端的 live 测试默认 ignored，并已单独在 Mac 上运行通过。三平台 Clippy、fmt、diff 检查通过；发布构建脚本的 11 项安全测试三平台均通过。最终整理只改变验收文档和共享构建文件格式，发布来源标记随最终重建刷新。
 
+根目录交付收尾另补一个真实 Git 仓库回归：第一次 target 的产物进入 staging 后，第二次 target 编译前工作区仍保持干净。staging 统一使用被忽略的 `.remote-ops-release-*` 前缀；Git dirty 检测显式检查未跟踪文件，避免受用户 status.showUntrackedFiles 设置影响。发布安全测试增至 12 项，Windows/Linux 通过；最终产物从修复后的干净提交重建。
+
 发布构建入口为 `buildAll.ps1`/`tools/build_release.py`。实测拒绝了构建期间文档被修改的第一次 smoke build，未留下完成目录；单元测试覆盖 Cargo 报错、未报告 executable、旧来源、错误架构、动态 musl、源码变化和已有输出目录保护。成功矩阵先在 sibling staging 中收集，全部核验后才切换到输出目录；默认是 `Releases/v2.0.0`，本次最终收尾显式使用 `-Output Releases`。已有整个 Releases 目录先移入 `target/validation/` 中唯一命名的备份，不在原目录逐项覆盖旧产物，也不回退到旧 target 文件。
 
 最终产物信息以 `Releases/manifest.json` 为准：记录版本、协议、唯一 build ID、源码 SHA-256 和逐文件哈希、Rust/Nightly/Zig 工具链、每个产物的目标/大小/SHA-256/内嵌 metadata；`Releases/SHA256SUMS` 同时覆盖 manifest。此前中间构建已保留在 `target/validation/release-matrix-trial-v2`，不能与最终目录混用。二进制和本地验收日志继续由 Git 忽略，提交只包含源码、测试与文档。
