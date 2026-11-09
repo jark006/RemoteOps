@@ -599,7 +599,12 @@ fn parse_mount(line: &str) -> Option<Value> {
     let mount_point = decode_mount_field(mount_fields[4]);
     let source = decode_mount_field(filesystem_fields[1]);
     let fs_type = filesystem_fields[0].chars().take(128).collect::<String>();
-    let read_only = mount_fields[5].split(',').any(|option| option == "ro");
+    // A mount can report rw while its underlying superblock is read-only
+    // (for example an embedded squashfs root). Either restriction prevents writes.
+    let read_only = [Some(mount_fields[5]), filesystem_fields.get(2).copied()]
+        .into_iter()
+        .flatten()
+        .any(|options| options.split(',').any(|option| option == "ro"));
     let stats = statvfs(&mount_point);
     Some(json!({
         "source": source,
@@ -740,6 +745,22 @@ mod tests {
         assert_eq!(mount["fs_type"], "ext4");
         assert_eq!(mount["read_only"], true);
         assert!(mount["total_bytes"].is_null());
+    }
+
+    #[test]
+    fn mount_read_only_checks_both_mount_and_superblock_options() {
+        for (mount_options, super_options, expected) in [
+            ("rw,relatime", "ro", true),
+            ("ro,nosuid", "rw", true),
+            ("rw,relatime", "rw", false),
+            ("rw", "rw,errors=remount-ro", false),
+        ] {
+            let line = format!(
+                "14 0 31:2 / /definitely-missing-mount {mount_options} - squashfs /dev/root {super_options}"
+            );
+            let mount = parse_mount(&line).unwrap();
+            assert_eq!(mount["read_only"], expected, "{line}");
+        }
     }
 
     #[test]

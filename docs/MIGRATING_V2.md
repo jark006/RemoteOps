@@ -1,5 +1,7 @@
 # 从 1.x 迁移到 2.0
 
+当前版本为 2.0.1，远端协议保持 v4；已有 2.0.0 且支持 update_receipts 的 Agent 可直接通过 agent_update 升级。2.0.1 修复 Linux mountinfo 的 superblock 只读选项识别，不改变工具输入、输出字段或 wire 格式。
+
 2.0 的 proxy 与 Agent 使用远端协议 v4，拒绝连接 v3。文件内容仍使用二进制 Chunk，不进入 MCP JSON。固定连接值、单管理连接和请求不自动重放的边界保持一致。
 
 ## 安装顺序
@@ -28,4 +30,4 @@
 
 ## 核对发布文件
 
-本次最终交付直接位于 `Releases/` 根目录，使用 `Releases/manifest.json` 和 `Releases/SHA256SUMS` 核对大小、哈希、目标和构建来源。构建器默认的版本子目录布局对应 `Releases/v2.0.0/manifest.json`，以实际输出目录为准。每次构建有独立 build ID，不与其他目录中的旧产物混用。MIPS 文件为小端 MIPS32r2/o32/soft-float 静态 musl；仍需在具体设备上验证内核、指令与固件兼容性。编译和 ABI 校验不能替代真机运行。
+本次最终交付直接位于 `Releases/` 根目录，使用 `Releases/manifest.json` 和 `Releases/SHA256SUMS` 核对大小、哈希、目标和构建来源。构建器默认的版本子目录布局对应 `Releases/v2.0.1/manifest.json`，以实际输出目录为准。每次构建有独立 build ID，不与其他目录中的旧产物混用。MIPS 文件为小端 MIPS32r2/o32/soft-float 静态 musl；仍需在具体设备上验证内核、指令与固件兼容性。编译和 ABI 校验不能替代真机运行。

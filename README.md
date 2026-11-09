@@ -3,7 +3,7 @@
 RemoteOps 是一个面向远程系统维护和嵌入式 Linux 开发的 MCP 工具。
 在 PC 端部署 `remote-ops-proxy` 并配置 MCP，远端设备部署 `remote-ops-agent`，则 PC 端的 Claude Code / Codex 即可远程控制远端设备。
 
-2.0 使用远端协议 v4，连接后可通过 `environment` 发现实际 shell 与工具。工具反馈默认 compact，需要完整诊断时传 `response_mode: "full"`。从 1.x 升级请先阅读 [迁移说明](docs/MIGRATING_V2.md)，proxy 和 Agent 必须配套升级。
+2.0.1 使用远端协议 v4，修复嵌入式 Linux 只读文件系统被误报为可写的问题，可从 2.0.0 通过 `agent_update` 升级。连接后可通过 `environment` 发现实际 shell 与工具。工具反馈默认 compact，需要完整诊断时传 `response_mode: "full"`。从 1.x 升级请先阅读 [迁移说明](docs/MIGRATING_V2.md)，proxy 和 Agent 必须配套升级。MIPS 真机验证见 [验收记录](docs/MIPS_VALIDATION.md)。
 
 ```text
 Claude Code / Codex
@@ -253,6 +253,8 @@ proxy 单行 MCP 请求最多 40 MiB，响应最多 128 MiB。超长或非法 UT
 
 脚本上限 256 KiB UTF-8，cmd 另限 8,000 个 UTF-16 单元；cwd 最多 4 KiB，env 最多 128 项且键值总计 64 KiB。超过 8 KiB 的 POSIX 脚本和 PowerShell 脚本通过临时文件执行并自动清理，以绕过命令行长度限制；短 POSIX 命令无需可写临时目录。shell 固定关闭 profile/交互启动钩子；PowerShell 使用 UTF-8 BOM 脚本并设置 UTF-8 输出。原生程序、cmd 和外部子程序输出按有损 UTF-8 解码，不自动推断代码页。stdin 固定关闭；需要长时间运行的程序仍使用 `process_start`。
 
+Linux `system_info` 的文件系统 `read_only` 同时考虑挂载点与底层文件系统限制；任一为只读时都报告 `true`，包括挂载点显示 `rw`、squashfs superblock 显示 `ro` 的嵌入式系统。
+
 ## 🔒 传输协议和安全边界
 
 - 当前远端协议版本为 4；协议版本不一致时握手失败，不进行兼容降级。v4 增加 environment、显式 shell/cwd/env 请求和实际解释器反馈，保留 v3 的续传、mode、目录 manifest 与部署事务。
@@ -308,9 +310,9 @@ rustup toolchain install nightly --component rust-src
 
 ### 4. 编译
 
-安装 Python 3.9+ 后，使用统一发布入口；Windows 包装脚本需要 PowerShell 7.2+。所有目标成功并通过校验后，才会出现 `Releases/v2.0.0/`。已有输出目录会被拒绝，旧版 `Releases/` 文件不会被覆盖。
+安装 Python 3.9+ 后，使用统一发布入口；Windows 包装脚本需要 PowerShell 7.2+。所有目标成功并通过校验后，才会出现 `Releases/v2.0.1/`。已有输出目录会被拒绝，旧版 `Releases/` 文件不会被覆盖。
 
-需要将产物直接放在 `Releases/` 根目录时，先将现有目录移到备份，再使用 `./buildAll.ps1 -Output Releases`（或 `python3 tools/build_release.py --output Releases`）。本次 2.0 最终交付采用这一布局，清单位于 `Releases/manifest.json`。先提交源码再构建，可使版本信息关联干净的 Git 提交。
+需要将产物直接放在 `Releases/` 根目录时，先将现有目录移到备份，再使用 `./buildAll.ps1 -Output Releases`（或 `python3 tools/build_release.py --output Releases`）。本次 2.0.1 交付采用这一布局，清单位于 `Releases/manifest.json`。先提交源码再构建，可使版本信息关联干净的 Git 提交。
 
 ```powershell
 pwsh -File ./buildAll.ps1

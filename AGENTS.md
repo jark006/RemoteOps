@@ -62,6 +62,7 @@ proxy 暴露 40 个工具。修改名称、参数、默认值、上限或结果�
 - 当 JSON 转义会超出帧预算时，read_text 返回更短前缀并推进 next_offset，read_file_lines 在完整行边界停止并返回 next_line，tail_text 保留可编码的末尾且保留 CRLF/LF/末尾换行，前台命令缩短保留前缀并设置对应 truncated。后台 process_output 可返回更短片段，next_*_cursor 必须只推进实际返回原始字节，不能丢弃尚未读取的保留输出。无法分页的超大结果返回 response_too_large；该状态表示操作可能已完成，不能当作未执行。
 - read_text/tail_text/file_hash 与 read_file_lines 一样拒绝目录、符号链接和特殊文件；Unix 打开使用 O_NOFOLLOW/O_NONBLOCK 并复核普通文件，避免 FIFO 阻塞。file_hash 还必须防止扫描期间文件增长突破 max_bytes。下载在任何失败路径上，未启用 resume 时清理新建普通 partial；拒绝的既有 symlink/special partial 必须保持原样。
 - `system_info` 保留主机、内核、运行时间、负载、内存、系统盘和温度字段，并返回 `os`、`cpu`、`identity`、`network`、`filesystems`、`time`、`init_system`、`toolchains`。Linux 必须有界解析 os-release、CPU/ABI/libc、用户组/umask/capabilities、网卡/IP/路由/DNS/监听端口、mount/文件系统/inode/只读状态、系统时间/时区/init 和 PATH 中的固定工具清单；不得执行外部诊断命令。网卡最多 128 个、地址最多 512 个、路由最多 256 条、监听端口最多 512 个、mount 最多 256 个、工具链最多 24 个，各集合必须报告 `available` 和 `truncated`。
+- Linux `filesystems.mounts[].read_only` 必须同时检查 mountinfo 的挂载点选项和 superblock 选项，任一包含独立的 `ro` 即为只读；嵌入式 squashfs 可出现挂载点 `rw`、superblock `ro`，不得报告可写。
 - `process_start` 不经过 shell，stdin 固定为空；后台任务默认超时 1 小时、最大 24 小时，同时最多保留 16 个。任务属于 agent 进程而非单个连接，可在 proxy 断线重连后继续查询，但不跨 agent 进程重启持久化。达到上限时先回收最早结束的任务；若全部仍在运行则拒绝启动。
 - 后台任务 stdout/stderr 各保留最近 256 KiB。`process_output` 使用绝对字节游标，每路默认返回 64 KiB、最多 256 KiB；游标落后于保留窗口时必须报告截断及最早可用游标。`process_wait` 默认等待 10 秒、最长 30 秒；`process_close` 只释放已结束任务，运行中的任务必须先 signal 并 wait。
 - `agent_info` 必须返回 Agent 版本、协议版本、构建 target/profile/Git revision、运行实例 ID/PID/启动时间、平台、支持操作、能力、限制和自更新路径；启动时间和 uptime 必须自进程启动起算（服务启动路径显式初始化运行身份），不得延迟到首次查询。构建信息由 `crates/agent/build.rs` 注入；自检信息必须保持有界且可机器读取。
@@ -98,7 +99,7 @@ proxy 暴露 40 个工具。修改名称、参数、默认值、上限或结果�
 
 ## 验证命令
 
-- 发布版本取自 workspace；协议 v4 的配套发布版本为 2.0.0，跨 v3 升级流程见 `docs/MIGRATING_V2.md`。
+- 发布版本取自 workspace；当前配套发布版本为 2.0.1，远端协议保持 v4，支持从 2.0.0 通过 agent_update 升级；跨 v3 升级流程见 `docs/MIGRATING_V2.md`。
 - `targets/releases.json` 是发布目标的唯一矩阵；`buildAll.ps1` 调用 `tools/build_release.py`。发布必须只收集 Cargo 报告的 executable，校验架构/ABI/内嵌构建来源与 SHA-256；任何失败或构建期间源码变化均不得交付完成目录。不得从固定 target 路径回退收集旧文件，不得覆盖已有发布目录。
 - 构建 staging 使用与输出同级的 `.remote-ops-release-*` 目录，必须由 `.gitignore` 忽略，避免 `-Output Releases` 的临时文件使后续 target 被标记为 dirty；Git dirty 检测显式检查未跟踪文件，不受用户 status.showUntrackedFiles 配置影响。
 - 构建源码来源标记由 `crates/build_version.rs` 注入，两个二进制的 `--version` 第二行保留该标记，便于不执行跨平台程序即验证来源。开发构建允许 `unknown`/`development`，发布构建必须匹配本次来源哈希和唯一 build ID。
