@@ -1,35 +1,51 @@
-# 从 1.x 迁移到 2.0
+# 升级与版本迁移
 
-当前版本为 2.0.1，远端协议保持 v4；已有 2.0.0 且支持 update_receipts 的 Agent 可直接通过 agent_update 升级。2.0.1 修复 Linux mountinfo 的 superblock 只读选项识别，不改变工具输入、输出字段或 wire 格式。
+当前版本系列为 2.x，远端协议 v4。常规更新步骤见[运维指南](OPERATIONS.md#更新-agent)。升级前保留旧程序、服务配置和可用维护入口。
 
-2.0.1 同时修复 Linux 更新 helper 等待未回收 zombie 进程超时的问题。首次从 2.0.0 升级仍使用旧 helper：若 Agent 是交互式 shell 的前台任务，shell 停在输入状态时可能不及时 reap，需先确保由能 wait/reap 的启动者运行（例如 systemd，或后台包装 shell 执行 `agent & wait $!`）。若回执为 unconfirmed，detail 指出旧 PID 未退出且进程实际是 Z，检查恢复路径并通过现有维护入口重启旧 Agent 后再完成迁移；不要把超时当作候选已安装，也不要盲目重复更新。2.0.1 helper 在有界 procfs 读取中将 Z/X/x 识别为已退出，procfs 不可读取时仍保守探测。
+## 先判断升级方式
 
-2.0 的 proxy 与 Agent 使用远端协议 v4，拒绝连接 v3。文件内容仍使用二进制 Chunk，不进入 MCP JSON。固定连接值、单管理连接和请求不自动重放的边界保持一致。
+| 当前设备 | 升级方式 |
+| --- | --- |
+| 1.x / 协议 v3 | 手动切换 Agent，再换配套 proxy；新版 proxy 无法连旧协议编排升级 |
+| 早期 v4 测试版，无 update_receipts | 手动安装正式配套版本 |
+| 正式 2.0.0 / v4 | 可用 agent_update；Linux 首次更新先检查下文的父进程回收条件 |
+| 2.0.1 / v4 | 按常规自更新流程，匹配 build.target 并检查最终回执 |
 
-## 安装顺序
+程序版本号、协议与能力以实际 `agent_info` full 或设备上的 `--self-check` 为准；不靠文件名判断。
 
-1. 保留可用的旧版 proxy/Agent 及服务配置。用旧版 proxy 上传 2.0 Agent 到独立路径，不覆盖正在运行的程序。
-2. 先用独立监听端口启动新 Agent；使用 2.0 proxy 的 `--remote IPv4:PORT` 验证 `remote_probe`、`environment` 和所需工具。
-3. 在维护窗口切换服务使用的 Agent，再切换 MCP 客户端配置中的 proxy 路径并重启客户端。Linux systemd 单元沿用 `deploy/remote-ops-agent.service` 的 `KillMode=process`、`Restart=on-failure`。
-4. 确认连接和任务正常后再停用旧服务。升级失败时恢复原服务与配套旧 proxy。
+## 从 v3 手动迁移
 
-跨 v3→v4 不能由新版 `agent_update` 编排：握手会先拒绝旧协议。后续 v4 内更新还要求 Agent 报告 `update_receipts`；阶段早期测试版 v4 未提供该能力时，也需要先手动切换到正式 2.0。不要以候选进程短暂上线作为更新成功证据，应检查关联本次尝试的最终回执。
+1. 用 SSH/SCP 或仍可连接旧 Agent 的旧版 proxy，将新版 Agent 上传到独立路径。按设备架构选择文件，设置执行权限并运行 --self-check。
+2. 在独立端口试运行候选，用新版 proxy 的 --remote 连接，验证 remote_probe、environment 和业务所需工具。
+3. 在维护窗口停止旧服务，备份并切换实际安装路径，启动原服务。systemd 使用仓库单元的 KillMode=process、Restart=on-failure；不要让临时 Agent 与服务抢同一端口。
+4. 替换电脑上的 proxy，重新加载 MCP 客户端，确认版本与设备状态。失败时恢复旧程序和配套旧 proxy。
 
-## 调用变化
+v4 不兼容降级连接 v3。不能先换掉唯一可用的旧 proxy，再指望新版 agent_update 上传跨协议候选。
 
-| 范围 | 2.0 行为 | 调用方调整 |
-| --- | --- | --- |
-| 响应 | 默认 compact；省略字段见 `_response.omitted_fields` | 依赖完整诊断分支时传 `response_mode: "full"`，或 proxy 启动参数 `--response-mode full` |
-| Windows `sh_exec` | native 优先 PowerShell 7，再选 5.1 | 既有 Bash 脚本显式传 `shell: "git_bash"`；cmd 脚本传 `shell: "cmd"` |
-| Unix `sh_exec` | native 使用 sh，可显式选 bash/BusyBox/pwsh | 先查询 `environment`，不要按 Linux 名称猜测 shell、systemd 或 BusyBox applet |
-| shell 运行上下文 | 支持 cwd/env；返回实际解释器 | 使用结构化参数传上下文，长任务使用 `process_start` |
-| `pids` | 有界分页、扫描及命令行可用性元数据 | 沿 next_cursor 继续；filter_incomplete 时不把空结果当作确定无匹配 |
-| 错误 | source/outcome/request_started/prior_requests，必要时 recovery | outcome=unknown 的操作不能自动重放，先检查远端状态和恢复路径 |
-| `batch` | 全部预检后顺序执行，错误后可能跳过后项 | 查看每项 ok/error；遇状态不确定、busy、协议或输出上限错误后，后项为 not_executed |
-| 更新/发布/同步 | 结构化事务状态、回滚与持久性信息 | 区分 committed/durable、rolled_back/rollback_failed，保留未确认的恢复文件供检查 |
+## 2.0.0 的首次 Linux 自更新
 
-`batch` 的 exec/sh_exec 仍能产生副作用，“诊断工具集合”不保证调用只读。工具发现使用统一注册表并提供注解；真正的平台支持和可执行程序以 Agent 返回的信息及实际调用结果为准。
+2.0.0 helper 用 kill(pid,0) 判断旧 Agent 是否退出。若它由停在输入状态的 BusyBox 交互式 shell 启动，退出后可能保持 zombie，导致 helper 超时退出、Agent 端口不再监听。首次升级执行的仍是旧 helper，新候选包含修复也不能提前改变它。
 
-## 核对发布文件
+迁移前确认 Agent 由可回收子进程的启动者运行，例如合规 systemd 单元，或运维指南中的 `agent & child=$!; wait "$child"` 包装 shell。先结束已有后台任务，保留其他维护入口。
 
-本次最终交付直接位于 `Releases/` 根目录，使用 `Releases/manifest.json` 和 `Releases/SHA256SUMS` 核对大小、哈希、目标和构建来源。构建器默认的版本子目录布局对应 `Releases/v2.0.1/manifest.json`，以实际输出目录为准。每次构建有独立 build ID，不与其他目录中的旧产物混用。MIPS 文件为小端 MIPS32r2/o32/soft-float 静态 musl；仍需在具体设备上验证内核、指令与固件兼容性。编译和 ABI 校验不能替代真机运行。
+如果出现 status=timed_out/unconfirmed，回执 detail 为旧 PID 未退出：
+
+1. 从维护终端检查回执、manifest、进程状态和候选/目标，确认旧进程是否为 Z；不要直接重复 agent_update。
+2. 若目标仍是旧程序且 helper 已退出，可恢复旧 Agent 并使启动者正确 wait，再核实恢复路径后重试迁移。未确认的恢复文件先保留。
+3. 2.0.1 helper 会有界识别 Linux Z/X/x，后续更新不再被这种未回收 PID 阻塞；procfs 不可读时保守退回存活探测。
+
+实际问题和验证记录见[MIPS 真机验证](MIPS_VALIDATION.md)。
+
+## 调用方需要调整的行为
+
+| 范围 | 2.x 行为与调整 |
+| --- | --- |
+| 反馈 | 默认 compact；需要网络/文件系统、build/limits/update 等分支时传 response_mode=full，省略字段见 _response.omitted_fields |
+| Windows 脚本 | native 优先 PowerShell 7 再选 5.1；旧 Bash 脚本显式指定 git_bash，cmd 脚本指定 cmd |
+| Unix 环境 | 先查 environment，再决定 sh/bash/BusyBox、服务管理方式；文件存在不证明实际可运行 |
+| 进程枚举 | 跟随 pids.next_cursor，检查 cmdline_available/cmdline_truncated 和 scan.filter_incomplete |
+| 错误恢复 | 按 source/outcome/request_started/prior_requests/recovery 处理；unknown 不能自动重放 |
+| batch | 全部预检后顺序执行，检查每项 ok/error；不确定错误后项为 not_executed，命令仍可修改状态 |
+| 同步/发布/更新 | 检查 committed/durable、rolled_back/rollback_failed、以及关联本次更新的最终回执 |
+
+2.0.1 修复 Linux 只读 superblock 识别和 zombie 等待，不改变工具输入、结果字段或 v4 wire 格式。工具详情见[工具参考](TOOLS.md)，升级产物核对见[运维指南](OPERATIONS.md#选择下载文件)。

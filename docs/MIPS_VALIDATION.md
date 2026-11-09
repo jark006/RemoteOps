@@ -1,41 +1,54 @@
-# MIPS 真机验收（2026-11-09）
+# MIPS 真机验证与 2.0.1 修复
 
-以下记录的是 2.0.0 运行期间的故障定位与独立副本修复验证。该修复正式纳入 2.0.1，协议保持 v4；2.0.1 全平台产物通过校验后，使用 agent_update 更新设备原安装路径。正式升级结果以 helper 最终回执、设备版本/实例/二进制哈希以及根文件系统 read_only=true 为验收依据。
+验证日期：2026-11-09。本文保留可复现的问题、修复依据与运行边界，不记录现场账号、设备地址或临时进程标识。
 
-设备为 `192.168.43.192:8022`，Ingenic XBurst、小端 MIPS、Linux 4.4.94、BusyBox 1.22.1，物理内存约 59,124 KiB。Agent 2.0.0 / protocol v4，原提交 e08b6d1b7d1b。PID 1 为 linuxrc/BusyBox init，检测到 sh 和 BusyBox，无 systemd/Python；根目录是 squashfs，`/tmp` 为 tmpfs，`/system` 为可写 jffs2。
+## 设备与覆盖范围
 
-通过本会话已注册的新版 RemoteOps 真实调用 150 次，覆盖全部 40 个工具，72 项断言通过。测试范围包括 UTF-8/BOM/CRLF 读取、按字节/行分页、tail、补丁及哈希冲突、目录分页/正则搜索、文件变更、mode/符号链接/特殊文件拒绝、BusyBox applet 实际执行、长脚本、cwd/env、退出码、超时、前后台输出上限/游标、pids/process_info/kill/pkill、跨 Chunk 二进制传输、前缀校验续传/安全回退、增量目录同步、发布成功/健康失败回滚/停止失败、连接复用/同地址重连及生命周期等待。
+Ingenic XBurst，小端 MIPS32r2/o32/soft-float，Linux 4.4.94，BusyBox 1.22.1，内存约 58 MiB（59,124 KiB）。PID 1 为 linuxrc/BusyBox init；只有 sh/BusyBox，无 systemd/Python。根目录 squashfs，`/tmp` 为 tmpfs，安装分区为可写 jffs2。
 
-三个 300,000 字节下载文件（普通、正确前缀续传、错误前缀回退）在 PC 端复核 SHA-256，均为 `3c65ea93424a9c362fec0e3a69ea36031e8a358441479dd665cc6110eabe7b08`。BusyBox 实际缺少 mkfifo/head applet，测试通过已确认存在的 mknod p、dd 等调整夹具，没有把 BusyBox 文件存在当作所有 applet 可用的保证。
+原 2.0.0（e08b6d1）通过已注册 RemoteOps 完成 150 次调用，覆盖全部 40 工具、72 项断言：
 
-## 发现并修复的问题
+- 文本/BOM/CRLF、分页、tail、补丁冲突、搜索、文件类型/mode/符号链接。
+- BusyBox shell/cwd/env、长脚本、进程信息/kill/pkill、前后台超时与输出窗口、断线重连。
+- 多 Chunk 二进制上传下载、正确前缀续传、错误前缀回退、仅变化文件同步。
+- Unix 发布成功、stop 失败、健康失败回滚；独立副本更新、启动失败回滚和实例切换。
 
-设备 `/proc/self/mountinfo` 根条目为：
+三份 300,000 字节文件在 PC 上重算 SHA-256 一致。BusyBox 缺 mkfifo/head applet，夹具按实际能力改用 mknod p、dd；不能因 BusyBox 存在就假设所有 applet 可用。
+
+## 只读 squashfs 被误报为可写
+
+设备 mountinfo 根条目为：
 
 ```text
 14 0 31:2 / / rw,relatime - squashfs /dev/root ro
 ```
 
-旧实现只检查挂载点选项，导致 `system_info.filesystems.mounts[].read_only=false`。现在同时检查挂载点和 superblock 选项，任一包含独立 `ro` 即报告只读；`errors=remount-ro` 不误判。增加挂载点/superblock 四种组合的回归测试，未修改工具参数、输出字段或 wire 协议。
+挂载点是 rw，但 superblock 为 ro。旧代码只检查前者，报告 `read_only=false`。2.0.1 同时检查两个选项集合，任一包含独立 ro 即为只读；`errors=remount-ro` 不误判。
 
-Linux workspace 166 项测试通过、1 项需指定独立远端的 live 用例默认 ignored；Linux Clippy、fmt、diff 检查通过。修复版使用 Nightly/build-std 构建 MIPS32r2/o32/soft-float 静态 musl，并通过构建器的 ABI、内嵌来源与哈希校验。
+回归覆盖挂载点/superblock 的四种组合。修复在临时 MIPS 副本上验证 `system_info` 根目录 read_only=true，随后自动更新/回滚后仍正确。
 
-测试产物位于 `target/validation/live-tools-20261109/mips-mount-fix/`，Agent SHA-256 为 `9db602fc92c2a5c27df046d02056375e96f5b38e67c6b6224420ad16347dfc77`，构建源码快照 SHA-256 为 `fbf26948c1a10dc3b3d31e4635628745f19b5bbb1fab517a6c5600b5e8e9f62e`。该来源快照包含修复代码和当时文档，不包含随后新增的本验收记录；正式 `Releases/` 未修改。
+## 自更新被未回收 zombie 阻塞
 
-在 `/tmp/remote-ops-full-20261109-mips-2ddfbaba` 中创建独立 Agent 副本和 18404 临时端口：原版副本通过 agent_update 更新到修复版，helper 最终回执和实例关联正确，真机 `system_info` 报告根只读。随后真实重启独立副本，验证 offline_then_online；再上传通过 self-check 但退出 37 的 shell 候选，验证自动回滚到修复版、回执 rolled_back、恢复后系统信息仍正确。
+正式安装升级时，原 Agent 退出后，交互式 BusyBox shell 尚未 wait。helper 仅用 kill(pid,0) 判断存活，对 Z 状态仍成功，于是返回 unconfirmed，未开始替换。设备业务与维护入口仍在线，旧程序和候选均完整保留。
 
-## 清理与边界
+通过已有维护入口恢复旧 Agent，先让其由能 wait/reap 的包装 shell 启动。2.0.1 修复为有界读取 `/proc/<pid>/stat`，Z/X/x 视为已退出；活进程继续阻止替换，procfs 不可读时保守退回存活探测。
 
-所有测试目录已删除，8 个后台任务均已 wait/close，未残留匹配测试路径的进程。`/tmp` 使用量从测试中约 7,380 KiB 恢复至 428 KiB，可用内存约 35,408 KiB。原 `/system/remote-ops-agent` 保持 PID 878、实例 `2ddfbabac17b90cc463d6ef1e6ad9c71`，未替换；因此原服务仍有上述只读信息误报，修复已在临时副本验证。
+验证包括真实子进程退出但不 wait 的 Linux 单测，以及：
 
-未执行设备的真实 root reboot，只测试参数越界拒绝。此次真机内核为 4.4.94，不能据此承诺其他内核（例如 3.10.14）或固件上的行为。机器可读用例、调用记录及构建/回归日志位于 `target/validation/live-tools-20261109/` 的 mips 相关文件。
+```sh
+python3 tools/verify_agent_update.py --defer-reap --agent /path/to/agent --proxy /path/to/proxy
+```
 
-## 2.0.1 正式升级中发现的退出检测问题
+脚本完整更新并取得最终回执后，确认旧 PID 为 Z 才回收；随后继续测试候选启动失败回滚。普通、自延迟回收和 systemd 更新/回滚均有执行记录。旧版首次迁移条件见[迁移说明](MIGRATING_V2.md)。
 
-首次正式更新时，原 Agent PID 878 已退出但父进程是停在输入状态的 BusyBox 交互式 shell，未及时 wait。helper 的 kill(pid,0) 对 Z 状态仍返回成功，最终回执为 unconfirmed，detail 为旧 PID 未退出；替换尚未开始，原文件和候选均完整保留。设备 Telnet 与业务端口持续可达，通过现有维护入口恢复旧 Agent 并由包装 shell wait/reap，恢复 RemoteOps 通道。
+## 最终发布与安装结果
 
-2.0.1 追加修复：Linux 存活检测有界读取 `/proc/<pid>/stat`，Z/X/x 状态视为已退出；真实运行进程继续阻止 helper 替换，不可读取 procfs 时保守退回 kill 探测。增加真实子进程退出但刻意不 wait 的 Linux 回归，确认 PID 仍存在时 helper 等待即可完成。旧版 helper 的首次迁移限制见迁移说明，后续更新由修复版处理。
+2.0.1 最终提交为 e5fb0e1，协议 v4；11 目标、21 个文件从干净提交构建并独立核验。Linux workspace 167 项测试通过，Windows 163 项；两端 Clippy、三项 musl 检查、发布脚本 12 项测试通过。
 
-`tools/verify_agent_update.py --defer-reap` 在 Linux 上故意延迟回收旧 Agent，直到完整 agent_update 成功且收到最终回执后才 wait；同时验证当时 `/proc/<pid>/stat` 为 Z，随后仍执行候选启动失败回滚。该入口避免测试夹具提前回收进程掩盖实际故障。
+设备实际安装路径 `/system/remote-ops-agent` 已成功从 2.0.0 升级至 2.0.1，最终回执 updated，前实例/attempt/候选哈希匹配；新实例上线、安装文件哈希与发布清单一致、根只读状态正确。MIPS 最终产物 SHA-256 为 `d004ef0f3d05432773716a05ec60663806218e331723a8926ea7cb90674c3366`，build ID 为 `2bd31179c0064b6085b558671c03203f`。后续产物应查自身 manifest，不能复用这份历史哈希。
 
-追加修复的 Linux workspace 167 项测试通过；Linux/Windows Clippy、三项 Linux musl 交叉检查、fmt/diff 检查和发布脚本 12 项测试通过。独立 Linux release 产物的 --defer-reap 实测同时通过 updated-identical-binary、updated-with-unreaped-parent 和 startup-failure-rolled-back 三种情形。
+## 清理与未测范围
+
+测试目录、8 个后台测试任务和更新 helper/候选/回滚临时文件已清理，安装目录保留最终回执。恢复连接时产生过少量 tmpfs 日志；未修改设备的启动脚本、账号、网络、防火墙或业务程序。
+
+未执行 root 设备真实 reboot，仅测试参数拒绝。当前设备的 Linux 4.4.94 证据不能推广到 3.10.14 或其他固件。后续兼容性验证采用[构建与验证](BUILDING.md#平台实测)的独立目录和端口，正式替换设备程序需明确授权。
