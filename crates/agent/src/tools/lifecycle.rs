@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -64,12 +66,29 @@ pub const SUPPORTED_OPERATIONS: &[&str] = &[
     "process_signal",
     "process_close",
     "system_info",
+    "environment",
     "agent_info",
     "reboot",
     "agent_update_prepare",
     "upload_file",
     "download_file",
 ];
+
+fn supported_operations() -> Vec<&'static str> {
+    SUPPORTED_OPERATIONS
+        .iter()
+        .copied()
+        .filter(|operation| match *operation {
+            "chmod" | "deploy_preflight" | "deploy_activate" => cfg!(unix),
+            "reboot" => reboot_supported(),
+            "sh_exec" | "environment" => cfg!(any(unix, windows)),
+            "system_info" | "pids" | "process_info" | "kill" | "pkill" => {
+                cfg!(any(target_os = "linux", target_os = "macos", windows))
+            }
+            _ => true,
+        })
+        .collect()
+}
 
 struct RuntimeIdentity {
     instance_id: String,
@@ -115,6 +134,72 @@ struct UpdateManifest {
     // restarted Agent back to that unit so the final process stays supervised.
     #[serde(default)]
     unit: Option<String>,
+    #[serde(default)]
+    attempt_id: Option<String>,
+    #[serde(default)]
+    candidate_sha256: Option<String>,
+    #[serde(default)]
+    previous_instance_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateReceipt {
+    attempt_id: String,
+    candidate_sha256: String,
+    previous_instance_id: String,
+    status: String,
+    completed_at_ms: u64,
+    detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<Value>,
+}
+
+fn update_receipt_path(target: &Path) -> PathBuf {
+    sibling_with_suffix(target, ".update-result.json")
+}
+
+fn last_update_receipt(target: &Path) -> Option<Value> {
+    let (file, _) = super::files::ensure_regular_file(&update_receipt_path(target)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 16 * 1024 {
+        return None;
+    }
+    let receipt: UpdateReceipt = serde_json::from_slice(&bytes).ok()?;
+    serde_json::to_value(receipt).ok()
+}
+
+fn write_update_receipt(
+    manifest: &UpdateManifest,
+    status: &str,
+    detail: Option<String>,
+) -> Result<(), String> {
+    let (Some(attempt), Some(hash), Some(previous)) = (
+        &manifest.attempt_id,
+        &manifest.candidate_sha256,
+        &manifest.previous_instance_id,
+    ) else {
+        return Ok(());
+    };
+    let receipt = UpdateReceipt {
+        attempt_id: attempt.clone(),
+        candidate_sha256: hash.clone(),
+        previous_instance_id: previous.clone(),
+        status: status.into(),
+        completed_at_ms: unix_time_ms(),
+        detail: detail.map(|detail| detail.chars().take(2048).collect()),
+        recovery:matches!(status,"rollback_failed"|"unconfirmed").then(||json!({"target_path":manifest.target,"backup_path":manifest.backup,"staging_path":manifest.staged,"failed_path":manifest.failed,"helper_path":manifest.helper})),
+    };
+    let target = update_receipt_path(&manifest.target);
+    let parent = target.parent().unwrap_or(Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut temp, &receipt).map_err(|error| error.to_string())?;
+    temp.flush()
+        .and_then(|_| temp.as_file().sync_all())
+        .map_err(|error| error.to_string())?;
+    super::files::persist_path_replace(temp.path(), &target, true)
+        .map_err(|error| error.to_string())
 }
 
 // The updater starts the candidate Agent directly to verify it before committing.
@@ -124,7 +209,10 @@ struct UpdateManifest {
 fn systemd_unit_of_self() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        let contents = fs::read_to_string("/proc/self/cgroup").ok()?;
+        let (contents, truncated) = super::system::bounded_text("/proc/self/cgroup", 64 * 1024)?;
+        if truncated {
+            return None;
+        }
         parse_systemd_unit(&contents)
     }
     #[cfg(not(target_os = "linux"))]
@@ -139,7 +227,13 @@ fn parse_systemd_unit(cgroup_contents: &str) -> Option<String> {
     cgroup_contents
         .lines()
         .flat_map(|line| line.rsplit(':').next().unwrap_or("").split('/'))
-        .find(|part| part.len() > ".service".len() && part.ends_with(".service"))
+        .find(|part| {
+            part.len() > ".service".len()
+                && part.len() <= 256
+                && !part.starts_with('-')
+                && !part.contains('\0')
+                && part.ends_with(".service")
+        })
         .map(str::to_string)
 }
 
@@ -174,7 +268,7 @@ pub fn agent_info(max_transfer_bytes: u64) -> Value {
             "arch": std::env::consts::ARCH,
             "family": std::env::consts::FAMILY
         },
-        "supported_operations": SUPPORTED_OPERATIONS,
+        "supported_operations": supported_operations(),
         "capabilities": {
             "background_processes": true,
             "incremental_output": true,
@@ -184,7 +278,11 @@ pub fn agent_info(max_transfer_bytes: u64) -> Value {
             "self_update": executable.is_some() && staging.is_some(),
             "resumable_transfers": true,
             "directory_sync": true,
-            "release_deployment": cfg!(unix)
+            "release_deployment": cfg!(unix),
+            "unix_mode": cfg!(unix),
+            "shell_selection": cfg!(any(unix, windows)),
+            "environment_profile": cfg!(any(unix, windows)),
+            "update_receipts":true
         },
         "limits": {
             "max_control_bytes": DEFAULT_MAX_CONTROL_BYTES,
@@ -211,7 +309,8 @@ pub fn agent_info(max_transfer_bytes: u64) -> Value {
         "update": {
             "executable_path": executable.as_ref().map(|path| path.to_string_lossy().into_owned()),
             "staging_path": staging.as_ref().map(|path| path.to_string_lossy().into_owned()),
-            "self_check_timeout_ms": SELF_CHECK_TIMEOUT_MS
+            "self_check_timeout_ms": SELF_CHECK_TIMEOUT_MS,
+            "last_result":executable.as_deref().and_then(last_update_receipt)
         }
     })
 }
@@ -325,6 +424,9 @@ fn prepare_agent_update_inner(
             "update candidate name, protocol version, or build target is incompatible",
         ));
     }
+    if let Some(unit) = systemd_unit_of_self() {
+        validate_supervisor(&unit)?;
+    }
 
     let suffix = format!(
         "{}-{}-{}",
@@ -340,7 +442,10 @@ fn prepare_agent_update_inner(
     fs::copy(target, &helper).map_err(|error| {
         AgentError::io(format!("copy update helper {}", helper.display()), error)
     })?;
-    copy_executable_permissions(target, &helper)?;
+    if let Err(error) = copy_executable_permissions(target, &helper) {
+        let _ = fs::remove_file(&helper);
+        return Err(error);
+    }
 
     let manifest = UpdateManifest {
         parent_pid: std::process::id(),
@@ -352,10 +457,20 @@ fn prepare_agent_update_inner(
         helper: helper.clone(),
         restart_args: restart_args.to_vec(),
         unit: systemd_unit_of_self(),
+        attempt_id: Some(suffix.clone()),
+        candidate_sha256: Some(actual_sha256.clone()),
+        previous_instance_id: Some(RUNTIME_IDENTITY.instance_id.clone()),
     };
     if let Err(error) = write_manifest(&manifest_path, &manifest) {
         let _ = fs::remove_file(&helper);
         return Err(error);
+    }
+    if let Err(error) = write_update_receipt(&manifest, "pending", None) {
+        let _ = fs::remove_file(&manifest_path);
+        let _ = fs::remove_file(&helper);
+        return Err(AgentError::command(format!(
+            "write update receipt: {error}"
+        )));
     }
     let spawn = Command::new(&helper)
         .arg("--update-helper")
@@ -365,6 +480,11 @@ fn prepare_agent_update_inner(
         .stderr(Stdio::null())
         .spawn();
     if let Err(error) = spawn {
+        let _ = write_update_receipt(
+            &manifest,
+            "unconfirmed",
+            Some(format!("start helper: {error}")),
+        );
         let _ = fs::remove_file(&manifest_path);
         let _ = fs::remove_file(&helper);
         return Err(AgentError::io("start update helper", error));
@@ -372,24 +492,44 @@ fn prepare_agent_update_inner(
 
     Ok(json!({
         "accepted": true,
+        "attempt_id":suffix,
         "restart_required": true,
         "previous_instance_id": RUNTIME_IDENTITY.instance_id,
         "candidate": candidate,
         "bytes_staged": metadata.len(),
         "sha256": actual_sha256,
         "staging_path": staged.to_string_lossy(),
+        "recovery":{"target_path":manifest.target,"backup_path":manifest.backup,"failed_path":manifest.failed,"manifest_path":manifest_path,"helper_path":manifest.helper,"receipt_path":update_receipt_path(&manifest.target)},
         "prepared_at_ms": unix_time_ms()
     }))
 }
 
 pub fn run_update_helper(manifest_path: &Path) -> Result<(), String> {
-    let manifest_bytes = fs::read(manifest_path)
-        .map_err(|error| format!("read update manifest {}: {error}", manifest_path.display()))?;
+    let (file, _) =
+        super::files::ensure_regular_file(manifest_path).map_err(|error| error.to_string())?;
+    let mut manifest_bytes = Vec::new();
+    file.take(64 * 1024 + 1)
+        .read_to_end(&mut manifest_bytes)
+        .map_err(|error| error.to_string())?;
+    if manifest_bytes.len() > 64 * 1024 {
+        return Err("update manifest exceeds 64 KiB".into());
+    }
     let manifest: UpdateManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("parse update manifest: {error}"))?;
-    wait_for_parent_exit(manifest.parent_pid)?;
+    if let Err(error) = wait_for_parent_exit(manifest.parent_pid) {
+        let _ = write_update_receipt(&manifest, "unconfirmed", Some(error.clone()));
+        return Err(error);
+    }
     let result = apply_update(manifest_path, &manifest);
-    if result.is_err() {
+    let status = if result.is_ok() {
+        "updated"
+    } else if manifest.backup.exists() {
+        "rollback_failed"
+    } else {
+        "rolled_back"
+    };
+    write_update_receipt(&manifest, status, result.as_ref().err().cloned())?;
+    if result.is_err() && !manifest.backup.exists() {
         let _ = fs::remove_file(&manifest.staged);
         let _ = fs::remove_file(&manifest.health);
         let _ = fs::remove_file(manifest_path);
@@ -438,13 +578,40 @@ pub fn schedule_cleanup(paths: Vec<PathBuf>) {
 }
 
 fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), String> {
+    if fs::symlink_metadata(&manifest.backup).is_ok()
+        || fs::symlink_metadata(&manifest.failed).is_ok()
+    {
+        restart_agent(manifest);
+        return Err("update recovery paths already exist; refusing to overwrite them".into());
+    }
+    if let Some(expected) = &manifest.candidate_sha256 {
+        let actual = sha256_file(
+            &manifest.staged,
+            remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES,
+        )
+        .map_err(|error| error.to_string());
+        if !actual
+            .as_ref()
+            .is_ok_and(|actual| actual.eq_ignore_ascii_case(expected))
+        {
+            restart_agent(manifest);
+            return Err(
+                "staged update changed after candidate validation; old binary was retained".into(),
+            );
+        }
+    }
     let _ = fs::remove_file(&manifest.health);
     if let Err(error) = fs::rename(&manifest.target, &manifest.backup) {
         restart_agent(manifest);
         return Err(format!("move current agent to rollback path: {error}"));
     }
     if let Err(error) = fs::rename(&manifest.staged, &manifest.target) {
-        let _ = fs::rename(&manifest.backup, &manifest.target);
+        if let Err(restore) = fs::rename(&manifest.backup, &manifest.target) {
+            return Err(format!(
+                "activate staged agent: {error}; restore rollback binary failed: {restore}; backup retained at {}",
+                manifest.backup.display()
+            ));
+        }
         restart_agent(manifest);
         return Err(format!("activate staged agent: {error}"));
     }
@@ -469,6 +636,13 @@ fn apply_update(manifest_path: &Path, manifest: &UpdateManifest) -> Result<(), S
             match child.try_wait() {
                 Ok(None) => {
                     if let Err(error) = hand_over_to_supervisor(manifest, &mut child) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        if let Some(unit) = manifest.unit.as_deref()
+                            && let Some(systemctl) = systemctl_path()
+                        {
+                            let _ = run_systemctl(&systemctl, &["stop", "--", unit], 10_000);
+                        }
                         rollback_files(manifest)?;
                         restart_agent(manifest);
                         let _ = fs::remove_file(manifest_path);
@@ -562,21 +736,10 @@ fn hand_over_to_supervisor(
     let Some(unit) = manifest.unit.as_deref() else {
         return Ok(());
     };
-    let Some(systemctl) = systemctl_path() else {
-        return Ok(());
-    };
+    let systemctl = systemctl_path().ok_or("supervised update requires systemctl")?;
     let _ = child.kill();
     let _ = child.wait();
-    let status = Command::new(&systemctl)
-        .args(["restart", unit])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("restart {unit}: {error}"))?;
-    if !status.success() {
-        return Err(format!("restart {unit}: systemctl exited with {status}"));
-    }
+    run_systemctl(&systemctl, &["restart", "--", unit], 10_000)?;
     // `Type=simple` reports the unit active as soon as it forks, so require the
     // restarted Agent to stay active across a short window before the previous
     // binary is discarded: one that cannot bind the port exits again immediately.
@@ -586,7 +749,13 @@ fn hand_over_to_supervisor(
         if Instant::now() >= deadline {
             return Err(format!("{unit} did not stabilize after restart"));
         }
-        if unit_is_active(&systemctl, unit) {
+        if unit_is_active(
+            &systemctl,
+            unit,
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(2)),
+        ) {
             stabilized += 1;
         } else {
             stabilized = 0;
@@ -599,29 +768,71 @@ fn hand_over_to_supervisor(
 /// Restart the restored Agent on rollback paths so it runs under the same
 /// supervisor it had before the update attempt.
 fn restart_agent(manifest: &UpdateManifest) {
-    if let Some(unit) = manifest.unit.as_deref()
-        && let Some(systemctl) = systemctl_path()
-    {
-        let _ = Command::new(systemctl)
-            .args(["restart", unit])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    if let Some(unit) = manifest.unit.as_deref() {
+        if let Some(systemctl) = systemctl_path() {
+            let _ = run_systemctl(&systemctl, &["restart", "--", unit], 10_000);
+        }
         return;
     }
     let _ = spawn_restarted_agent(manifest, false);
 }
 
-fn unit_is_active(systemctl: &Path, unit: &str) -> bool {
-    Command::new(systemctl)
-        .args(["is-active", "--quiet", unit])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn unit_is_active(systemctl: &Path, unit: &str, timeout: Duration) -> bool {
+    run_systemctl(
+        systemctl,
+        &["is-active", "--quiet", "--", unit],
+        timeout.as_millis().max(1) as u64,
+    )
+    .is_ok()
+}
+
+fn run_systemctl(program: &Path, args: &[&str], timeout_ms: u64) -> Result<Value, String> {
+    let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let result = command::exec(
+        &program.to_string_lossy(),
+        &args,
+        None,
+        &BTreeMap::new(),
+        timeout_ms,
+    )
+    .map_err(|error| error.to_string())?;
+    if result["timed_out"] == true || result["exit_code"] != 0 {
+        return Err(format!(
+            "systemctl failed or timed out: {}",
+            result["stderr"].as_str().unwrap_or_default()
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_supervisor(unit: &str) -> AgentResult<()> {
+    let systemctl = systemctl_path().ok_or_else(|| {
+        AgentError::unsupported("systemd-supervised self-update requires systemctl")
+    })?;
+    let result = run_systemctl(
+        &systemctl,
+        &[
+            "show",
+            "--property=KillMode",
+            "--property=Restart",
+            "--",
+            unit,
+        ],
+        5000,
+    )
+    .map_err(AgentError::command)?;
+    let properties = result["stdout"].as_str().unwrap_or_default();
+    if !supervisor_properties_compatible(properties) {
+        return Err(AgentError::unsupported(
+            "self-update requires KillMode=process and Restart=on-failure on the supervising systemd unit",
+        ));
+    }
+    Ok(())
+}
+
+fn supervisor_properties_compatible(properties: &str) -> bool {
+    properties.lines().any(|line| line == "KillMode=process")
+        && properties.lines().any(|line| line == "Restart=on-failure")
 }
 
 fn rollback_files(manifest: &UpdateManifest) -> Result<(), String> {
@@ -655,8 +866,8 @@ fn check_candidate(path: &Path) -> AgentResult<Value> {
 }
 
 fn sha256_file(path: &Path, max_bytes: u64) -> AgentResult<String> {
-    let mut file = File::open(path)
-        .map_err(|error| AgentError::io(format!("open {}", path.display()), error))?;
+    let (file, _) = super::files::ensure_regular_file(path)?;
+    let mut file = file.take(max_bytes.saturating_add(1));
     let mut digest = Sha256::new();
     let mut total = 0u64;
     let mut buffer = [0u8; 64 * 1024];
@@ -883,6 +1094,47 @@ fn trigger_reboot() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn supervisor_policy_requires_both_update_safe_properties() {
+        assert!(supervisor_properties_compatible(
+            "Restart=on-failure\nKillMode=process\n"
+        ));
+        assert!(!supervisor_properties_compatible(
+            "Restart=always\nKillMode=process\n"
+        ));
+        assert!(!supervisor_properties_compatible(
+            "Restart=on-failure\nKillMode=control-group\n"
+        ));
+        assert!(!supervisor_properties_compatible(""));
+    }
+
+    #[test]
+    fn update_receipt_is_bounded_and_correlated_with_the_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("agent");
+        let manifest = UpdateManifest {
+            parent_pid: 1,
+            target: target.clone(),
+            staged: root.path().join("staged"),
+            backup: root.path().join("backup"),
+            failed: root.path().join("failed"),
+            health: root.path().join("health"),
+            helper: root.path().join("helper"),
+            restart_args: vec![],
+            unit: None,
+            attempt_id: Some("unique-attempt".into()),
+            candidate_sha256: Some("a".repeat(64)),
+            previous_instance_id: Some("previous-instance".into()),
+        };
+        write_update_receipt(&manifest, "updated", Some("detail".repeat(2000))).unwrap();
+        let receipt = last_update_receipt(&target).unwrap();
+        assert_eq!(receipt["attempt_id"], "unique-attempt");
+        assert_eq!(receipt["status"], "updated");
+        assert_eq!(receipt["candidate_sha256"], "a".repeat(64));
+        assert!(receipt["detail"].as_str().unwrap().len() <= 2048);
+        fs::write(update_receipt_path(&target), vec![b'x'; 16 * 1024 + 1]).unwrap();
+        assert!(last_update_receipt(&target).is_none());
+    }
     #[test]
     fn agent_info_has_stable_identity_capabilities_and_limits() {
         let first = agent_info(1234);

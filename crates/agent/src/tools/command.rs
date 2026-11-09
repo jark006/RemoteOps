@@ -8,50 +8,118 @@ use serde_json::{Value, json};
 
 use crate::error::{AgentError, AgentResult};
 
-pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;
-pub const MAX_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = remote_ops_protocol::execution::DEFAULT_COMMAND_TIMEOUT_MS;
+pub const MAX_TIMEOUT_MS: u64 = remote_ops_protocol::execution::MAX_COMMAND_TIMEOUT_MS;
 pub const OUTPUT_LIMIT: usize = 256 * 1024;
 
-#[cfg(windows)]
-const GIT_BASH_PATH: &str = r"C:\Program Files\Git\bin\bash.exe";
+pub fn sh_exec(args: &remote_ops_protocol::ShellArgs) -> AgentResult<Value> {
+    use remote_ops_protocol::ShellKind;
 
-#[cfg(unix)]
-pub fn sh_exec(command: &str, timeout_ms: u64) -> AgentResult<Value> {
-    let mut process = Command::new("/bin/sh");
-    process.arg("-c").arg(command);
-    run(process, timeout_ms)
-}
-
-#[cfg(windows)]
-pub fn sh_exec(command: &str, timeout_ms: u64) -> AgentResult<Value> {
-    match std::fs::metadata(GIT_BASH_PATH) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => {
-            return Err(AgentError::unsupported(format!(
-                "sh_exec requires Git Bash at {GIT_BASH_PATH}"
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(AgentError::unsupported(format!(
-                "sh_exec requires Git Bash at {GIT_BASH_PATH}"
-            )));
-        }
-        Err(error) => return Err(AgentError::io("inspect Git Bash", error)),
+    args.validate().map_err(AgentError::invalid)?;
+    let shell = super::environment::resolve_shell(args.shell)?;
+    let mut process = Command::new(&shell.program);
+    process.envs(&args.env);
+    if let Some(cwd) = &args.cwd {
+        process.current_dir(cwd);
     }
-
-    let mut process = Command::new(GIT_BASH_PATH);
-    process
-        .args(["--noprofile", "--norc", "-c"])
-        .arg(command)
-        .env_remove("BASH_ENV");
-    run(process, timeout_ms)
+    // Keep the script alive until the shell and its output readers finish.
+    let _script = match shell.kind {
+        ShellKind::Sh => {
+            process.env_remove("ENV");
+            prepare_posix_script(&mut process, &args.command, false)?
+        }
+        ShellKind::Bash | ShellKind::GitBash => {
+            process
+                .args(["--noprofile", "--norc"])
+                .env_remove("BASH_ENV")
+                .env_remove("ENV");
+            prepare_posix_script(
+                &mut process,
+                &args.command,
+                shell.kind == ShellKind::GitBash,
+            )?
+        }
+        ShellKind::Busybox => {
+            process.arg("sh").env_remove("ENV");
+            prepare_posix_script(&mut process, &args.command, false)?
+        }
+        ShellKind::Pwsh | ShellKind::Powershell => {
+            Some(prepare_powershell(&mut process, &args.command)?)
+        }
+        ShellKind::Cmd => {
+            process.args(["/D", "/S", "/C", &args.command]);
+            None
+        }
+        ShellKind::Native => unreachable!("native resolves to a concrete shell"),
+    };
+    let mut result = run(process, args.timeout_ms)?;
+    result["shell"] = json!({"name":shell.kind,"program":shell.program.to_string_lossy()});
+    Ok(result)
 }
 
-#[cfg(not(any(unix, windows)))]
-pub fn sh_exec(_command: &str, _timeout_ms: u64) -> AgentResult<Value> {
-    Err(AgentError::unsupported(
-        "sh_exec requires /bin/sh or Git Bash on Windows",
-    ))
+fn temporary_script(script: &str, suffix: &str, bom: bool) -> AgentResult<tempfile::TempPath> {
+    use std::io::Write;
+    let mut file = tempfile::Builder::new()
+        .prefix("remote-ops-")
+        .suffix(suffix)
+        .tempfile()
+        .map_err(|error| AgentError::io("create shell script", error))?;
+    if bom {
+        file.write_all(b"\xef\xbb\xbf")
+            .map_err(|error| AgentError::io("write script BOM", error))?;
+    }
+    file.write_all(script.as_bytes())
+        .and_then(|_| file.flush())
+        .map_err(|error| AgentError::io("write shell script", error))?;
+    // Close the writable file handle before PowerShell opens the script.
+    // TempPath retains automatic cleanup without a Windows sharing conflict.
+    Ok(file.into_temp_path())
+}
+
+fn prepare_posix_script(
+    process: &mut Command,
+    script: &str,
+    git_bash: bool,
+) -> AgentResult<Option<tempfile::TempPath>> {
+    if script.len() <= 8192 {
+        process.args(["-c", script]);
+        return Ok(None);
+    }
+    let file = temporary_script(script, ".sh", false)?;
+    if git_bash {
+        process.arg(file.to_string_lossy().replace('\\', "/"));
+    } else {
+        process.arg(file.as_os_str());
+    }
+    Ok(Some(file))
+}
+
+fn prepare_powershell(process: &mut Command, script: &str) -> AgentResult<tempfile::TempPath> {
+    // Windows PowerShell 5.1 needs the BOM to read a UTF-8 script reliably.
+    let file = temporary_script(script, ".ps1", true)?;
+    let script_path: &std::path::Path = file.as_ref();
+    let path = script_path
+        .to_str()
+        .ok_or_else(|| AgentError::command("PowerShell script path is not UTF-8"))?
+        .replace('\'', "''");
+    // Pass a small loader, not the user script: Windows limits command lines
+    // to 32K UTF-16 units. A private .ps1 also preserves literal quotes/Unicode.
+    let loader = format!(
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); $OutputEncoding = [Console]::OutputEncoding; & '{path}'; if (-not $?) {{ if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}; exit 1 }}"
+    );
+    process
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-OutputFormat",
+            "Text",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+        ])
+        .arg(loader);
+    Ok(file)
 }
 
 pub fn exec(
@@ -61,9 +129,8 @@ pub fn exec(
     env: &BTreeMap<String, String>,
     timeout_ms: u64,
 ) -> AgentResult<Value> {
-    if program.is_empty() {
-        return Err(AgentError::invalid("program must not be empty"));
-    }
+    remote_ops_protocol::execution::validate_exec(program, args, cwd, env, timeout_ms)
+        .map_err(AgentError::invalid)?;
     let mut process = Command::new(program);
     process.args(args).envs(env);
     if let Some(cwd) = cwd {
@@ -131,12 +198,19 @@ fn run(mut command: Command, timeout_ms: u64) -> AgentResult<Value> {
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let (stdout, stdout_truncated) = stdout_reader
+    let (mut stdout, mut stdout_truncated) = stdout_reader
         .join()
         .map_err(|_| AgentError::command("stdout reader panicked"))?;
-    let (stderr, stderr_truncated) = stderr_reader
+    let (mut stderr, mut stderr_truncated) = stderr_reader
         .join()
         .map_err(|_| AgentError::command("stderr reader panicked"))?;
+    let per_stream_budget = (remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES - 16 * 1024) / 2;
+    let stdout_length = remote_ops_protocol::encoding::lossy_prefix_len(&stdout, per_stream_budget);
+    let stderr_length = remote_ops_protocol::encoding::lossy_prefix_len(&stderr, per_stream_budget);
+    stdout_truncated |= stdout_length < stdout.len();
+    stderr_truncated |= stderr_length < stderr.len();
+    stdout.truncate(stdout_length);
+    stderr.truncate(stderr_length);
     let status = status.expect("command status available before readers are joined");
     Ok(json!({
         "stdout": String::from_utf8_lossy(&stdout),
@@ -299,7 +373,7 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        use super::super::{GIT_BASH_PATH, exec, sh_exec};
+        use super::super::{exec, sh_exec};
 
         const HELPER_ROLE: &str = "REMOTE_OPS_COMMAND_TEST_ROLE";
         const HELPER_PID_FILE: &str = "REMOTE_OPS_COMMAND_TEST_PID_FILE";
@@ -325,18 +399,16 @@ mod tests {
 
         #[test]
         fn git_bash_executes_shell_command_when_installed() {
-            if !std::path::Path::new(GIT_BASH_PATH).is_file() {
-                let error = sh_exec("exit 0", 10_000).unwrap_err();
+            let args = serde_json::from_value(serde_json::json!({"shell":"git_bash","command":"printf 'stdout-中文\\n'; printf 'stderr-中文\\n' >&2; exit 7"})).unwrap();
+            if crate::tools::environment::resolve_shell(remote_ops_protocol::ShellKind::GitBash)
+                .is_err()
+            {
+                let error = sh_exec(&args).unwrap_err();
                 assert_eq!(error.kind, "unsupported");
-                assert!(error.message.contains(GIT_BASH_PATH));
                 return;
             }
 
-            let result = sh_exec(
-                "printf 'stdout-中文\n'; printf 'stderr-中文\n' >&2; exit 7",
-                10_000,
-            )
-            .unwrap();
+            let result = sh_exec(&args).unwrap();
 
             assert_eq!(result["stdout"], "stdout-中文\n");
             assert_eq!(result["stderr"], "stderr-中文\n");

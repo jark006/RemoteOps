@@ -1,18 +1,19 @@
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io;
 use std::net::SocketAddrV4;
 use std::time::Duration;
 
 use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
 use remote_ops_proxy::client::RemoteClient;
-use remote_ops_proxy::mcp::handle_message;
+use remote_ops_proxy::response::ResponseMode;
+use remote_ops_proxy::stdio;
 use remote_ops_version::{requests_version, version_text};
-use serde_json::{Value, json};
 
 struct Config {
     remote: SocketAddrV4,
     timeout: Duration,
     max_transfer_bytes: u64,
+    response_mode: ResponseMode,
 }
 
 fn main() {
@@ -27,30 +28,13 @@ fn main() {
     let mut client = RemoteClient::new(config.remote, config.timeout, config.max_transfer_bytes);
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("stdin read failed: {error}");
-                break;
-            }
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => handle_message(message, &mut client),
-            Err(_) => Some(
-                json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}),
-            ),
-        };
-        if let Some(response) = response
-            && (serde_json::to_writer(&mut stdout, &response).is_err()
-                || stdout.write_all(b"\n").is_err()
-                || stdout.flush().is_err())
-        {
-            break;
-        }
+    if let Err(error) = stdio::serve(
+        &mut stdin.lock(),
+        &mut stdout,
+        &mut client,
+        config.response_mode,
+    ) {
+        eprintln!("MCP stdio failed: {error}");
     }
 }
 
@@ -62,6 +46,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Config, Str
     let mut remote = "192.168.43.106:8022".parse().expect("valid default remote");
     let mut timeout_ms = 310_000u64;
     let mut max_transfer_bytes = DEFAULT_MAX_TRANSFER_BYTES;
+    let mut response_mode = ResponseMode::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -78,7 +63,11 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Config, Str
             }
             "--timeout-ms" => timeout_ms = parse_u64(args.next(), "--timeout-ms")?,
             "--max-transfer-bytes" => max_transfer_bytes = parse_u64(args.next(), "--max-transfer-bytes")?,
-            "--help" | "-h" => return Err("usage: remote-ops-proxy [--remote IPv4:PORT] [--timeout-ms 310000] [--max-transfer-bytes 4294967296] [--version]".to_string()),
+            "--response-mode" => {
+                let value = args.next().ok_or("--response-mode requires compact or full")?;
+                response_mode = ResponseMode::parse(&value)?;
+            }
+            "--help" | "-h" => return Err("usage: remote-ops-proxy [--remote IPv4:PORT] [--timeout-ms 310000] [--max-transfer-bytes 4294967296] [--response-mode compact|full] [--version]".to_string()),
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
@@ -89,6 +78,7 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> Result<Config, Str
         remote,
         timeout: Duration::from_millis(timeout_ms),
         max_transfer_bytes,
+        response_mode,
     })
 }
 
@@ -117,6 +107,21 @@ mod tests {
                 .to_string(),
             "127.0.0.1:9000"
         );
+    }
+
+    #[test]
+    fn response_mode_defaults_to_compact_and_can_be_overridden() {
+        assert_eq!(args(&[]).unwrap().response_mode, ResponseMode::Compact);
+        assert_eq!(
+            args(&["--response-mode", "full"]).unwrap().response_mode,
+            ResponseMode::Full
+        );
+        for values in [
+            &["--response-mode"][..],
+            &["--response-mode", "unknown"][..],
+        ] {
+            assert!(args(values).is_err());
+        }
     }
 
     #[test]

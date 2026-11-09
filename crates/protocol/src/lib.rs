@@ -9,7 +9,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
 
-pub const PROTOCOL_VERSION: u8 = 3;
+pub mod arguments;
+pub mod encoding;
+pub mod execution;
+pub use execution::{ShellArgs, ShellKind};
+
+pub const PROTOCOL_VERSION: u8 = 4;
 pub const BUILTIN_PSK: &[u8] = b"JARK006_PSK";
 pub const DEFAULT_MAX_CONTROL_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
@@ -64,6 +69,7 @@ const MAC_BYTES: usize = 32;
 #[derive(Debug)]
 pub enum ProtocolError {
     Io(io::Error),
+    IncompleteFrame(io::Error),
     Json(serde_json::Error),
     Authentication,
     InvalidFrame(String),
@@ -77,6 +83,7 @@ impl fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "I/O error: {err}"),
+            Self::IncompleteFrame(err) => write!(f, "incomplete frame: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::Authentication => write!(f, "authentication failed"),
             Self::InvalidFrame(message) => write!(f, "invalid frame: {message}"),
@@ -331,9 +338,40 @@ impl Session {
         options: SessionOptions,
         max_control_bytes: usize,
     ) -> Result<Self, ProtocolError> {
-        let mut stream = TcpStream::connect_timeout(&address, options.connect_timeout)?;
+        Self::connect_bounded(address, psk, options, max_control_bytes, None)
+    }
+
+    /// Bound connect and every handshake step by one caller-owned deadline.
+    pub fn connect_until(
+        address: SocketAddr,
+        psk: &[u8],
+        options: SessionOptions,
+        max_control_bytes: usize,
+        deadline: Instant,
+    ) -> Result<Self, ProtocolError> {
+        Self::connect_bounded(address, psk, options, max_control_bytes, Some(deadline))
+    }
+
+    fn connect_bounded(
+        address: SocketAddr,
+        psk: &[u8],
+        options: SessionOptions,
+        max_control_bytes: usize,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ProtocolError> {
+        let connect_timeout = deadline
+            .map(remaining_until)
+            .transpose()?
+            .map_or(options.connect_timeout, |remaining| {
+                remaining.min(options.connect_timeout)
+            });
+        let mut stream = TcpStream::connect_timeout(&address, connect_timeout)?;
         configure_handshake(&stream, options.handshake_timeout)?;
-        let key = client_handshake(&mut stream, psk)?;
+        let handshake_deadline = Instant::now() + options.handshake_timeout;
+        let handshake_deadline = deadline.map_or(handshake_deadline, |overall| {
+            overall.min(handshake_deadline)
+        });
+        let key = client_handshake(&mut stream, psk, handshake_deadline)?;
         configure_established(&stream, options.write_timeout)?;
         Ok(Self::new(stream, key, max_control_bytes, options))
     }
@@ -345,7 +383,7 @@ impl Session {
         max_control_bytes: usize,
     ) -> Result<Self, ProtocolError> {
         configure_handshake(&stream, options.handshake_timeout)?;
-        let key = server_handshake(&mut stream, psk)?;
+        let key = server_handshake(&mut stream, psk, Instant::now() + options.handshake_timeout)?;
         configure_established(&stream, options.write_timeout)?;
         Ok(Self::new(stream, key, max_control_bytes, options))
     }
@@ -372,14 +410,32 @@ impl Session {
         request_id: u64,
         value: &T,
     ) -> Result<(), ProtocolError> {
-        let payload = serde_json::to_vec(value)?;
-        if payload.len() > self.max_control_bytes {
-            return Err(ProtocolError::InvalidFrame(format!(
-                "control payload exceeds {} bytes",
-                self.max_control_bytes
-            )));
-        }
+        let payload = self.encode_json(value)?;
         self.send(kind, request_id, &payload)
+    }
+
+    pub fn send_json_until<T: Serialize>(
+        &mut self,
+        kind: FrameType,
+        request_id: u64,
+        value: &T,
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        let payload = self.encode_json(value)?;
+        self.send_until(kind, request_id, &payload, deadline)
+    }
+
+    fn encode_json<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, ProtocolError> {
+        let payload =
+            encoding::to_vec_bounded(value, self.max_control_bytes).map_err(
+                |error| match error {
+                    encoding::JsonEncodeError::TooLarge(limit) => ProtocolError::InvalidFrame(
+                        format!("control payload exceeds {limit} bytes"),
+                    ),
+                    encoding::JsonEncodeError::Json(error) => ProtocolError::Json(error),
+                },
+            )?;
+        Ok(payload)
     }
 
     pub fn receive_json<T: for<'de> Deserialize<'de>>(
@@ -408,6 +464,28 @@ impl Session {
         request_id: u64,
         payload: &[u8],
     ) -> Result<(), ProtocolError> {
+        self.send_until(
+            kind,
+            request_id,
+            payload,
+            Instant::now() + self.options.write_timeout,
+        )
+    }
+
+    pub fn send_until(
+        &mut self,
+        kind: FrameType,
+        request_id: u64,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        let deadline = deadline.min(Instant::now() + self.options.write_timeout);
+        remaining_until(deadline)?;
+        if kind == FrameType::Chunk && payload.len() > DEFAULT_CHUNK_BYTES {
+            return Err(ProtocolError::InvalidFrame(
+                "chunk payload too large".into(),
+            ));
+        }
         if kind != FrameType::Chunk && payload.len() > self.max_control_bytes {
             return Err(ProtocolError::InvalidFrame(
                 "control payload too large".to_string(),
@@ -418,7 +496,6 @@ impl Session {
         let sequence = self.send_sequence;
         let header = make_header(kind, request_id, sequence, payload_len);
         let tag = sign(&self.key, &header, payload);
-        let deadline = Instant::now() + self.options.write_timeout;
         write_all_until(&mut self.stream, &header, deadline)?;
         write_all_until(&mut self.stream, &tag, deadline)?;
         write_all_until(&mut self.stream, payload, deadline)?;
@@ -440,11 +517,30 @@ impl Session {
         &mut self,
         idle_timeout: Option<Duration>,
     ) -> Result<Frame, ProtocolError> {
+        self.receive_bounded(idle_timeout, None)
+    }
+
+    pub fn receive_until(&mut self, deadline: Instant) -> Result<Frame, ProtocolError> {
+        self.receive_bounded(Some(remaining_until(deadline)?), Some(deadline))
+    }
+
+    fn receive_bounded(
+        &mut self,
+        idle_timeout: Option<Duration>,
+        overall_deadline: Option<Instant>,
+    ) -> Result<Frame, ProtocolError> {
         let mut header = [0u8; FRAME_HEADER_BYTES];
         self.stream.set_read_timeout(idle_timeout)?;
-        self.stream.read_exact(&mut header[..1])?;
-        let deadline = Instant::now() + self.options.frame_timeout;
-        read_exact_until(&mut self.stream, &mut header[1..], deadline)?;
+        if let Some(deadline) = overall_deadline {
+            read_exact_until(&mut self.stream, &mut header[..1], deadline)?;
+        } else {
+            self.stream.read_exact(&mut header[..1])?;
+        }
+        let frame_deadline = Instant::now() + self.options.frame_timeout;
+        let deadline =
+            overall_deadline.map_or(frame_deadline, |overall| overall.min(frame_deadline));
+        read_exact_until(&mut self.stream, &mut header[1..], deadline)
+            .map_err(ProtocolError::IncompleteFrame)?;
         if &header[..4] != HELLO_MAGIC || header[4] != PROTOCOL_VERSION || header[6..8] != [0, 0] {
             return Err(ProtocolError::InvalidFrame(
                 "magic or version mismatch".to_string(),
@@ -471,9 +567,11 @@ impl Session {
             ));
         }
         let mut received_tag = [0u8; MAC_BYTES];
-        read_exact_until(&mut self.stream, &mut received_tag, deadline)?;
+        read_exact_until(&mut self.stream, &mut received_tag, deadline)
+            .map_err(ProtocolError::IncompleteFrame)?;
         let mut payload = vec![0u8; payload_len];
-        read_exact_until(&mut self.stream, &mut payload, deadline)?;
+        read_exact_until(&mut self.stream, &mut payload, deadline)
+            .map_err(ProtocolError::IncompleteFrame)?;
         verify(&self.key, &header, &payload, &received_tag)?;
         self.receive_sequence = self
             .receive_sequence
@@ -578,33 +676,41 @@ fn verify(key: &[u8], header: &[u8], payload: &[u8], tag: &[u8]) -> Result<(), P
     }
 }
 
-fn client_handshake(stream: &mut TcpStream, psk: &[u8]) -> Result<[u8; 32], ProtocolError> {
+fn client_handshake(
+    stream: &mut TcpStream,
+    psk: &[u8],
+    deadline: Instant,
+) -> Result<[u8; 32], ProtocolError> {
     validate_psk(psk)?;
     let mut client_nonce = [0u8; 32];
     getrandom::fill(&mut client_nonce)
         .map_err(|error| ProtocolError::Io(io::Error::other(error.to_string())))?;
-    stream.write_all(HELLO_MAGIC)?;
-    stream.write_all(&[PROTOCOL_VERSION])?;
-    stream.write_all(&client_nonce)?;
+    write_all_until(stream, HELLO_MAGIC, deadline)?;
+    write_all_until(stream, &[PROTOCOL_VERSION], deadline)?;
+    write_all_until(stream, &client_nonce, deadline)?;
     stream.flush()?;
 
     let mut response = [0u8; 64];
-    stream.read_exact(&mut response)?;
+    read_exact_until(stream, &mut response, deadline)?;
     let server_nonce: [u8; 32] = response[..32].try_into().expect("fixed slice");
     let expected = handshake_tag(psk, b"server", &client_nonce, &server_nonce);
     if !constant_time_eq(&expected, &response[32..]) {
         return Err(ProtocolError::Authentication);
     }
     let client_tag = handshake_tag(psk, b"client", &client_nonce, &server_nonce);
-    stream.write_all(&client_tag)?;
+    write_all_until(stream, &client_tag, deadline)?;
     stream.flush()?;
     Ok(handshake_tag(psk, b"session", &client_nonce, &server_nonce))
 }
 
-fn server_handshake(stream: &mut TcpStream, psk: &[u8]) -> Result<[u8; 32], ProtocolError> {
+fn server_handshake(
+    stream: &mut TcpStream,
+    psk: &[u8],
+    deadline: Instant,
+) -> Result<[u8; 32], ProtocolError> {
     validate_psk(psk)?;
     let mut hello = [0u8; 37];
-    stream.read_exact(&mut hello)?;
+    read_exact_until(stream, &mut hello, deadline)?;
     if &hello[..4] != HELLO_MAGIC || hello[4] != PROTOCOL_VERSION {
         return Err(ProtocolError::Authentication);
     }
@@ -613,11 +719,11 @@ fn server_handshake(stream: &mut TcpStream, psk: &[u8]) -> Result<[u8; 32], Prot
     getrandom::fill(&mut server_nonce)
         .map_err(|error| ProtocolError::Io(io::Error::other(error.to_string())))?;
     let server_tag = handshake_tag(psk, b"server", &client_nonce, &server_nonce);
-    stream.write_all(&server_nonce)?;
-    stream.write_all(&server_tag)?;
+    write_all_until(stream, &server_nonce, deadline)?;
+    write_all_until(stream, &server_tag, deadline)?;
     stream.flush()?;
     let mut client_tag = [0u8; 32];
-    stream.read_exact(&mut client_tag)?;
+    read_exact_until(stream, &mut client_tag, deadline)?;
     let expected = handshake_tag(psk, b"client", &client_nonce, &server_nonce);
     if !constant_time_eq(&expected, &client_tag) {
         return Err(ProtocolError::Authentication);
@@ -688,6 +794,161 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn trickled_client_hello_cannot_extend_the_server_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut options = SessionOptions::agent();
+            options.handshake_timeout = Duration::from_millis(60);
+            let started = Instant::now();
+            let result = Session::accept(stream, BUILTIN_PSK, options, 1024);
+            (result, started.elapsed())
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let hello = [HELLO_MAGIC.as_slice(), &[PROTOCOL_VERSION], &[0; 32]].concat();
+        for byte in hello {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (result, elapsed) = server.join().unwrap();
+        assert!(
+            matches!(result,Err(ProtocolError::Io(error)) if matches!(error.kind(),io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+    }
+
+    #[test]
+    fn trickled_server_nonce_cannot_extend_the_client_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.read_exact(&mut [0; 37]).unwrap();
+            for _ in 0..64 {
+                if stream.write_all(&[0]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let mut options = SessionOptions::proxy(Duration::from_secs(1));
+        options.handshake_timeout = Duration::from_millis(60);
+        let started = Instant::now();
+        let result = Session::connect(address, BUILTIN_PSK, options, 1024);
+        assert!(
+            matches!(result,Err(ProtocolError::Io(error)) if matches!(error.kind(),io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn absolute_read_deadline_caps_an_already_started_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut session =
+                Session::accept(stream, BUILTIN_PSK, SessionOptions::agent(), 1024).unwrap();
+            session.stream.write_all(&HELLO_MAGIC[..1]).unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let mut session = Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(5)),
+            1024,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = session.receive_until(started + Duration::from_millis(50));
+        assert!(
+            matches!(result,Err(ProtocolError::IncompleteFrame(error)) if matches!(error.kind(),io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn absolute_write_deadline_covers_socket_backpressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            SockRef::from(&stream).set_recv_buffer_size(4096).unwrap();
+            let _session = Session::accept(
+                stream,
+                BUILTIN_PSK,
+                SessionOptions::agent(),
+                DEFAULT_MAX_CONTROL_BYTES,
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let mut session = Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(5)),
+            DEFAULT_MAX_CONTROL_BYTES,
+        )
+        .unwrap();
+        SockRef::from(&session.stream)
+            .set_send_buffer_size(4096)
+            .unwrap();
+        let started = Instant::now();
+        let payload = vec![0; DEFAULT_MAX_CONTROL_BYTES];
+        let deadline = started + Duration::from_millis(50);
+        let result = (1..=32)
+            .try_for_each(|id| session.send_until(FrameType::Response, id, &payload, deadline));
+        assert!(
+            matches!(&result,Err(ProtocolError::Io(error)) if matches!(error.kind(),io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn successful_deadline_exchange_does_not_change_normal_idle_policy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut session =
+                Session::accept(stream, BUILTIN_PSK, SessionOptions::agent(), 1024).unwrap();
+            session
+                .receive_until(Instant::now() + Duration::from_millis(50))
+                .unwrap();
+            // The preceding deadline expires while this authenticated session
+            // remains idle. Normal receive must still allow the later frame.
+            session.receive().unwrap()
+        });
+        let mut session = Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(2)),
+            1024,
+        )
+        .unwrap();
+        session
+            .send_json_until(
+                FrameType::Request,
+                1,
+                &serde_json::json!({}),
+                Instant::now() + Duration::from_millis(50),
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        session
+            .send_json(FrameType::Request, 2, &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(server.join().unwrap().request_id, 2);
+    }
+
+    #[test]
     fn authenticated_sessions_exchange_frames() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -717,6 +978,10 @@ mod tests {
             1024,
         )
         .unwrap();
+        assert!(matches!(
+            client.send(FrameType::Chunk, 7, &vec![0; DEFAULT_CHUNK_BYTES + 1]),
+            Err(ProtocolError::InvalidFrame(_))
+        ));
         client
             .send_json(
                 FrameType::Request,
@@ -747,8 +1012,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v3_transfer_requests_require_resume_integrity_fields() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn transfer_requests_require_resume_integrity_fields() {
+        assert_eq!(PROTOCOL_VERSION, 4);
         assert!(
             serde_json::from_value::<UploadRequest>(serde_json::json!({
                 "remote_path":"file","size":1,"overwrite":true
@@ -830,6 +1095,31 @@ mod tests {
             server.join().unwrap(),
             Err(ProtocolError::Authentication)
         ));
+    }
+
+    #[test]
+    fn v3_frame_is_rejected_after_a_v4_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut session =
+                Session::accept(stream, BUILTIN_PSK, SessionOptions::agent(), 1024).unwrap();
+            session.receive()
+        });
+        let mut session = Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(1)),
+            1024,
+        )
+        .unwrap();
+        let mut header = make_header(FrameType::Request, 1, 0, 0);
+        header[4] = 3;
+        session.stream.write_all(&header).unwrap();
+        assert!(
+            matches!(server.join().unwrap(),Err(ProtocolError::InvalidFrame(message)) if message.contains("version mismatch"))
+        );
     }
 
     #[test]
@@ -964,7 +1254,7 @@ mod tests {
             options.frame_timeout = Duration::from_millis(50);
             let mut session =
                 Session::accept(stream, b"a sufficiently long psk", options, 1024).unwrap();
-            session.receive()
+            session.receive_with_idle_timeout(Some(Duration::from_millis(5)))
         });
         let mut client = Session::connect(
             address,
@@ -977,7 +1267,7 @@ mod tests {
         client.stream.flush().unwrap();
         assert!(matches!(
             server.join().unwrap(),
-            Err(ProtocolError::Io(error))
+            Err(ProtocolError::IncompleteFrame(error))
                 if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
         ));
     }

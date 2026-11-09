@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -69,7 +71,6 @@ pub fn sync_prepare(request: SyncPrepareRequest) -> AgentResult<Value> {
                 fs::copy(&source, &staged_path).map_err(|error| {
                     AgentError::io(format!("reuse unchanged file {}", source.display()), error)
                 })?;
-                apply_mode(&staged_path, entry.mode)?;
                 reused_files += 1;
                 reused_bytes = reused_bytes
                     .checked_add(entry.size)
@@ -109,33 +110,63 @@ pub fn sync_commit(request: SyncFinishRequest) -> AgentResult<Value> {
         ));
     }
     validate_staged_tree(staging, &manifest.entries)?;
+    sync_staged_contents(staging, &manifest.entries)?;
+    #[cfg(not(unix))]
+    for entry in manifest.entries.iter().filter(|entry| entry.kind == "file") {
+        apply_mode(&join_entry(staging, &entry.path), entry.mode)?;
+    }
     apply_directory_modes(staging, manifest.root_mode, &manifest.entries)?;
 
-    let backup = if fs::symlink_metadata(target).is_ok() {
-        let backup = backup_path_for(target)?;
-        fs::rename(target, &backup).map_err(|error| {
-            AgentError::io(
-                format!("move previous directory to {}", backup.display()),
+    let backup = match fs::symlink_metadata(target) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(AgentError::invalid(
+                "remote_path is no longer an ordinary directory",
+            ));
+        }
+        Ok(_) => {
+            let backup = backup_path_for(target)?;
+            fs::rename(target, &backup).map_err(|error| {
+                AgentError::io(
+                    format!("move previous directory to {}", backup.display()),
+                    error,
+                )
+            })?;
+            Some(backup)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(AgentError::io(
+                "inspect sync destination before activation",
                 error,
-            )
-        })?;
-        Some(backup)
-    } else {
-        None
+            ));
+        }
     };
     if let Err(error) = fs::rename(staging, target) {
-        if let Some(backup) = &backup {
-            let _ = fs::rename(backup, target);
-        }
-        return Err(AgentError::io(
-            format!("activate staged directory {}", target.display()),
-            error,
-        ));
+        let restored = backup
+            .as_ref()
+            .map(|backup| fs::rename(backup, target))
+            .transpose();
+        let status = if restored.is_ok() {
+            "not_committed"
+        } else {
+            "rollback_failed"
+        };
+        return Ok(
+            json!({"committed":false,"status":status,"remote_path":request.remote_path,"staging_path":request.staging_path,
+            "backup_path":backup.map(|path|path.to_string_lossy().into_owned()),"error":{"kind":status,"message":format!("activate staging: {error}; restoring previous directory: {restored:?}")}}),
+        );
     }
-    sync_parent(target)?;
-    let metadata_cleaned = fs::remove_file(marker_path(staging)).is_ok();
+    let durability_error = if cfg!(unix) {
+        sync_parent(target).err().map(|error| error.to_string())
+    } else {
+        Some("directory durability cannot be confirmed on this platform".to_string())
+    };
+    let metadata_cleaned = (!cfg!(unix) || durability_error.is_none())
+        && fs::remove_file(marker_path(staging)).is_ok();
     Ok(json!({
         "committed": true,
+        "durable":durability_error.is_none(),
+        "durability_error":durability_error,
         "remote_path": request.remote_path,
         "manifest_sha256": request.manifest_sha256,
         "backup_path": backup.map(|path| path.to_string_lossy().into_owned()),
@@ -313,15 +344,22 @@ pub fn deploy_activate(request: DeployActivateRequest) -> AgentResult<Value> {
                 "release_path must be a directory and not a symbolic link",
             ));
         }
+        let resolved_release = fs::canonicalize(release)
+            .map_err(|error| AgentError::io("resolve deployment release", error))?;
         let current = Path::new(&request.current_path);
-        if let Ok(metadata) = fs::symlink_metadata(current)
-            && !metadata.file_type().is_symlink()
-        {
-            return Err(AgentError::invalid(
-                "current_path must be absent or a symbolic link",
-            ));
-        }
-        let previous_target = fs::read_link(current).ok();
+        let previous_target = match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Some(
+                fs::read_link(current)
+                    .map_err(|error| AgentError::io("read existing current link", error))?,
+            ),
+            Ok(_) => {
+                return Err(AgentError::invalid(
+                    "current_path must be absent or a symbolic link",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AgentError::io("inspect current path", error)),
+        };
         let mut steps = Vec::new();
 
         if let Some(stop) = &request.stop {
@@ -340,14 +378,9 @@ pub fn deploy_activate(request: DeployActivateRequest) -> AgentResult<Value> {
             }
         }
 
-        if let Err(error) = switch_symlink(current, release) {
-            if previous_target.is_some() {
-                let restart = request.rollback_start.as_ref().unwrap_or(&request.start);
-                if let Ok(result) = run_command("restart_previous_after_switch_failure", restart) {
-                    steps.push(result);
-                }
-            }
-            return Err(error);
+        if let Err(error) = switch_symlink(current, &resolved_release) {
+            steps.push(failed_step("switch", &error));
+            return rollback_deploy(previous_target.as_deref(), &request, steps, "switch_failed");
         }
         steps.push(json!({"step":"switch","succeeded":true,"target":request.release_path}));
 
@@ -384,14 +417,34 @@ fn rollback_deploy(
     failure_status: &str,
 ) -> AgentResult<Value> {
     let current = Path::new(&request.current_path);
-    match previous_target {
-        Some(previous) => switch_symlink(current, previous)?,
-        None => fs::remove_file(current).map_err(|error| {
-            AgentError::io(
-                format!("remove new current link {}", current.display()),
+    let switched = match previous_target {
+        Some(previous) => switch_symlink(current, previous),
+        None => match fs::symlink_metadata(current) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::remove_file(current)
+                .map_err(|error| AgentError::io("remove new current link", error))
+                .and_then(|_| sync_parent(current)),
+            Ok(_) => Err(AgentError::invalid(
+                "current_path was replaced by a non-symlink during deployment; refusing to remove it",
+            )),
+            Err(error) => Err(AgentError::io(
+                "inspect current link before rollback",
                 error,
-            )
-        })?,
+            )),
+        },
+    };
+    if let Err(error) = switched {
+        steps.push(failed_step("rollback_switch", &error));
+        let mut result = deploy_result(
+            "rollback_failed",
+            false,
+            false,
+            previous_target,
+            request,
+            steps,
+        );
+        result["failure_stage"] = json!(failure_status);
+        return Ok(result);
     }
     steps.push(json!({"step":"rollback_switch","succeeded":true,"target":previous_target.map(|path| path.to_string_lossy())}));
     let restarted = if previous_target.is_some() {
@@ -447,13 +500,16 @@ fn deploy_result(
 
 #[cfg(unix)]
 fn run_command(step: &str, spec: &CommandSpec) -> AgentResult<Value> {
-    let mut result = command::exec(
+    let mut result = match command::exec(
         &spec.program,
         &spec.args,
         spec.cwd.as_deref(),
         &spec.env,
         spec.timeout_ms,
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(error) => return Ok(failed_step(step, &error)),
+    };
     if let Some(object) = result.as_object_mut() {
         truncate_step_output(object, "stdout", "stdout_truncated");
         truncate_step_output(object, "stderr", "stderr_truncated");
@@ -464,6 +520,11 @@ fn run_command(step: &str, spec: &CommandSpec) -> AgentResult<Value> {
         );
     }
     Ok(result)
+}
+
+#[cfg(unix)]
+fn failed_step(step: &str, error: &AgentError) -> Value {
+    json!({"step":step,"succeeded":false,"exit_code":null,"timed_out":false,"error":{"kind":error.kind,"message":error.message}})
 }
 
 #[cfg(unix)]
@@ -493,18 +554,14 @@ fn command_succeeded(result: &Value) -> bool {
 
 #[cfg(unix)]
 fn validate_command(spec: &CommandSpec) -> AgentResult<()> {
-    if spec.program.is_empty() || spec.program.contains('\0') {
-        return Err(AgentError::invalid(
-            "deployment command program must not be empty or contain NUL",
-        ));
-    }
-    if spec.timeout_ms > command::MAX_TIMEOUT_MS {
-        return Err(AgentError::invalid(format!(
-            "deployment command timeout_ms must be in range 0..={}",
-            command::MAX_TIMEOUT_MS
-        )));
-    }
-    Ok(())
+    remote_ops_protocol::execution::validate_exec(
+        &spec.program,
+        &spec.args,
+        spec.cwd.as_deref(),
+        &spec.env,
+        spec.timeout_ms,
+    )
+    .map_err(AgentError::invalid)
 }
 
 fn validate_sync_request(request: &SyncPrepareRequest) -> AgentResult<()> {
@@ -593,6 +650,7 @@ fn validate_sync_entry(entry: &SyncEntry, max_depth: usize) -> AgentResult<()> {
 }
 
 fn validate_staged_tree(staging: &Path, entries: &[SyncEntry]) -> AgentResult<()> {
+    ensure_staging_directory(staging)?;
     let expected = entries
         .iter()
         .map(|entry| entry.path.clone())
@@ -613,6 +671,11 @@ fn validate_staged_tree(staging: &Path, entries: &[SyncEntry]) -> AgentResult<()
                 .expect("walk remains below staging")
                 .to_string_lossy()
                 .replace('\\', "/");
+            if !expected.contains(&relative) {
+                return Err(AgentError::invalid(
+                    "staging contains an entry outside the manifest",
+                ));
+            }
             let metadata = fs::symlink_metadata(&path)
                 .map_err(|error| AgentError::io(format!("stat {}", path.display()), error))?;
             if metadata.file_type().is_dir() {
@@ -653,21 +716,29 @@ fn validate_staged_tree(staging: &Path, entries: &[SyncEntry]) -> AgentResult<()
 }
 
 fn write_marker(staging: &Path, request: &SyncPrepareRequest) -> AgentResult<()> {
-    let bytes = serde_json::to_vec(request)
-        .map_err(|error| AgentError::command(format!("serialize sync manifest: {error}")))?;
+    let bytes = remote_ops_protocol::encoding::to_vec_bounded(
+        request,
+        remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES,
+    )
+    .map_err(|error| AgentError::command(format!("serialize sync manifest: {error}")))?;
     let marker = marker_path(staging);
-    fs::OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&marker)
-        .and_then(|mut file| file.write_all(&bytes).and_then(|_| file.sync_all()))
-        .map_err(|error| AgentError::io(format!("write sync marker {}", marker.display()), error))
+        .map_err(|error| AgentError::io("create sync marker", error))?;
+    let written = file.write_all(&bytes).and_then(|_| file.sync_all());
+    drop(file);
+    if written.is_err() {
+        let _ = fs::remove_file(&marker);
+    }
+    written.map_err(|error| AgentError::io("write sync marker", error))
 }
 
 fn read_marker(staging: &Path) -> AgentResult<SyncPrepareRequest> {
     let marker = marker_path(staging);
-    let file = File::open(&marker)
-        .map_err(|error| AgentError::io(format!("open sync marker {}", marker.display()), error))?;
+    ensure_staging_directory(staging)?;
+    let (file, _) = super::files::ensure_regular_file(&marker)?;
     let mut bytes = Vec::new();
     file.take((remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -690,6 +761,7 @@ fn remove_staging(staging: &Path) -> AgentResult<()> {
 fn validate_removable_tree(root: &Path) -> AgentResult<()> {
     let mut stack = vec![root.to_path_buf()];
     let mut count = 0usize;
+    let mut queued = 1usize;
     while let Some(path) = stack.pop() {
         count += 1;
         if count > MAX_SYNC_FILES.saturating_mul(2).saturating_add(2) {
@@ -701,6 +773,10 @@ fn validate_removable_tree(root: &Path) -> AgentResult<()> {
             for item in fs::read_dir(&path).map_err(|error| {
                 AgentError::io(format!("read directory {}", path.display()), error)
             })? {
+                queued += 1;
+                if queued > MAX_SYNC_FILES.saturating_mul(2).saturating_add(2) {
+                    return Err(AgentError::invalid("staging exceeds bounded entry count"));
+                }
                 stack.push(
                     item.map_err(|error| AgentError::io("read directory entry", error))?
                         .path(),
@@ -722,11 +798,26 @@ fn validate_finish_request(request: &SyncFinishRequest) -> AgentResult<()> {
 }
 
 fn validate_staging_relationship(target: &Path, staging: &Path) -> AgentResult<()> {
-    if target.parent() != staging.parent()
+    let parent = |path: &Path| {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    };
+    let target_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AgentError::invalid("remote_path must name a UTF-8 entry"))?;
+    let prefix = format!(".remoteops-sync-{target_name}-");
+    if target == staging
+        || parent(target) != parent(staging)
         || !staging
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".remoteops-sync-"))
+            .and_then(|name| name.strip_prefix(&prefix))
+            .is_some_and(|suffix| {
+                suffix.len() == 24 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
     {
         return Err(AgentError::invalid(
             "staging_path is not a managed sibling of remote_path",
@@ -800,8 +891,24 @@ fn make_tree_removable(staging: &Path, entries: &[SyncEntry]) -> AgentResult<()>
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for entry in entries.iter().filter(|entry| entry.kind == "dir") {
+        ensure_staging_directory(staging)?;
+        fs::set_permissions(staging, fs::Permissions::from_mode(0o700))
+            .map_err(|error| AgentError::io("prepare staging root cleanup", error))?;
+        let mut directories = entries
+            .iter()
+            .filter(|entry| entry.kind == "dir")
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|entry| entry.path.matches('/').count());
+        for entry in directories {
             let path = join_entry(staging, &entry.path);
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                AgentError::io("inspect staging directory before cleanup", error)
+            })?;
+            if !metadata.file_type().is_dir() {
+                return Err(AgentError::invalid(
+                    "staging cleanup directory was replaced by a link or special file",
+                ));
+            }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
                 AgentError::io(format!("prepare staging cleanup {}", path.display()), error)
             })?;
@@ -812,6 +919,45 @@ fn make_tree_removable(staging: &Path, entries: &[SyncEntry]) -> AgentResult<()>
                 error,
             )
         })?;
+    }
+    #[cfg(not(unix))]
+    let _ = (staging, entries);
+    Ok(())
+}
+
+fn ensure_staging_directory(staging: &Path) -> AgentResult<()> {
+    let metadata = fs::symlink_metadata(staging)
+        .map_err(|error| AgentError::io("inspect staging directory", error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(AgentError::invalid(
+            "staging must be an ordinary directory and not a symlink",
+        ));
+    }
+    Ok(())
+}
+
+fn sync_staged_contents(staging: &Path, entries: &[SyncEntry]) -> AgentResult<()> {
+    #[cfg(unix)]
+    {
+        for entry in entries.iter().filter(|entry| entry.kind == "file") {
+            let (file, _) = super::files::ensure_regular_file(&join_entry(staging, &entry.path))?;
+            apply_mode(&join_entry(staging, &entry.path), entry.mode)?;
+            file.sync_all()
+                .map_err(|error| AgentError::io("sync staged file", error))?;
+        }
+        let mut directories = entries
+            .iter()
+            .filter(|entry| entry.kind == "dir")
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|entry| std::cmp::Reverse(entry.path.matches('/').count()));
+        for entry in directories {
+            File::open(join_entry(staging, &entry.path))
+                .and_then(|file| file.sync_all())
+                .map_err(|error| AgentError::io("sync staged directory", error))?;
+        }
+        File::open(staging)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| AgentError::io("sync staging root", error))?;
     }
     #[cfg(not(unix))]
     let _ = (staging, entries);
@@ -896,6 +1042,17 @@ fn command_available(program: &str) -> bool {
 
 #[cfg(unix)]
 fn switch_symlink(link: &Path, target: &Path) -> AgentResult<()> {
+    match fs::symlink_metadata(link) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => {
+            return Err(AgentError::invalid(
+                "current_path is no longer a symbolic link; refusing to replace it",
+            ));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(AgentError::io("inspect deployment link", error));
+        }
+        _ => {}
+    }
     let parent = link
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -948,6 +1105,171 @@ fn sync_parent(_path: &Path) -> AgentResult<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn release_spawn_and_rollback_failures_are_structured_and_restore_the_old_link() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let new = root.path().join("new");
+        let current = root.path().join("current");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        symlink(&old, &current).unwrap();
+        let command = |program: &str| CommandSpec {
+            program: program.into(),
+            args: vec![],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 1000,
+        };
+        let mut request = DeployActivateRequest {
+            release_path: new.to_string_lossy().into_owned(),
+            current_path: current.to_string_lossy().into_owned(),
+            stop: None,
+            start: command("/no/such/remote-ops-start"),
+            health: command("/usr/bin/true"),
+            rollback_start: Some(command("/usr/bin/true")),
+        };
+        let result = deploy_activate(request.clone()).unwrap();
+        assert_eq!(result["status"], "rolled_back");
+        assert_eq!(result["failure_stage"], "start_failed");
+        assert_eq!(result["steps"][1]["error"]["kind"], "io");
+        assert_eq!(fs::read_link(&current).unwrap(), old);
+        request.start = command("/usr/bin/true");
+        request.health = command("/no/such/remote-ops-health");
+        request.rollback_start = Some(command("/no/such/remote-ops-rollback"));
+        let result = deploy_activate(request.clone()).unwrap();
+        assert_eq!(result["status"], "rollback_failed");
+        assert_eq!(result["rolled_back"], true);
+        assert_eq!(fs::read_link(&current).unwrap(), old);
+        request.stop = Some(command("/no/such/remote-ops-stop"));
+        let result = deploy_activate(request).unwrap();
+        assert_eq!(result["status"], "stop_failed");
+        assert_eq!(fs::read_link(&current).unwrap(), old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_refuses_to_replace_a_new_regular_current_file() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old");
+        let new = root.path().join("new");
+        let current = root.path().join("current");
+        fs::create_dir(&old).unwrap();
+        fs::create_dir(&new).unwrap();
+        symlink(&old, &current).unwrap();
+        let request = DeployActivateRequest {
+            release_path: new.to_string_lossy().into_owned(),
+            current_path: current.to_string_lossy().into_owned(),
+            stop: None,
+            start: CommandSpec {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "rm \"$CURRENT\"; printf keep > \"$CURRENT\"; exit 1".into(),
+                ],
+                cwd: None,
+                env: std::collections::BTreeMap::from([(
+                    "CURRENT".into(),
+                    current.to_string_lossy().into_owned(),
+                )]),
+                timeout_ms: 1000,
+            },
+            health: CommandSpec {
+                program: "/usr/bin/true".into(),
+                args: vec![],
+                cwd: None,
+                env: Default::default(),
+                timeout_ms: 1000,
+            },
+            rollback_start: None,
+        };
+        let result = deploy_activate(request).unwrap();
+        assert_eq!(result["status"], "rollback_failed");
+        assert_eq!(result["rolled_back"], false);
+        assert_eq!(fs::read(&current).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn sync_commit_rechecks_the_destination_type_before_any_backup_move() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let entries = vec![entry("file.txt", b"payload")];
+        let request = SyncPrepareRequest {
+            remote_path: target.to_string_lossy().into_owned(),
+            manifest_sha256: manifest_sha256(None, &entries).unwrap(),
+            root_mode: None,
+            entries,
+            max_files: 10,
+            max_total_bytes: 1024,
+            max_depth: 4,
+        };
+        let prepared = sync_prepare(request.clone()).unwrap();
+        let staging = PathBuf::from(prepared["staging_path"].as_str().unwrap());
+        fs::write(staging.join("file.txt"), b"payload").unwrap();
+        fs::write(&target, b"must-not-move").unwrap();
+        let finish = SyncFinishRequest {
+            remote_path: request.remote_path,
+            staging_path: staging.to_string_lossy().into_owned(),
+            manifest_sha256: request.manifest_sha256,
+        };
+        assert_eq!(
+            sync_commit(finish.clone()).unwrap_err().kind,
+            "invalid_params"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"must-not-move");
+        sync_abort(finish).unwrap();
+        assert!(!staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_does_not_chmod_through_a_replaced_staging_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        let entries = vec![SyncEntry {
+            path: "nested".into(),
+            kind: "dir".into(),
+            size: 0,
+            sha256: None,
+            mode: Some(0),
+        }];
+        let request = SyncPrepareRequest {
+            remote_path: target.to_string_lossy().into_owned(),
+            manifest_sha256: manifest_sha256(None, &entries).unwrap(),
+            root_mode: None,
+            entries,
+            max_files: 10,
+            max_total_bytes: 1024,
+            max_depth: 4,
+        };
+        let prepared = sync_prepare(request.clone()).unwrap();
+        let staging = PathBuf::from(prepared["staging_path"].as_str().unwrap());
+        fs::remove_dir(staging.join("nested")).unwrap();
+        symlink(&outside, staging.join("nested")).unwrap();
+        let finish = SyncFinishRequest {
+            remote_path: request.remote_path,
+            staging_path: staging.to_string_lossy().into_owned(),
+            manifest_sha256: request.manifest_sha256,
+        };
+        assert!(sync_abort(finish.clone()).is_err());
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_file(staging.join("nested")).unwrap();
+        fs::create_dir(staging.join("nested")).unwrap();
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o0)).unwrap();
+        sync_abort(finish).unwrap();
+        assert!(!staging.exists());
+    }
+
     fn entry(path: &str, contents: &[u8]) -> SyncEntry {
         SyncEntry {
             path: path.to_string(),
@@ -956,6 +1278,31 @@ mod tests {
             sha256: Some(format!("{:x}", Sha256::digest(contents))),
             mode: Some(0o644),
         }
+    }
+
+    #[test]
+    fn managed_staging_is_bound_to_the_target_name_including_relative_paths() {
+        assert!(
+            validate_staging_relationship(
+                Path::new("target"),
+                Path::new("./.remoteops-sync-target-0123456789abcdef01234567")
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_staging_relationship(
+                Path::new("target"),
+                Path::new("./.remoteops-sync-other-0123456789abcdef01234567")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_staging_relationship(
+                Path::new("target"),
+                Path::new("./.remoteops-sync-target-../target")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -986,6 +1333,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(fs::read_to_string(target.join("new.txt")).unwrap(), "new");
+        assert_eq!(committed["durable"], cfg!(unix));
+        assert_eq!(committed["metadata_cleaned"], true);
         assert!(Path::new(committed["backup_path"].as_str().unwrap()).exists());
     }
 

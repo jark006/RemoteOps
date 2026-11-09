@@ -6,129 +6,129 @@ use crate::error::{AgentError, AgentResult};
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use crate::tools::timefmt::format_epoch_iso;
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod snapshot;
 #[cfg(target_os = "linux")]
+use snapshot::MAX_CMDLINE_BYTES;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use snapshot::{CommandLine, Entry, MAX_PROCESS_IDS, limit_error};
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub fn pids(filter: Option<&str>, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
-    use std::fs;
-    if limit == 0 || limit > 1024 {
-        return Err(AgentError::invalid("limit must be in range 1..=1024"));
+    use remote_ops_protocol::arguments::ValidateArguments;
+    remote_ops_protocol::arguments::PidsArgs {
+        filter: filter.map(str::to_string),
+        cursor: cursor.map(str::to_string),
+        limit,
     }
-    let mut ids: Vec<u32> = fs::read_dir("/proc")
-        .map_err(|err| AgentError::io("list /proc", err))?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
-        .collect();
-    ids.sort_unstable();
-    let after_pid = match cursor {
-        Some(value) => value
-            .parse::<u32>()
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or_else(|| AgentError::invalid("cursor must be a positive PID"))?,
-        None => 0,
-    };
-    let mut processes = Vec::new();
-    let mut more = false;
-    for pid in ids.into_iter().filter(|pid| *pid > after_pid) {
-        let name = fs::read_to_string(format!("/proc/{pid}/comm"))
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
-            .ok()
-            .map(|bytes| {
-                String::from_utf8_lossy(&bytes)
-                    .replace('\0', " ")
-                    .trim()
-                    .to_string()
+    .validate()
+    .map_err(AgentError::invalid)?;
+    let after = cursor
+        .map(|cursor| cursor.parse::<u32>().expect("validated PID"))
+        .unwrap_or(0);
+    #[cfg(target_os = "linux")]
+    {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir("/proc")
+            .map_err(|error| AgentError::io("list /proc", error))?
+            .flatten()
+        {
+            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
+                ids.push(pid);
+                if ids.len() > MAX_PROCESS_IDS {
+                    return Err(limit_error("process enumeration exceeds 65536 entries"));
+                }
+            }
+        }
+        ids.sort_unstable();
+        snapshot::page(ids, after, filter, limit, MAX_CMDLINE_BYTES + 1, |pid| {
+            let name = read_proc_text(&format!("/proc/{pid}/comm"), 1024)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            Some(Entry {
+                pid,
+                name,
+                command: linux_command_line(pid).unwrap_or_default(),
             })
-            .unwrap_or_default();
-        if filter.is_some_and(|needle| !name.contains(needle) && !cmdline.contains(needle)) {
-            continue;
-        }
-        if processes.len() == limit {
-            more = true;
-            break;
-        }
-        processes.push(json!({"pid": pid, "name": name, "cmdline": cmdline}));
+        })
     }
-    let next_cursor = if more {
-        processes
-            .last()
-            .and_then(|value| value["pid"].as_u64())
-            .map(|pid| pid.to_string())
-    } else {
-        None
-    };
-    Ok(json!({"processes": processes, "next_cursor": next_cursor, "truncated": more}))
+    #[cfg(windows)]
+    {
+        let mut entries = windows_process_entries()?;
+        entries.sort_unstable_by_key(|entry| entry.pid);
+        let names: std::collections::BTreeMap<_, _> = entries
+            .into_iter()
+            .map(|entry| (entry.pid, entry.name))
+            .collect();
+        snapshot::page(
+            names.keys().copied(),
+            after,
+            filter,
+            limit,
+            128 * 1024,
+            |pid| {
+                Some(Entry {
+                    pid,
+                    name: names[&pid].clone(),
+                    command: windows_process_command_line(pid).unwrap_or_default(),
+                })
+            },
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        snapshot::page(
+            macos_process_ids()?,
+            after,
+            filter,
+            limit,
+            MAX_PROCARGS_BUFFER_BYTES,
+            |pid| {
+                let info = macos_bsd_info(pid as i32).ok()?;
+                Some(Entry {
+                    pid,
+                    name: macos_process_name(&info),
+                    command: macos_process_command_line(pid as i32).unwrap_or_default(),
+                })
+            },
+        )
+    }
 }
 
-#[cfg(windows)]
-pub fn pids(filter: Option<&str>, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
-    if limit == 0 || limit > 1024 {
-        return Err(AgentError::invalid("limit must be in range 1..=1024"));
+#[cfg(target_os = "linux")]
+fn read_proc_text(path: &str, limit: usize) -> AgentResult<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(limit as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|error| AgentError::io(format!("read {path}"), error))?;
+    if bytes.len() > limit {
+        return Err(limit_error(format!(
+            "process metadata exceeds {limit} bytes"
+        )));
     }
-    let after_pid = parse_cursor(cursor)?;
-    let mut entries = windows_process_entries()?;
-    entries.sort_unstable_by_key(|entry| entry.pid);
-
-    let mut processes = Vec::new();
-    let mut more = false;
-    for entry in entries.into_iter().filter(|entry| entry.pid > after_pid) {
-        let cmdline = windows_process_command_line(entry.pid).unwrap_or_default();
-        if filter.is_some_and(|needle| !entry.name.contains(needle) && !cmdline.contains(needle)) {
-            continue;
-        }
-        if processes.len() == limit {
-            more = true;
-            break;
-        }
-        processes.push(json!({"pid": entry.pid, "name": entry.name, "cmdline": cmdline}));
-    }
-    let next_cursor = if more {
-        processes
-            .last()
-            .and_then(|value| value["pid"].as_u64())
-            .map(|pid| pid.to_string())
-    } else {
-        None
-    };
-    Ok(json!({"processes": processes, "next_cursor": next_cursor, "truncated": more}))
+    String::from_utf8(bytes).map_err(|error| AgentError::command(error.to_string()))
 }
 
-#[cfg(target_os = "macos")]
-pub fn pids(filter: Option<&str>, cursor: Option<&str>, limit: usize) -> AgentResult<Value> {
-    if limit == 0 || limit > 1024 {
-        return Err(AgentError::invalid("limit must be in range 1..=1024"));
-    }
-    let after_pid = parse_cursor(cursor)?;
-    let ids = macos_process_ids()?;
-
-    let mut processes = Vec::new();
-    let mut more = false;
-    for pid in ids.into_iter().filter(|pid| *pid > after_pid) {
-        let Ok(info) = macos_bsd_info(pid as i32) else {
-            continue;
-        };
-        let name = macos_process_name(&info);
-        let cmdline = macos_process_command_line(pid as i32).unwrap_or_default();
-        if filter.is_some_and(|needle| !name.contains(needle) && !cmdline.contains(needle)) {
-            continue;
-        }
-        if processes.len() == limit {
-            more = true;
-            break;
-        }
-        processes.push(json!({"pid": pid, "name": name, "cmdline": cmdline}));
-    }
-    let next_cursor = if more {
-        processes
-            .last()
-            .and_then(|value| value["pid"].as_u64())
-            .map(|pid| pid.to_string())
-    } else {
-        None
-    };
-    Ok(json!({"processes": processes, "next_cursor": next_cursor, "truncated": more}))
+#[cfg(target_os = "linux")]
+fn linux_command_line(pid: u32) -> AgentResult<CommandLine> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(format!("/proc/{pid}/cmdline"))
+        .and_then(|file| {
+            file.take(MAX_CMDLINE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|error| AgentError::io("read process command line", error))?;
+    let length = bytes.len();
+    let truncated = length > MAX_CMDLINE_BYTES;
+    bytes.truncate(MAX_CMDLINE_BYTES);
+    let text = String::from_utf8_lossy(&bytes)
+        .replace('\0', " ")
+        .trim()
+        .to_string();
+    Ok(CommandLine::from_text(text, length, truncated))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -140,7 +140,7 @@ pub fn pids(_filter: Option<&str>, _cursor: Option<&str>, _limit: usize) -> Agen
 
 #[cfg(target_os = "linux")]
 fn linux_boot_time() -> Option<u64> {
-    std::fs::read_to_string("/proc/stat")
+    read_proc_text("/proc/stat", 1024 * 1024)
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("btime "))
@@ -149,14 +149,11 @@ fn linux_boot_time() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 pub fn process_info(pid: i32) -> AgentResult<Value> {
-    use std::fs;
     if pid <= 0 {
         return Err(AgentError::invalid("pid must be greater than zero"));
     }
-    let status = fs::read_to_string(format!("/proc/{pid}/status"))
-        .map_err(|err| AgentError::io(format!("read process {pid}"), err))?;
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|err| AgentError::io(format!("read process stat {pid}"), err))?;
+    let status = read_proc_text(&format!("/proc/{pid}/status"), 64 * 1024)?;
+    let stat = read_proc_text(&format!("/proc/{pid}/stat"), 16 * 1024)?;
     let value = |key: &str| {
         status
             .lines()
@@ -184,15 +181,7 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
         parse_first("Uid").ok_or_else(|| AgentError::command("process status Uid is invalid"))?;
     let rss_bytes = parse_first("VmRSS").map(|v| v * 1024);
     let virtual_memory_bytes = parse_first("VmSize").map(|v| v * 1024);
-    let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
-        .ok()
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .replace('\0', " ")
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_default();
+    let cmdline = linux_command_line(pid as u32).unwrap_or_default();
     let close = stat
         .rfind(')')
         .ok_or_else(|| AgentError::command("malformed /proc stat"))?;
@@ -209,7 +198,7 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
         .map(|boot| boot + start_time_ticks / clock_ticks as u64)
         .map(|epoch| format_epoch_iso(epoch as i64));
     Ok(
-        json!({"pid": pid, "ppid": ppid, "name": name, "state": state, "cmdline": cmdline, "uid": uid, "resident_bytes": rss_bytes, "virtual_bytes": virtual_memory_bytes, "start_time_ticks": start_time_ticks, "start_time_seconds": start_time_ticks as f64 / clock_ticks as f64, "start_time_iso": start_time_iso}),
+        json!({"pid": pid, "ppid": ppid, "name": name, "state": state, "cmdline": cmdline.text, "cmdline_available":cmdline.available,"cmdline_truncated":cmdline.truncated, "uid": uid, "resident_bytes": rss_bytes, "virtual_bytes": virtual_memory_bytes, "start_time_ticks": start_time_ticks, "start_time_seconds": start_time_ticks as f64 / clock_ticks as f64, "start_time_iso": start_time_iso}),
     )
 }
 
@@ -278,7 +267,7 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
         "ppid": entry.ppid,
         "name": entry.name,
         "state": Value::Null,
-        "cmdline": cmdline,
+        "cmdline": cmdline.text, "cmdline_available":cmdline.available,"cmdline_truncated":cmdline.truncated,
         "uid": Value::Null,
         "resident_bytes": memory.WorkingSetSize as u64,
         "virtual_bytes": virtual_bytes,
@@ -296,13 +285,14 @@ pub fn process_info(pid: i32) -> AgentResult<Value> {
     let info = macos_bsd_info(pid)?;
     let task = macos_task_info(pid)?;
     let start_time_ticks = macos_process_start_ticks(&info)?;
+    let cmdline = macos_process_command_line(pid).unwrap_or_default();
 
     Ok(json!({
         "pid": pid,
         "ppid": info.pbi_ppid,
         "name": macos_process_name(&info),
         "state": macos_process_state(info.pbi_status),
-        "cmdline": macos_process_command_line(pid).unwrap_or_default(),
+        "cmdline":cmdline.text,"cmdline_available":cmdline.available,"cmdline_truncated":cmdline.truncated,
         "uid": info.pbi_uid,
         "resident_bytes": task.pti_resident_size,
         "virtual_bytes": task.pti_virtual_size,
@@ -327,8 +317,6 @@ const PROC_PIDTASKINFO: libc::c_int = 4;
 const CTL_KERN: libc::c_int = 1;
 #[cfg(target_os = "macos")]
 const KERN_PROCARGS2: libc::c_int = 49;
-#[cfg(target_os = "macos")]
-const MAX_COMMAND_LINE_BYTES: usize = 128 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_PROCARGS_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -406,7 +394,12 @@ fn macos_process_ids() -> AgentResult<Vec<u32>> {
             std::io::Error::last_os_error(),
         ));
     }
-    let capacity = (estimated as usize).saturating_add(64);
+    if estimated as usize > MAX_PROCESS_IDS {
+        return Err(limit_error("process enumeration exceeds 65536 entries"));
+    }
+    let capacity = (estimated as usize)
+        .saturating_add(64)
+        .min(MAX_PROCESS_IDS + 1);
     let buffer_bytes = capacity
         .checked_mul(size_of::<libc::pid_t>())
         .and_then(|value| libc::c_int::try_from(value).ok())
@@ -419,7 +412,12 @@ fn macos_process_ids() -> AgentResult<Vec<u32>> {
             std::io::Error::last_os_error(),
         ));
     }
-    buffer.truncate((count as usize).min(buffer.len()));
+    if count as usize >= buffer.len() || count as usize > MAX_PROCESS_IDS {
+        return Err(limit_error(
+            "process snapshot filled its bounded buffer; retry after reducing process count",
+        ));
+    }
+    buffer.truncate(count as usize);
     let mut ids: Vec<u32> = buffer
         .into_iter()
         .filter_map(|pid| u32::try_from(pid).ok())
@@ -513,7 +511,7 @@ fn macos_process_state(status: u32) -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_process_command_line(pid: i32) -> AgentResult<String> {
+fn macos_process_command_line(pid: i32) -> AgentResult<CommandLine> {
     use std::ffi::c_void;
     use std::mem::size_of;
 
@@ -559,7 +557,7 @@ fn macos_process_command_line(pid: i32) -> AgentResult<String> {
         ));
     }
     buffer.truncate(required);
-    macos_parse_command_line(&buffer)
+    macos_parse_command_line(&buffer).map(|text| CommandLine::from_text(text, required, false))
 }
 
 #[cfg(target_os = "macos")]
@@ -599,15 +597,7 @@ fn macos_parse_command_line(buffer: &[u8]) -> AgentResult<String> {
         arguments.push(String::from_utf8_lossy(&buffer[offset..end]).into_owned());
         offset = end.saturating_add(1);
     }
-    let mut command_line = arguments.join(" ");
-    if command_line.len() > MAX_COMMAND_LINE_BYTES {
-        let mut boundary = MAX_COMMAND_LINE_BYTES;
-        while !command_line.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        command_line.truncate(boundary);
-    }
-    Ok(command_line)
+    Ok(arguments.join(" "))
 }
 
 #[cfg(target_os = "macos")]
@@ -654,18 +644,6 @@ struct WindowsProcessEntry {
     name: String,
 }
 
-#[cfg(any(target_os = "macos", windows))]
-fn parse_cursor(cursor: Option<&str>) -> AgentResult<u32> {
-    match cursor {
-        Some(value) => value
-            .parse::<u32>()
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or_else(|| AgentError::invalid("cursor must be a positive PID")),
-        None => Ok(0),
-    }
-}
-
 #[cfg(windows)]
 fn windows_process_entries() -> AgentResult<Vec<WindowsProcessEntry>> {
     use std::mem::{size_of, zeroed};
@@ -700,6 +678,9 @@ fn windows_process_entries() -> AgentResult<Vec<WindowsProcessEntry>> {
                 .iter()
                 .position(|value| *value == 0)
                 .unwrap_or(raw.szExeFile.len());
+            if entries.len() == MAX_PROCESS_IDS {
+                return Err(limit_error("process enumeration exceeds 65536 entries"));
+            }
             entries.push(WindowsProcessEntry {
                 pid: raw.th32ProcessID,
                 ppid: raw.th32ParentProcessID,
@@ -741,7 +722,7 @@ fn windows_process_name_matches(actual: &str, requested: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_process_command_line(pid: u32) -> Option<String> {
+fn windows_process_command_line(pid: u32) -> Option<CommandLine> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -770,14 +751,14 @@ fn open_process_for_query(pid: u32) -> AgentResult<OwnedHandle> {
 }
 
 #[cfg(windows)]
-fn process_virtual_bytes(process: windows_sys::Win32::Foundation::HANDLE) -> u64 {
+fn process_virtual_bytes(process: windows_sys::Win32::Foundation::HANDLE) -> Option<u64> {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
     use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
 
     let mut address = 0usize;
     let mut total = 0u64;
-    loop {
+    for _ in 0..65_536 {
         let mut region: MEMORY_BASIC_INFORMATION = unsafe { zeroed() };
         if unsafe {
             VirtualQueryEx(
@@ -788,26 +769,24 @@ fn process_virtual_bytes(process: windows_sys::Win32::Foundation::HANDLE) -> u64
             )
         } == 0
         {
-            break;
+            return Some(total);
         }
         if region.State != MEM_FREE {
             total = total.saturating_add(region.RegionSize as u64);
         }
-        let Some(next) = (region.BaseAddress as usize).checked_add(region.RegionSize) else {
-            break;
-        };
+        let next = (region.BaseAddress as usize).checked_add(region.RegionSize)?;
         if next <= address {
-            break;
+            return None;
         }
         address = next;
     }
-    total
+    None
 }
 
 #[cfg(windows)]
 fn query_process_command_line(
     process: windows_sys::Win32::Foundation::HANDLE,
-) -> AgentResult<String> {
+) -> AgentResult<CommandLine> {
     use std::ffi::c_void;
     use std::mem::size_of;
     use windows_sys::Wdk::System::Threading::{
@@ -864,7 +843,11 @@ fn query_process_command_line(
         ));
     }
     let wide = unsafe { std::slice::from_raw_parts(value.Buffer, byte_len / 2) };
-    Ok(String::from_utf16_lossy(wide))
+    Ok(CommandLine::from_text(
+        String::from_utf16_lossy(wide),
+        required as usize,
+        false,
+    ))
 }
 
 #[cfg(windows)]
@@ -1037,6 +1020,7 @@ pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
     validate_pkill_args(name, signal)?;
     let own_pid = std::process::id() as i32;
     let mut matched_pids = Vec::new();
+    let mut examined = 0;
     for entry in fs::read_dir("/proc").map_err(|error| AgentError::io("list /proc", error))? {
         let Ok(entry) = entry else {
             continue;
@@ -1049,13 +1033,21 @@ pub fn pkill(name: &str, signal: i32) -> AgentResult<Value> {
         else {
             continue;
         };
-        let Ok(mut process_name) = fs::read(entry.path().join("comm")) else {
+        examined += 1;
+        if examined > MAX_PROCESS_IDS {
+            return Err(limit_error(
+                "process enumeration exceeds 65536 entries; no signals sent",
+            ));
+        }
+        let Ok(mut process_name) =
+            read_proc_text(&entry.path().join("comm").to_string_lossy(), 1024)
+        else {
             continue;
         };
-        if process_name.last() == Some(&b'\n') {
+        if process_name.ends_with('\n') {
             process_name.pop();
         }
-        if process_name != name.as_bytes() {
+        if process_name != name {
             continue;
         }
         push_pkill_match(&mut matched_pids, pid)?;

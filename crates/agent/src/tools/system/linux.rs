@@ -3,7 +3,6 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -681,33 +680,7 @@ fn temperatures() -> Vec<Value> {
 }
 
 fn init_system_snapshot() -> Value {
-    let pid1_comm = bounded_text("/proc/1/comm", 256)
-        .map(|(value, _)| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let init_target = fs::read_link("/sbin/init")
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned());
-    let name =
-        if Path::new("/run/systemd/system").exists() || pid1_comm.as_deref() == Some("systemd") {
-            Some("systemd")
-        } else if Path::new("/run/openrc").exists()
-            || init_target
-                .as_deref()
-                .is_some_and(|path| path.contains("openrc"))
-        {
-            Some("openrc")
-        } else if pid1_comm.as_deref() == Some("busybox")
-            || init_target
-                .as_deref()
-                .is_some_and(|path| path.contains("busybox"))
-        {
-            Some("busybox-init")
-        } else if pid1_comm.as_deref() == Some("init") {
-            Some("sysvinit")
-        } else {
-            pid1_comm.as_deref()
-        };
-    json!({"name": name, "pid1_comm": pid1_comm})
+    super::super::environment::init_system_snapshot()
 }
 
 #[cfg(test)]

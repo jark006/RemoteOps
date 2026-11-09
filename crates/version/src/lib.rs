@@ -4,6 +4,12 @@
 
 pub const REPOSITORY_URL: &str = "https://github.com/jark006/RemoteOps";
 
+/// Embedded in both binaries so cross-build artifacts can be checked without
+/// executing code for a different platform.
+pub fn artifact_metadata() -> &'static str {
+    env!("REMOTE_OPS_ARTIFACT_METADATA")
+}
+
 /// Whether any argument requests the version (equivalent to `--version`/`-v`).
 pub fn requests_version(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter()
@@ -33,7 +39,11 @@ pub fn version_line() -> String {
 /// Renders the full `--version` output for a binary, e.g.
 /// `remote-ops-proxy v1.4.0 (...) ...` followed by the repository URL.
 pub fn version_text(binary_name: &str) -> String {
-    format!("{binary_name} {} {REPOSITORY_URL}\n", version_line())
+    format!(
+        "{binary_name} {} {REPOSITORY_URL}\n{}\n",
+        version_line(),
+        artifact_metadata()
+    )
 }
 
 #[cfg(test)]
@@ -70,5 +80,8 @@ mod tests {
             env!("REMOTE_OPS_BUILD_TZ"),
         )));
         assert!(text.contains(REPOSITORY_URL));
+        assert!(text.lines().any(|line| line == artifact_metadata()));
+        assert!(artifact_metadata().starts_with("REMOTE_OPS_ARTIFACT_V1:{"));
+        assert!(artifact_metadata().ends_with(":REMOTE_OPS_ARTIFACT_END"));
     }
 }

@@ -15,12 +15,12 @@ use remote_ops_protocol::{
 use crate::error::{AgentError, AgentResult};
 use crate::tools::timefmt::format_epoch_iso;
 
-pub const READ_TEXT_MAX_BYTES: usize = 1024 * 1024;
+pub use remote_ops_protocol::arguments::{
+    FILE_HASH_MAX_BYTES, READ_TEXT_MAX_BYTES, TAIL_TEXT_MAX_BYTES,
+};
 pub const READ_FILE_LINES_MAX_BYTES: usize = 1024 * 1024;
 pub const READ_FILE_LINES_MAX_LINES: u64 = 10_000;
 pub const READ_FILE_LINES_DEFAULT_LINES: u64 = 200;
-pub const TAIL_TEXT_MAX_BYTES: usize = 1024 * 1024;
-pub const FILE_HASH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const GREP_MAX_PATTERN_BYTES: usize = 4 * 1024;
 pub const GREP_MAX_GLOB_BYTES: usize = 1024;
 pub const GREP_MAX_RESULTS: usize = 1000;
@@ -43,11 +43,7 @@ pub fn read_text(path: &str, offset: u64, max_bytes: usize) -> AgentResult<Value
             "max_bytes must be in range 0..={READ_TEXT_MAX_BYTES}"
         )));
     }
-    let mut file = File::open(path).map_err(|err| AgentError::io(format!("open {path}"), err))?;
-    let size = file
-        .metadata()
-        .map_err(|err| AgentError::io(format!("stat {path}"), err))?
-        .len();
+    let (mut file, size) = ensure_regular_file(Path::new(path))?;
     if offset > size {
         return Err(AgentError::invalid("offset exceeds file size"));
     }
@@ -57,6 +53,11 @@ pub fn read_text(path: &str, offset: u64, max_bytes: usize) -> AgentResult<Value
     file.take(max_bytes as u64)
         .read_to_end(&mut bytes)
         .map_err(|err| AgentError::io(format!("read {path}"), err))?;
+    let keep = remote_ops_protocol::encoding::lossy_prefix_len(
+        &bytes,
+        remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES - 16 * 1024,
+    );
+    bytes.truncate(keep);
     let next_offset = offset + bytes.len() as u64;
     let truncated = next_offset < size;
     let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -105,11 +106,7 @@ pub fn read_file_lines(
             "path must be a regular file and not a symlink",
         ));
     }
-    let file = File::open(target).map_err(|err| AgentError::io(format!("open {path}"), err))?;
-    let size = file
-        .metadata()
-        .map_err(|err| AgentError::io(format!("stat {path}"), err))?
-        .len();
+    let (file, size) = ensure_regular_file(target)?;
     let mut reader = BufReader::new(file);
     let mut current_line = 1u64;
     let mut bytes_scanned = 0u64;
@@ -118,6 +115,7 @@ pub fn read_file_lines(
     let mut lines_returned = 0u64;
     let mut next_line = None;
     let mut truncated = false;
+    let mut encoded_remaining = remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES - 16 * 1024;
 
     loop {
         let remaining_scan = READ_FILE_LINES_MAX_SCAN_BYTES
@@ -149,6 +147,15 @@ pub fn read_file_lines(
                 next_line = Some(current_line);
                 break;
             }
+            let current_cost =
+                remote_ops_protocol::encoding::lossy_prefix_len(&line, encoded_remaining);
+            if current_cost < line.len() {
+                truncated = true;
+                next_line = Some(current_line);
+                break;
+            }
+            encoded_remaining -=
+                remote_ops_protocol::encoding::json_text_bytes(&String::from_utf8_lossy(&line));
             output.extend_from_slice(&line);
             lines_returned += 1;
         }
@@ -187,25 +194,28 @@ pub fn tail_text(path: &str, lines: usize, max_bytes: usize) -> AgentResult<Valu
             "max_bytes must be in range 0..={TAIL_TEXT_MAX_BYTES}"
         )));
     }
-    let mut file = File::open(path).map_err(|err| AgentError::io(format!("open {path}"), err))?;
-    let size = file
-        .metadata()
-        .map_err(|err| AgentError::io(format!("stat {path}"), err))?
-        .len();
+    let (mut file, size) = ensure_regular_file(Path::new(path))?;
     let scan = size.min(max_bytes as u64);
     file.seek(SeekFrom::Start(size - scan))
         .map_err(|err| AgentError::io(format!("seek {path}"), err))?;
     let mut bytes = Vec::with_capacity(scan as usize);
-    file.read_to_end(&mut bytes)
+    file.take(scan)
+        .read_to_end(&mut bytes)
         .map_err(|err| AgentError::io(format!("read {path}"), err))?;
     let text = String::from_utf8_lossy(&bytes);
-    let parts: Vec<&str> = text.lines().collect();
+    let parts: Vec<&str> = text.split_inclusive('\n').collect();
     let start = parts.len().saturating_sub(lines);
-    let selected = parts[start..].join("\n");
-    let truncated = scan < size || start > 0;
+    let selected = parts[start..].concat();
+    let bounded_start = remote_ops_protocol::encoding::json_suffix_start(
+        &selected,
+        remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES - 16 * 1024,
+    );
+    let selected = &selected[bounded_start..];
+    let truncated = scan < size || start > 0 || bounded_start > 0;
+    let lines_returned = selected.split_inclusive('\n').count();
     Ok(json!({
         "text": selected,
-        "metadata": {"bytes_scanned": scan, "lines_returned": parts.len() - start, "truncated": truncated}
+        "metadata": {"bytes_scanned": scan, "lines_returned": lines_returned, "truncated": truncated}
     }))
 }
 
@@ -1019,19 +1029,14 @@ pub fn file_hash(path: &str, max_bytes: u64) -> AgentResult<Value> {
             "max_bytes must be in range 0..={FILE_HASH_MAX_BYTES}"
         )));
     }
-    let mut file = File::open(path).map_err(|err| AgentError::io(format!("open {path}"), err))?;
-    let metadata = file
-        .metadata()
-        .map_err(|err| AgentError::io(format!("stat {path}"), err))?;
-    if !metadata.is_file() {
-        return Err(AgentError::invalid("path must be a regular file"));
-    }
-    if metadata.len() > max_bytes {
+    let (file, size) = ensure_regular_file(Path::new(path))?;
+    if size > max_bytes {
         return Err(AgentError::invalid(format!(
             "file exceeds max_bytes ({max_bytes})"
         )));
     }
     let mut digest = Sha256::new();
+    let mut file = file.take(max_bytes.saturating_add(1));
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
@@ -1040,6 +1045,11 @@ pub fn file_hash(path: &str, max_bytes: u64) -> AgentResult<Value> {
             .map_err(|err| AgentError::io(format!("read {path}"), err))?;
         if read == 0 {
             break;
+        }
+        if total.saturating_add(read as u64) > max_bytes {
+            return Err(AgentError::invalid(
+                "file grew beyond max_bytes while hashing",
+            ));
         }
         digest.update(&buffer[..read]);
         total += read as u64;
@@ -1264,8 +1274,14 @@ pub fn ensure_regular_file(path: &Path) -> AgentResult<(File, u64)> {
             "source must be a regular file and not a symlink",
         ));
     }
-    let file = OpenOptions::new()
-        .read(true)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
         .open(path)
         .map_err(|err| AgentError::io(format!("open {}", path.display()), err))?;
     let metadata = file
@@ -1288,6 +1304,27 @@ pub fn normalized_path(path: &str) -> AgentResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn text_and_hash_readers_reject_symlinks_and_fifos_before_opening() {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        let link = root.path().join("link");
+        let fifo = root.path().join("fifo");
+        fs::write(&file, b"text").unwrap();
+        symlink(&file, &link).unwrap();
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        for path in [&link, &fifo] {
+            let path = path.to_str().unwrap();
+            assert!(read_text(path, 0, 10).is_err());
+            assert!(tail_text(path, 1, 10).is_err());
+            assert!(read_file_lines(path, 1, None, 10).is_err());
+            assert!(file_hash(path, 100).is_err());
+        }
+    }
 
     fn update_patch(path: &str, hunks: &str) -> String {
         format!("*** Begin Patch\n*** Update File: {path}\n{hunks}*** End Patch")

@@ -5,8 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use remote_ops_protocol::{
-    CommandSpec, DEFAULT_MAX_CONTROL_BYTES, DeployActivateRequest, DeployPreflightRequest,
-    MAX_RELEASE_ID_BYTES, SyncEntry, SyncFinishRequest, SyncPrepareRequest,
+    CommandSpec, DeployActivateRequest, DeployPreflightRequest, MAX_RELEASE_ID_BYTES, SyncEntry,
+    SyncFinishRequest, SyncPrepareRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -87,7 +87,7 @@ pub fn deploy_release(
     let preflight = client.call(
         "deploy_preflight",
         serde_json::to_value(preflight_request).expect("serializable deploy preflight"),
-    )?;
+    ).map_err(|error|error.with_recovery(json!({"tool":"deploy_release","phase":"preflight","release_path":release_path,"current_path":options.current_path})))?;
     let sync = sync_manifest(client, &release_path, &options.sync, &manifest)?;
     let activation_request = DeployActivateRequest {
         release_path: release_path.clone(),
@@ -100,7 +100,7 @@ pub fn deploy_release(
     let activation = client.call(
         "deploy_activate",
         serde_json::to_value(activation_request).expect("serializable deployment activation"),
-    )?;
+    ).map_err(|error|error.with_recovery(json!({"tool":"deploy_release","phase":"activation","release_path":release_path,"current_path":options.current_path,"sync":sync})))?;
     Ok(json!({
         "status": activation["status"],
         "deployed": activation["deployed"],
@@ -130,106 +130,97 @@ fn sync_manifest(
         max_total_bytes: options.max_total_bytes,
         max_depth: options.max_depth,
     };
-    let encoded = serde_json::to_vec(&prepare_request)
-        .map_err(|error| ClientError::local("invalid_params", error.to_string()))?;
-    if encoded.len() > DEFAULT_MAX_CONTROL_BYTES {
-        return Err(ClientError::local(
-            "invalid_params",
-            "directory manifest exceeds the control frame limit",
-        ));
-    }
-    let prepared = client.call(
-        "sync_prepare",
-        serde_json::to_value(&prepare_request).expect("serializable sync request"),
-    )?;
+    let arguments = serde_json::to_value(&prepare_request).expect("serializable sync request");
+    crate::client::validate_request("sync_prepare", &arguments)?;
+    let prepared=client.call("sync_prepare",arguments).map_err(|error|error.with_recovery(json!({"tool":"sync_directory","phase":"prepare","remote_path":remote_path,"manifest_sha256":manifest.sha256,"cleanup":{"status":"not_attempted"}})))?;
     let staging_path = prepared["staging_path"]
         .as_str()
         .ok_or_else(|| ClientError::local("protocol", "sync_prepare omitted staging_path"))?
         .to_string();
+    validate_staging_reply(remote_path, &staging_path)?;
     let finish = SyncFinishRequest {
         remote_path: remote_path.to_string(),
         staging_path: staging_path.clone(),
         manifest_sha256: manifest.sha256.clone(),
     };
-    let required = prepared["required_uploads"]
-        .as_array()
-        .ok_or_else(|| ClientError::local("protocol", "sync_prepare omitted required_uploads"))?;
-    let files = manifest
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == "file")
-        .map(|entry| (entry.path.as_str(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut seen = BTreeSet::new();
-    let mut transferred_files = 0usize;
-    let mut transferred_bytes = 0u64;
-    for item in required {
-        let relative = item.as_str().ok_or_else(|| {
-            ClientError::local("protocol", "required upload path is not a string")
+    let mut phase = "prepare";
+    let result = (|| {
+        let required = prepared["required_uploads"].as_array().ok_or_else(|| {
+            ClientError::local("protocol", "sync_prepare omitted required_uploads")
         })?;
-        if !seen.insert(relative.to_string()) {
-            abort_sync(client, &finish);
-            return Err(ClientError::local(
-                "protocol",
-                "sync_prepare returned a duplicate upload path",
-            ));
-        }
-        let entry = files.get(relative).ok_or_else(|| {
-            abort_sync(client, &finish);
-            ClientError::local(
-                "protocol",
-                "sync_prepare requested a path outside the local manifest",
-            )
-        })?;
-        let local = join_local_entry(&manifest.root, relative);
-        let remote = remote_join(&staging_path, relative);
-        match client.upload(&local.to_string_lossy(), &remote, false, entry.mode, true) {
-            Ok(upload) => {
-                transferred_files += 1;
-                transferred_bytes = transferred_bytes
-                    .checked_add(upload["bytes_transferred"].as_u64().unwrap_or(0))
-                    .ok_or_else(|| {
-                        ClientError::local("protocol", "transferred byte count overflow")
-                    })?;
-            }
-            Err(error) => {
-                abort_sync(client, &finish);
-                return Err(error);
+        let files = manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "file")
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut seen = BTreeSet::new();
+        // Validate the entire upload plan before sending any bytes.
+        for item in required {
+            let relative = item.as_str().ok_or_else(|| {
+                ClientError::local("protocol", "required upload path is not a string")
+            })?;
+            if !seen.insert(relative) || !files.contains_key(relative) {
+                return Err(ClientError::local(
+                    "protocol",
+                    "sync_prepare returned a duplicate path or a path outside the local manifest",
+                ));
             }
         }
-    }
-    let committed = match client.call(
-        "sync_commit",
-        serde_json::to_value(&finish).expect("serializable sync finish"),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            abort_sync(client, &finish);
-            return Err(error);
+        let mut transferred_files = 0usize;
+        let mut transferred_bytes = 0u64;
+        phase = "upload";
+        for item in required {
+            let relative = item.as_str().expect("validated upload path");
+            let local = join_local_entry(&manifest.root, relative);
+            let remote = remote_join(&staging_path, relative);
+            let upload = client.upload(&local.to_string_lossy(), &remote, false, None, true)?;
+            let bytes = upload["bytes_transferred"].as_u64().ok_or_else(|| {
+                ClientError::local("protocol", "upload response omitted byte count")
+            })?;
+            transferred_bytes = transferred_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| ClientError::local("protocol", "transferred byte count overflow"))?;
+            transferred_files += 1;
         }
-    };
-    Ok(json!({
-        "committed": true,
-        "local_path": manifest.root.to_string_lossy(),
-        "remote_path": remote_path,
-        "manifest_sha256": manifest.sha256,
-        "files": manifest.files,
-        "directories": manifest.directories,
-        "total_bytes": manifest.total_bytes,
-        "files_transferred": transferred_files,
-        "bytes_transferred": transferred_bytes,
-        "files_reused": prepared["reused_files"],
-        "bytes_reused": prepared["reused_bytes"],
-        "backup_path": committed["backup_path"],
-        "staging_path": staging_path
-    }))
-}
-
-fn abort_sync(client: &mut RemoteClient, finish: &SyncFinishRequest) {
-    let _ = client.call(
-        "sync_abort",
-        serde_json::to_value(finish).expect("serializable sync abort"),
-    );
+        phase = "commit";
+        let committed = client.call(
+            "sync_commit",
+            serde_json::to_value(&finish).expect("serializable sync finish"),
+        )?;
+        if committed["committed"] != true {
+            return Err(ClientError::from(remote_ops_protocol::RemoteError {
+                kind: committed["error"]["kind"]
+                    .as_str()
+                    .unwrap_or("sync_commit_failed")
+                    .to_string(),
+                message: committed["error"]["message"]
+                    .as_str()
+                    .unwrap_or("sync_commit did not confirm activation")
+                    .to_string(),
+            })
+            .with_recovery(json!({"commit":committed})));
+        }
+        Ok(json!({
+            "committed":true,"local_path":manifest.root.to_string_lossy(),"remote_path":remote_path,
+            "manifest_sha256":manifest.sha256,"files":manifest.files,"directories":manifest.directories,"total_bytes":manifest.total_bytes,
+            "files_transferred":transferred_files,"bytes_transferred":transferred_bytes,"files_reused":prepared["reused_files"],"bytes_reused":prepared["reused_bytes"],
+            "backup_path":committed["backup_path"],"staging_path":staging_path,
+            "commit":committed
+        }))
+    })();
+    result.map_err(|error:ClientError| {
+        // An unconfirmed commit or upload may still be executing on the Agent.
+        // Keep its staging/marker intact; never reconnect merely to abort it.
+        let cleanup=if phase!="commit" && !error.halts_workflow() {
+            match client.call("sync_abort",serde_json::to_value(&finish).expect("serializable sync finish")) {
+                Ok(value) if value["aborted"]==true=>json!({"status":"removed"}),
+                Ok(value)=>json!({"status":"unconfirmed","response":value}),
+                Err(cleanup_error)=>json!({"status":"unconfirmed","error":cleanup_error.details()}),
+            }
+        } else {json!({"status":"not_attempted"})};
+        error.with_recovery(json!({"tool":"sync_directory","phase":phase,"remote_path":remote_path,"staging_path":staging_path,"manifest_sha256":manifest.sha256,"cleanup":cleanup}))
+    })
 }
 
 fn build_manifest(
@@ -385,6 +376,41 @@ fn remote_join(root: &str, relative: &str) -> String {
     format!("{}/{}", root.trim_end_matches(['/', '\\']), relative)
 }
 
+fn validate_staging_reply(remote_path: &str, staging: &str) -> Result<(), ClientError> {
+    let normalized = remote_path.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    let (parent, name) = normalized.rsplit_once('/').unwrap_or(("", normalized));
+    let staged = staging.replace('\\', "/");
+    let (stage_parent, stage_name) = staged.rsplit_once('/').unwrap_or(("", staged.as_str()));
+    let parent = if parent.is_empty() {
+        if normalized.starts_with('/') {
+            "/"
+        } else {
+            "."
+        }
+    } else {
+        parent
+    };
+    let stage_parent = if stage_parent.is_empty() {
+        if staged.starts_with('/') { "/" } else { "." }
+    } else {
+        stage_parent
+    };
+    let expected = format!(".remoteops-sync-{name}-");
+    let suffix = stage_name.strip_prefix(&expected);
+    if parent != stage_parent
+        || !suffix.is_some_and(|suffix| {
+            suffix.len() == 24 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(ClientError::local(
+            "protocol",
+            "sync_prepare returned a staging path outside its managed sibling namespace",
+        ));
+    }
+    Ok(())
+}
+
 fn hash_local_file(path: &Path, expected_size: u64) -> Result<String, ClientError> {
     let mut file = File::open(path)
         .map_err(|error| ClientError::local("io", format!("open {}: {error}", path.display())))?;
@@ -488,6 +514,41 @@ fn local_mode(_metadata: &fs::Metadata) -> Option<u32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sync_reply_must_use_the_same_parent_and_target_bound_random_name() {
+        assert!(
+            validate_staging_reply(
+                "/target",
+                "/.remoteops-sync-target-0123456789abcdef01234567"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_staging_reply("/target", ".remoteops-sync-target-0123456789abcdef01234567")
+                .is_err()
+        );
+        assert!(
+            validate_staging_reply(
+                "target",
+                "./.remoteops-sync-target-0123456789abcdef01234567"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_staging_reply(
+                "C:\\data\\target",
+                "C:/data/.remoteops-sync-target-0123456789abcdef01234567"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_staging_reply(
+                "/tmp/target",
+                "/tmp/.remoteops-sync-other-0123456789abcdef01234567"
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn manifest_is_sorted_hashed_and_excludes_subtrees() {
         let directory = tempfile::tempdir().unwrap();

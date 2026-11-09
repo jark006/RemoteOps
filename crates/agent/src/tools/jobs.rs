@@ -334,8 +334,14 @@ pub fn process_output(
     }
     let job = manager.get(job_id)?;
     let data = lock(&job.data);
-    let stdout = data.stdout.read(stdout_cursor, max_bytes, "stdout")?;
-    let stderr = data.stderr.read(stderr_cursor, max_bytes, "stderr")?;
+    let mut stdout = data.stdout.read(stdout_cursor, max_bytes, "stdout")?;
+    let mut stderr = data.stderr.read(stderr_cursor, max_bytes, "stderr")?;
+    let budget = (remote_ops_protocol::DEFAULT_MAX_CONTROL_BYTES - 16 * 1024) / 2;
+    for output in [&mut stdout, &mut stderr] {
+        let length = remote_ops_protocol::encoding::lossy_prefix_len(&output.bytes, budget);
+        output.next_cursor -= (output.bytes.len() - length) as u64;
+        output.bytes.truncate(length);
+    }
     let mut result = status_object(&job, &data);
     result.insert(
         "stdout".to_string(),
@@ -409,32 +415,8 @@ fn validate_process_start(
     cwd: Option<&str>,
     env: &BTreeMap<String, String>,
 ) -> AgentResult<()> {
-    if program.is_empty() {
-        return Err(AgentError::invalid("program must not be empty"));
-    }
-    if program.contains('\0') {
-        return Err(AgentError::invalid("program must not contain NUL"));
-    }
-    if args.iter().any(|arg| arg.contains('\0')) {
-        return Err(AgentError::invalid("args must not contain NUL"));
-    }
-    if let Some(cwd) = cwd {
-        if cwd.is_empty() {
-            return Err(AgentError::invalid("cwd must not be empty"));
-        }
-        if cwd.contains('\0') {
-            return Err(AgentError::invalid("cwd must not contain NUL"));
-        }
-    }
-    if env
-        .iter()
-        .any(|(name, value)| name.is_empty() || name.contains(['\0', '=']) || value.contains('\0'))
-    {
-        return Err(AgentError::invalid(
-            "environment names must be non-empty without NUL or '=' and values must not contain NUL",
-        ));
-    }
-    Ok(())
+    remote_ops_protocol::execution::validate_program(program, args, cwd, env)
+        .map_err(AgentError::invalid)
 }
 
 fn validate_job_timeout(timeout_ms: u64) -> AgentResult<()> {

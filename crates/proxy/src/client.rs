@@ -14,37 +14,8 @@ use remote_ops_protocol::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug)]
-pub struct ClientError {
-    pub kind: String,
-    pub message: String,
-}
-
-impl ClientError {
-    pub(crate) fn local(kind: &str, message: impl Into<String>) -> Self {
-        Self {
-            kind: kind.to_string(),
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for ClientError {}
-
-impl From<RemoteError> for ClientError {
-    fn from(value: RemoteError) -> Self {
-        Self {
-            kind: value.kind,
-            message: value.message,
-        }
-    }
-}
+mod error;
+pub use error::ClientError;
 
 #[derive(Debug, Clone)]
 enum LifecycleState {
@@ -85,6 +56,7 @@ pub struct RemoteClient {
     max_transfer_bytes: u64,
     session: Option<Session>,
     next_request_id: u64,
+    operation_attempts: u64,
     last_activity: Option<Instant>,
     health_check_after: Duration,
     last_success_at_ms: Option<u64>,
@@ -102,6 +74,7 @@ impl RemoteClient {
             max_transfer_bytes,
             session: None,
             next_request_id: 1,
+            operation_attempts: 0,
             last_activity: None,
             health_check_after: DEFAULT_HEALTH_CHECK_AFTER,
             last_success_at_ms: None,
@@ -169,26 +142,28 @@ impl RemoteClient {
     }
 
     pub fn call(&mut self, operation: &str, arguments: Value) -> Result<Value, ClientError> {
+        let payload = encode_request(operation, &arguments)?;
         self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
-        let request = RemoteRequest {
-            operation: operation.to_string(),
-            arguments,
-        };
+        self.operation_attempts = self.operation_attempts.saturating_add(1);
         let result = (|| {
             let session = self.session.as_mut().expect("connected");
             session
-                .send_json(FrameType::Request, request_id, &request)
+                .send(FrameType::Request, request_id, &payload)
                 .map_err(protocol_error)?;
             receive_remote_response(session, request_id)
         })();
-        let result = self.finish_operation(result);
+        let result = self.finish_operation(result.map_err(ClientError::during_request), true);
         if operation == "agent_info"
             && let Ok(agent_info) = &result
         {
             self.last_agent_info = Some(agent_info.clone());
         }
         result
+    }
+
+    pub(crate) fn operation_attempts(&self) -> u64 {
+        self.operation_attempts
     }
 
     pub fn remote_probe(&mut self, timeout_ms: u64) -> Value {
@@ -303,7 +278,7 @@ impl RemoteClient {
                     }
                     (true, false, Some(response), previous)
                 }
-                Err(error) if error.kind == "connection_uncertain" => {
+                Err(error) if error.disconnected_during_request() => {
                     (false, true, None, fallback_instance)
                 }
                 Err(error) => return Err(error),
@@ -364,10 +339,12 @@ impl RemoteClient {
                 )
             })?
             .to_string();
-        if previous_agent["capabilities"]["self_update"] != true {
+        if previous_agent["capabilities"]["self_update"] != true
+            || previous_agent["capabilities"]["update_receipts"] != true
+        {
             return Err(ClientError::local(
                 "unsupported",
-                "remote agent does not support self-update",
+                "remote agent does not support verified self-update receipts; deploy a matching Agent before using agent_update",
             ));
         }
         let upload_mode = agent_supports_unix_mode(&previous_agent).then_some(0o755);
@@ -379,7 +356,7 @@ impl RemoteClient {
         let prepare = self.call("agent_update_prepare", json!({"expected_sha256": sha256}));
         let (restart_acknowledged, prepared) = match prepare {
             Ok(value) => (true, Some(value)),
-            Err(error) if error.kind == "connection_uncertain" => (false, None),
+            Err(error) if error.disconnected_during_request() => (false, None),
             Err(error) => return Err(error),
         };
         self.session = None;
@@ -387,30 +364,91 @@ impl RemoteClient {
         self.lifecycle_state = LifecycleState::Updating {
             previous_instance_id: previous_instance_id.clone(),
         };
-        let wait = self.wait_remote(
+        let wait_started = Instant::now();
+        let mut wait = self.wait_remote(
             Some("offline_then_online"),
             timeout_ms,
             poll_interval_ms,
             probe_timeout_ms,
         );
-        let current_agent = wait["agent_info"].clone();
-        let reached = wait["reached"].as_bool().unwrap_or(false);
         let candidate = prepared
             .as_ref()
             .and_then(|value| value.get("candidate"))
             .cloned();
-        let status = if !reached {
-            "timed_out"
-        } else if candidate
+        let expected_attempt = prepared
             .as_ref()
-            .is_some_and(|candidate| candidate_matches_agent(candidate, &current_agent))
+            .and_then(|prepared| prepared["attempt_id"].as_str());
+        self.lifecycle_state = LifecycleState::Updating {
+            previous_instance_id: previous_instance_id.clone(),
+        };
+        // Being online may be the helper's temporary candidate instance. Only
+        // its final receipt proves stabilization and supervisor handover.
+        while wait["reached"] == true {
+            let receipt = &wait["agent_info"]["update"]["last_result"];
+            if update_receipt_matches(
+                receipt,
+                &sha256,
+                previous_instance_id.as_deref(),
+                expected_attempt,
+            ) && receipt["status"] != "pending"
+            {
+                break;
+            }
+            let remaining =
+                Duration::from_millis(timeout_ms).saturating_sub(wait_started.elapsed());
+            if remaining.is_zero() {
+                wait["timed_out"] = json!(true);
+                break;
+            }
+            thread::sleep(Duration::from_millis(poll_interval_ms).min(remaining));
+            let remaining =
+                Duration::from_millis(timeout_ms).saturating_sub(wait_started.elapsed());
+            if remaining.is_zero() {
+                wait["timed_out"] = json!(true);
+                break;
+            }
+            let probe = self.probe(Duration::from_millis(probe_timeout_ms).min(remaining));
+            wait["last_probe"] = probe.clone();
+            if probe["reachable"] == true {
+                wait["agent_info"] = probe["agent_info"].clone();
+            }
+        }
+        let current_agent = wait["agent_info"].clone();
+        let receipt = current_agent["update"]["last_result"].clone();
+        let matched = update_receipt_matches(
+            &receipt,
+            &sha256,
+            previous_instance_id.as_deref(),
+            expected_attempt,
+        );
+        let status = if wait["timed_out"] == true || wait["reached"] != true {
+            "timed_out"
+        } else if matched
+            && receipt["status"] == "updated"
+            && candidate
+                .as_ref()
+                .is_none_or(|candidate| candidate_matches_agent(candidate, &current_agent))
         {
             "updated"
-        } else if restart_acknowledged {
+        } else if matched
+            && receipt["status"] == "rolled_back"
+            && candidate_matches_agent(&previous_agent, &current_agent)
+        {
             "rolled_back"
         } else {
             "unconfirmed"
         };
+        if matches!(status, "updated" | "rolled_back") {
+            self.lifecycle_state = LifecycleState::Ready;
+        }
+        wait["elapsed_ms"] = json!(duration_ms(wait_started.elapsed()));
+        wait["lifecycle_state"] = json!(self.lifecycle_state.name());
+        wait["connected"] = json!(self.session.is_some());
+        wait["connection_state"] = json!(if self.session.is_some() {
+            "cached"
+        } else {
+            "disconnected"
+        });
         Ok(json!({
             "status": status,
             "updated": status == "updated",
@@ -420,6 +458,8 @@ impl RemoteClient {
             "previous_agent": previous_agent,
             "candidate": candidate,
             "current_agent": current_agent,
+            "update_receipt":receipt,
+            "recovery":prepared.as_ref().and_then(|prepared|prepared.get("recovery")).cloned(),
             "staging_path": staging_path,
             "bytes_transferred": upload["bytes_transferred"],
             "sha256": sha256,
@@ -471,27 +511,25 @@ impl RemoteClient {
         let sha256 = hash_file(&mut file, local_path, size)?;
         file.seek(SeekFrom::Start(0))
             .map_err(|error| ClientError::local("io", format!("seek {local_path}: {error}")))?;
+        let payload = encode_request(
+            "upload_file",
+            &serde_json::to_value(UploadRequest {
+                remote_path: remote_path.to_string(),
+                size,
+                sha256: sha256.clone(),
+                overwrite,
+                resume,
+                mode,
+            })
+            .expect("serializable"),
+        )?;
         self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
+        self.operation_attempts = self.operation_attempts.saturating_add(1);
         let result = (|| {
             let session = self.session.as_mut().expect("connected");
             session
-                .send_json(
-                    FrameType::Request,
-                    request_id,
-                    &RemoteRequest {
-                        operation: "upload_file".to_string(),
-                        arguments: serde_json::to_value(UploadRequest {
-                            remote_path: remote_path.to_string(),
-                            size,
-                            sha256: sha256.clone(),
-                            overwrite,
-                            resume,
-                            mode,
-                        })
-                        .expect("serializable"),
-                    },
-                )
+                .send(FrameType::Request, request_id, &payload)
                 .map_err(protocol_error)?;
             let metadata = receive_transfer_metadata(session, request_id, size)?;
             if metadata.offset > size {
@@ -558,7 +596,7 @@ impl RemoteClient {
                 "destination": remote_path
             }))
         })();
-        self.finish_operation(result)
+        self.finish_operation(result.map_err(ClientError::during_request), false)
     }
 
     pub fn download(
@@ -590,7 +628,13 @@ impl RemoteClient {
             ));
         }
         let partial = download_partial_path(target)?;
+        let mut cleanup = DownloadPartialCleanup {
+            path: partial.clone(),
+            keep: true,
+            committed: false,
+        };
         let mut temp = open_download_partial(&partial, resume)?;
+        cleanup.keep = resume;
         let requested_offset = temp
             .metadata()
             .map_err(|error| {
@@ -605,24 +649,22 @@ impl RemoteClient {
         }
         let (prefix_digest, prefix_sha256) =
             hash_local_prefix(&mut temp, requested_offset, &partial.to_string_lossy())?;
+        let payload = encode_request(
+            "download_file",
+            &serde_json::to_value(DownloadRequest {
+                remote_path: remote_path.to_string(),
+                offset: requested_offset,
+                prefix_sha256: (requested_offset > 0).then_some(prefix_sha256.clone()),
+            })
+            .expect("serializable"),
+        )?;
         self.prepare_connection()?;
         let request_id = self.allocate_request_id()?;
+        self.operation_attempts = self.operation_attempts.saturating_add(1);
         let result = (|| {
             let session = self.session.as_mut().expect("connected");
             session
-                .send_json(
-                    FrameType::Request,
-                    request_id,
-                    &RemoteRequest {
-                        operation: "download_file".to_string(),
-                        arguments: serde_json::to_value(DownloadRequest {
-                            remote_path: remote_path.to_string(),
-                            offset: requested_offset,
-                            prefix_sha256: (requested_offset > 0).then_some(prefix_sha256.clone()),
-                        })
-                        .expect("serializable"),
-                    },
-                )
+                .send(FrameType::Request, request_id, &payload)
                 .map_err(protocol_error)?;
             let first = session.receive().map_err(protocol_error)?;
             check_request_id(&first, request_id)?;
@@ -712,9 +754,12 @@ impl RemoteClient {
                             .map_err(|error| {
                                 ClientError::local("io", format!("flush {local_path}: {error}"))
                             })?;
-                        preserve_local_mode(target, &partial)?;
+                        preserve_local_mode(target, &partial)
+                            .map_err(ClientError::after_response)?;
                         drop(temp);
-                        persist_local(&partial, target, overwrite)?;
+                        persist_local(&partial, target, overwrite)
+                            .map_err(ClientError::after_response)?;
+                        cleanup.committed = true;
                         return Ok(json!({
                             "bytes_transferred": total - metadata.offset,
                             "size": total,
@@ -738,38 +783,32 @@ impl RemoteClient {
                 }
             }
         })();
-        let result = self.finish_operation(result);
-        if result.is_err() && !resume {
-            let _ = fs::remove_file(&partial);
-        }
-        result
+        self.finish_operation(result.map_err(ClientError::during_request), false)
     }
 
     fn probe(&mut self, timeout: Duration) -> Value {
         let started = Instant::now();
-        let connection_reused = self.session.is_some();
+        let deadline = started + timeout;
+        let mut connection_reused = self.session.is_some();
         // A reused session only spends half the budget on its health check. A
         // stale or half-open connection must never be able to consume the whole
         // probe timeout, because that would leave nothing for the reconnect that
         // recovers it and report the remote unreachable while it is healthy.
-        let reused_timeout = (timeout / 2).max(Duration::from_millis(1));
         let first = if self.session.is_some() {
-            self.ping_current_session(reused_timeout)
+            self.ping_current_session_until(started + timeout / 2)
         } else {
-            self.ensure_connected_with(timeout)
-                .and_then(|_| self.ping_current_session(timeout))
+            self.connect_and_ping_until(deadline)
         };
         let result = match first {
             Ok(agent_info) => Ok(agent_info),
             Err(first_error) if connection_reused => {
+                connection_reused = false;
                 self.session = None;
                 self.last_activity = None;
-                let remaining = timeout.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
+                if Instant::now() >= deadline {
                     Err(first_error)
                 } else {
-                    self.ensure_connected_with(remaining)
-                        .and_then(|_| self.ping_current_session(remaining))
+                    self.connect_and_ping_until(deadline)
                 }
             }
             Err(error) => Err(error),
@@ -796,7 +835,7 @@ impl RemoteClient {
             Err(error) => {
                 self.session = None;
                 self.last_activity = None;
-                let error_value = json!({"kind": error.kind, "message": error.message});
+                let error_value = error.details();
                 self.last_error = Some(error_value.clone());
                 json!({
                     "address": self.remote.to_string(),
@@ -862,70 +901,62 @@ impl RemoteClient {
     }
 
     fn ensure_connected_with(&mut self, connect_timeout: Duration) -> Result<(), ClientError> {
+        self.ensure_connected_until(Instant::now() + connect_timeout)
+    }
+
+    fn connect_and_ping_until(&mut self, deadline: Instant) -> Result<Value, ClientError> {
+        self.ensure_connected_until(deadline)?;
+        self.ping_current_session_until(deadline)
+    }
+
+    fn ensure_connected_until(&mut self, deadline: Instant) -> Result<(), ClientError> {
         if self.session.is_none() {
             let mut options = SessionOptions::proxy(self.timeout);
-            let phase_timeout = (connect_timeout / 2).max(Duration::from_millis(1));
-            options.connect_timeout = phase_timeout;
-            options.handshake_timeout = phase_timeout;
-            self.session = Some(
-                Session::connect(
-                    SocketAddr::V4(self.remote),
-                    BUILTIN_PSK,
-                    options,
-                    DEFAULT_MAX_CONTROL_BYTES,
-                )
-                .map_err(connection_error)?,
-            );
+            options.connect_timeout = DEFAULT_CONNECT_TIMEOUT;
+            let connection = Session::connect_until(
+                SocketAddr::V4(self.remote),
+                BUILTIN_PSK,
+                options,
+                DEFAULT_MAX_CONTROL_BYTES,
+                deadline,
+            )
+            .map_err(connection_error);
+            match connection {
+                Ok(session) => self.session = Some(session),
+                Err(error) => {
+                    self.last_error = Some(error.details());
+                    self.last_activity = None;
+                    return Err(error);
+                }
+            }
             self.last_activity = Some(Instant::now());
         }
         Ok(())
     }
 
     fn ping_current_session(&mut self, timeout: Duration) -> Result<Value, ClientError> {
+        self.ping_current_session_until(Instant::now() + timeout)
+    }
+
+    fn ping_current_session_until(&mut self, deadline: Instant) -> Result<Value, ClientError> {
         let request_id = self.allocate_request_id()?;
         let session = self.session.as_mut().expect("connected");
         session
-            .send_json(
+            .send_json_until(
                 FrameType::Request,
                 request_id,
                 &RemoteRequest {
                     operation: INTERNAL_PING_OPERATION.to_string(),
                     arguments: Value::Null,
                 },
+                deadline,
             )
             .map_err(health_check_error)?;
         let frame = session
-            .receive_with_idle_timeout(Some(timeout))
+            .receive_until(deadline)
             .map_err(health_check_error)?;
         check_request_id(&frame, request_id)?;
-        let agent_info = match frame.kind {
-            FrameType::Response => {
-                let response = serde_json::from_slice::<RemoteResponse>(&frame.payload)
-                    .map_err(|error| ClientError::local("protocol", error.to_string()))?;
-                if response.ok {
-                    response.result.unwrap_or(Value::Null)
-                } else {
-                    return Err(response
-                        .error
-                        .unwrap_or(RemoteError {
-                            kind: "remote".to_string(),
-                            message: "health check failed".to_string(),
-                        })
-                        .into());
-                }
-            }
-            FrameType::Error => {
-                return Err(serde_json::from_slice::<RemoteError>(&frame.payload)
-                    .map_err(|error| ClientError::local("protocol", error.to_string()))?
-                    .into());
-            }
-            _ => {
-                return Err(ClientError::local(
-                    "protocol",
-                    "unexpected health check response frame",
-                ));
-            }
-        };
+        let agent_info = decode_remote_response(frame)?;
         if agent_info["name"] != "remote-ops-agent"
             || agent_info["runtime"]["instance_id"].as_str().is_none()
             || agent_info["supported_operations"].as_array().is_none()
@@ -940,7 +971,11 @@ impl RemoteClient {
         Ok(agent_info)
     }
 
-    fn finish_operation<T>(&mut self, result: Result<T, ClientError>) -> Result<T, ClientError> {
+    fn finish_operation<T>(
+        &mut self,
+        result: Result<T, ClientError>,
+        reuse_remote_error: bool,
+    ) -> Result<T, ClientError> {
         match &result {
             Ok(_) => {
                 self.last_activity = Some(Instant::now());
@@ -948,12 +983,13 @@ impl RemoteClient {
                 self.last_error = None;
             }
             Err(error) => {
-                self.session = None;
-                self.last_activity = None;
-                self.last_error = Some(json!({
-                    "kind": error.kind,
-                    "message": error.message
-                }));
+                if reuse_remote_error && error.reusable_reply() {
+                    self.last_activity = Some(Instant::now());
+                } else {
+                    self.session = None;
+                    self.last_activity = None;
+                }
+                self.last_error = Some(error.details());
             }
         }
         result
@@ -985,6 +1021,19 @@ fn candidate_matches_agent(candidate: &Value, agent_info: &Value) -> bool {
         && candidate["build"]["git_revision"] == agent_info["build"]["git_revision"]
 }
 
+fn update_receipt_matches(
+    receipt: &Value,
+    sha256: &str,
+    previous: Option<&str>,
+    attempt: Option<&str>,
+) -> bool {
+    receipt["candidate_sha256"]
+        .as_str()
+        .is_some_and(|hash| hash.eq_ignore_ascii_case(sha256))
+        && previous.is_some_and(|previous| receipt["previous_instance_id"] == previous)
+        && attempt.is_none_or(|attempt| receipt["attempt_id"] == attempt)
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1001,26 +1050,26 @@ fn duration_ms(duration: Duration) -> u64 {
 fn receive_remote_response(session: &mut Session, request_id: u64) -> Result<Value, ClientError> {
     let frame = session.receive().map_err(protocol_error)?;
     check_request_id(&frame, request_id)?;
+    decode_remote_response(frame)
+}
+
+fn decode_remote_response(frame: remote_ops_protocol::Frame) -> Result<Value, ClientError> {
     match frame.kind {
         FrameType::Response => {
             let response: RemoteResponse = serde_json::from_slice(&frame.payload)
-                .map_err(|error| ClientError::local("protocol", error.to_string()))?;
-            if response.ok {
-                Ok(response.result.unwrap_or(Value::Null))
-            } else {
-                Err(response
-                    .error
-                    .unwrap_or(RemoteError {
-                        kind: "remote".to_string(),
-                        message: "remote operation failed".to_string(),
-                    })
-                    .into())
+                .map_err(|error| ClientError::protocol(error.to_string()))?;
+            match (response.ok, response.result, response.error) {
+                (true, Some(value), None) if value.is_object() => Ok(value),
+                (false, None, Some(error)) if !error.kind.is_empty() => Err(error.into()),
+                _ => Err(ClientError::protocol(
+                    "inconsistent remote response envelope",
+                )),
             }
         }
         FrameType::Error => Err(serde_json::from_slice::<RemoteError>(&frame.payload)
-            .map_err(|error| ClientError::local("protocol", error.to_string()))?
+            .map_err(|error| ClientError::protocol(error.to_string()))?
             .into()),
-        _ => Err(ClientError::local("protocol", "unexpected response frame")),
+        _ => Err(ClientError::protocol("unexpected response frame")),
     }
 }
 
@@ -1057,28 +1106,68 @@ fn check_request_id(frame: &remote_ops_protocol::Frame, expected: u64) -> Result
     if frame.request_id == expected {
         Ok(())
     } else {
-        Err(ClientError::local("protocol", "request id mismatch"))
+        Err(ClientError::protocol("request id mismatch"))
     }
 }
 
-fn protocol_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
-    ClientError::local(
-        "connection_uncertain",
-        format!("remote connection failed; request was not replayed: {error}"),
+pub(crate) fn validate_request(operation: &str, arguments: &Value) -> Result<(), ClientError> {
+    encode_request(operation, arguments).map(|_| ())
+}
+
+fn encode_request(operation: &str, arguments: &Value) -> Result<Vec<u8>, ClientError> {
+    #[derive(serde::Serialize)]
+    struct Request<'a> {
+        operation: &'a str,
+        arguments: &'a Value,
+    }
+    remote_ops_protocol::encoding::to_vec_bounded(
+        &Request {
+            operation,
+            arguments,
+        },
+        DEFAULT_MAX_CONTROL_BYTES,
     )
+    .map_err(|error| ClientError::local("invalid_params", error.to_string()))
+}
+
+fn protocol_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
+    if let remote_ops_protocol::ProtocolError::Io(io)
+    | remote_ops_protocol::ProtocolError::IncompleteFrame(io) = &error
+    {
+        let disconnected = matches!(
+            io.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::NotConnected
+        );
+        ClientError::transport(
+            "connection_uncertain",
+            format!("remote connection failed; request was not replayed: {error}"),
+            true,
+        )
+        .with_disconnect(disconnected)
+    } else {
+        ClientError::protocol(format!(
+            "remote protocol failed; request was not replayed: {error}"
+        ))
+    }
 }
 
 fn connection_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
-    ClientError::local(
+    ClientError::transport(
         "connection_unavailable",
         format!("could not establish remote connection; request was not sent: {error}"),
+        false,
     )
 }
 
 fn health_check_error(error: remote_ops_protocol::ProtocolError) -> ClientError {
-    ClientError::local(
+    ClientError::transport(
         "connection_unavailable",
         format!("health check failed: {error}"),
+        false,
     )
 }
 
@@ -1205,6 +1294,19 @@ fn open_download_partial(path: &Path, resume: bool) -> Result<File, ClientError>
         .map_err(|error| ClientError::local("io", format!("open {}: {error}", path.display())))
 }
 
+struct DownloadPartialCleanup {
+    path: PathBuf,
+    keep: bool,
+    committed: bool,
+}
+impl Drop for DownloadPartialCleanup {
+    fn drop(&mut self) {
+        if !self.keep && !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn hash_file(file: &mut File, display: &str, expected_size: u64) -> Result<String, ClientError> {
     let (digest, _) = hash_local_prefix(file, expected_size, display)?;
     Ok(format!("{:x}", digest.finalize()))
@@ -1254,6 +1356,216 @@ mod tests {
             DEFAULT_MAX_CONTROL_BYTES,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn update_receipts_must_match_the_hash_old_instance_and_attempt() {
+        let receipt = json!({"attempt_id":"attempt","candidate_sha256":"a".repeat(64),"previous_instance_id":"old","status":"updated"});
+        assert!(update_receipt_matches(
+            &receipt,
+            &"a".repeat(64),
+            Some("old"),
+            Some("attempt")
+        ));
+        assert!(!update_receipt_matches(
+            &receipt,
+            &"b".repeat(64),
+            Some("old"),
+            Some("attempt")
+        ));
+        assert!(!update_receipt_matches(
+            &receipt,
+            &"a".repeat(64),
+            Some("other"),
+            Some("attempt")
+        ));
+        assert!(!update_receipt_matches(
+            &receipt,
+            &"a".repeat(64),
+            Some("old"),
+            Some("stale")
+        ));
+        assert!(!update_receipt_matches(
+            &Value::Null,
+            &"a".repeat(64),
+            Some("old"),
+            None
+        ));
+    }
+
+    #[test]
+    fn probe_budget_is_shared_by_delayed_handshake_and_health_check() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut hello = [0; 37];
+            stream.read_exact(&mut hello).unwrap();
+            thread::sleep(Duration::from_millis(250));
+            // Use a second protocol Session as the handshake endpoint through a
+            // transparent TCP relay, so this test does not duplicate auth code.
+            let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+            let upstream_address = upstream.local_addr().unwrap();
+            let responder = thread::spawn(move || {
+                let mut session = accept_session(&upstream);
+                session.receive().unwrap();
+                thread::sleep(Duration::from_millis(700));
+            });
+            let mut connection = std::net::TcpStream::connect(upstream_address).unwrap();
+            connection.write_all(&hello).unwrap();
+            let mut reply = [0; 64];
+            connection.read_exact(&mut reply).unwrap();
+            stream.write_all(&reply).unwrap();
+            let mut tag = [0; 32];
+            stream.read_exact(&mut tag).unwrap();
+            connection.write_all(&tag).unwrap();
+            let mut outgoing = connection.try_clone().unwrap();
+            let mut incoming = stream.try_clone().unwrap();
+            let forward = thread::spawn(move || {
+                let _ = std::io::copy(&mut incoming, &mut outgoing);
+            });
+            let _ = std::io::copy(&mut connection, &mut stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            forward.join().unwrap();
+            responder.join().unwrap();
+        });
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(10), DEFAULT_MAX_TRANSFER_BYTES);
+        let started = Instant::now();
+        let probe = client.remote_probe(600);
+        assert_eq!(probe["reachable"], false);
+        assert!(
+            started.elapsed() >= Duration::from_millis(500)
+                && started.elapsed() < Duration::from_millis(800),
+            "{probe}"
+        );
+        assert_eq!(client.remote_status()["connection_state"], "disconnected");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probe_reconnects_after_a_partial_cached_health_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut raw = stream.try_clone().unwrap();
+            let mut first = Session::accept(
+                stream,
+                BUILTIN_PSK,
+                SessionOptions::agent(),
+                DEFAULT_MAX_CONTROL_BYTES,
+            )
+            .unwrap();
+            answer_ping(&mut first, "old-instance");
+            first.receive().unwrap();
+            raw.write_all(b"R").unwrap();
+            let mut replacement = accept_session(&listener);
+            answer_ping(&mut replacement, "new-instance");
+        });
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(5), DEFAULT_MAX_TRANSFER_BYTES);
+        assert_eq!(client.remote_probe(1000)["reachable"], true);
+        let started = Instant::now();
+        let result = client.remote_probe(400);
+        assert_eq!(result["reachable"], true, "{result}");
+        assert_eq!(result["connection_reused"], false);
+        assert_eq!(
+            result["agent_info"]["runtime"]["instance_id"],
+            "new-instance"
+        );
+        assert!(started.elapsed() < Duration::from_millis(700), "{result}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_user_request_is_rejected_before_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut client = RemoteClient::new(
+            listener.local_addr().unwrap().to_string().parse().unwrap(),
+            Duration::from_secs(1),
+            DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let error = client
+            .call(
+                "write_text",
+                json!({"path":"must-not-write","content":"\0".repeat(400_000)}),
+            )
+            .unwrap_err();
+        assert_eq!(error.details()["outcome"], "not_sent");
+        assert_eq!(error.details()["source"], "proxy");
+        assert_eq!(client.operation_attempts(), 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn invalid_response_envelopes_are_uncertain_and_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut session = accept_session(&listener);
+            let frame = session.receive().unwrap();
+            session.send_json(FrameType::Response,frame.request_id,&json!({"ok":true,"result":{"value":1},"error":{"kind":"io","message":"contradictory"}})).unwrap();
+        });
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(1), DEFAULT_MAX_TRANSFER_BYTES);
+        let error = client.call("exec", json!({})).unwrap_err();
+        assert_eq!(error.details()["outcome"], "unknown");
+        assert_eq!(error.details()["source"], "protocol");
+        assert_eq!(client.remote_status()["connected"], false);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn reboot_timeout_is_not_acknowledged_as_a_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut session = accept_session(&listener);
+            session.receive().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = RemoteClient::new(
+            remote,
+            Duration::from_millis(30),
+            DEFAULT_MAX_TRANSFER_BYTES,
+        );
+        let error = client.reboot(1000).unwrap_err();
+        assert_eq!(error.kind, "connection_uncertain");
+        assert_eq!(client.remote_status()["lifecycle_state"], "ready");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn remote_error_text_cannot_impersonate_a_transport_disconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = listener.local_addr().unwrap().to_string().parse().unwrap();
+        let server = thread::spawn(move || {
+            let mut session = accept_session(&listener);
+            let frame = session.receive().unwrap();
+            session
+                .send_json(
+                    FrameType::Response,
+                    frame.request_id,
+                    &RemoteResponse::failure(RemoteError {
+                        kind: "connection_uncertain".into(),
+                        message: "remote internal failure".into(),
+                    }),
+                )
+                .unwrap();
+        });
+        let mut client =
+            RemoteClient::new(remote, Duration::from_secs(1), DEFAULT_MAX_TRANSFER_BYTES);
+        let error = client.reboot(1000).unwrap_err();
+        assert_eq!(error.details()["source"], "remote");
+        assert_eq!(error.details()["outcome"], "remote_error");
+        assert_eq!(client.remote_status()["lifecycle_state"], "ready");
+        server.join().unwrap();
     }
 
     #[test]
@@ -1411,7 +1723,7 @@ mod tests {
 
         let probe = client.remote_probe(1_000);
         assert!(probe["reachable"].as_bool().unwrap(), "{probe}");
-        assert!(probe["connection_reused"].as_bool().unwrap(), "{probe}");
+        assert!(!probe["connection_reused"].as_bool().unwrap(), "{probe}");
         server.join().unwrap();
     }
 

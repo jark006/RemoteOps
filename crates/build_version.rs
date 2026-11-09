@@ -1,5 +1,4 @@
-// Shared build-script logic for the proxy and agent binaries. Both
-// crates/proxy/build.rs and crates/agent/build.rs include this file and
+// Shared build-script logic. Both crates/version/build.rs and crates/agent/build.rs include this file and
 // call emit_version_env() to inject version, git and build-time metadata
 // through cargo rustc-env at compile time.
 use std::path::{Path, PathBuf};
@@ -58,9 +57,17 @@ pub fn emit_version_env() {
         .unwrap_or_else(|_| "0".to_string());
     println!("cargo:rustc-env=REMOTE_OPS_APP_VERSION_CODE={version_code}");
 
-    let dirty = git_output(&workspace, &["status", "--porcelain"])
-        .map(|_| "dirty")
-        .unwrap_or("clean");
+    let dirty_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&workspace)
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    let dirty = match dirty_output {
+        Some(output) if output.stdout.is_empty() => "clean",
+        Some(_) => "dirty",
+        None => "unknown",
+    };
     println!("cargo:rustc-env=REMOTE_OPS_GIT_DIRTY={dirty}");
 
     let commit_date = git_output(&workspace, &["log", "-1", "--format=%cd", "--date=short"])
@@ -84,6 +91,29 @@ pub fn emit_version_env() {
     println!("cargo:rustc-env=REMOTE_OPS_BUILD_TZ={timezone}");
 
     println!("cargo:rerun-if-env-changed=REMOTE_OPS_GIT_REVISION");
+    let source = std::env::var("REMOTE_OPS_SOURCE_SHA256").unwrap_or_else(|_| "unknown".into());
+    let build_id =
+        std::env::var("REMOTE_OPS_RELEASE_BUILD_ID").unwrap_or_else(|_| "development".into());
+    assert!(
+        source == "unknown"
+            || (source.len() == 64 && source.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "invalid source SHA-256"
+    );
+    assert!(
+        !build_id.is_empty()
+            && build_id.len() <= 128
+            && build_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "invalid build ID"
+    );
+    let version = std::env::var("CARGO_PKG_VERSION").expect("package version");
+    let metadata = format!(
+        r#"REMOTE_OPS_ARTIFACT_V1:{{"version":"{version}","target":"{target}","profile":"{profile}","source_sha256":"{source}","build_id":"{build_id}"}}:REMOTE_OPS_ARTIFACT_END"#
+    );
+    println!("cargo:rustc-env=REMOTE_OPS_ARTIFACT_METADATA={metadata}");
+    println!("cargo:rerun-if-env-changed=REMOTE_OPS_SOURCE_SHA256");
+    println!("cargo:rerun-if-env-changed=REMOTE_OPS_RELEASE_BUILD_ID");
     for path in [".git/HEAD", ".git/refs", ".git/packed-refs"] {
         println!("cargo:rerun-if-changed={}", workspace.join(path).display());
     }

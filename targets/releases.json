@@ -1,0 +1,13 @@
+[
+  {"target":"aarch64-apple-darwin","suffix":"arm64-mac","format":"macho","machine":16777228},
+  {"target":"x86_64-apple-darwin","suffix":"x64-mac","format":"macho","machine":16777223},
+  {"target":"x86_64-pc-windows-gnullvm","suffix":"x64-win.exe","format":"pe","machine":34404},
+  {"target":"aarch64-pc-windows-gnullvm","suffix":"arm64-win.exe","format":"pe","machine":43620},
+  {"target":"armv7-unknown-linux-musleabihf","suffix":"arm32hf-linux","format":"elf","machine":40,"bits":32,"float":"hard"},
+  {"target":"armv7-unknown-linux-musleabi","suffix":"arm32-linux","format":"elf","machine":40,"bits":32,"float":"soft"},
+  {"target":"aarch64-unknown-linux-musl","suffix":"arm64-linux","format":"elf","machine":183,"bits":64},
+  {"target":"x86_64-unknown-linux-musl","suffix":"x64-linux","format":"elf","machine":62,"bits":64},
+  {"target":"riscv64gc-unknown-linux-musl","suffix":"riscv64gc-linux","format":"elf","machine":243,"bits":64},
+  {"target":"loongarch64-unknown-linux-musl","suffix":"loongarch64-linux","format":"elf","machine":258,"bits":64},
+  {"target":"mipsel-unknown-linux-musl","suffix":"mipsel-linux","format":"elf","machine":8,"bits":32,"spec":"targets/mipsel-unknown-linux-musl.json","bins":["remote-ops-agent"]}
+]

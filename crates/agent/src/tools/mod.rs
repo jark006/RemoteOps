@@ -1,5 +1,6 @@
 pub mod command;
 pub mod deployment;
+pub mod environment;
 pub mod file_ops;
 pub mod files;
 pub mod jobs;

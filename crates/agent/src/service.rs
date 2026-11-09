@@ -488,7 +488,7 @@ fn handle_session(
                     started_at,
                     error.as_deref(),
                 );
-                session.send_json(FrameType::Response, frame.request_id, &response)?;
+                send_tool_response(&mut session, frame.request_id, &response)?;
                 if action == ConnectionAction::RestartAgent {
                     return Ok(action);
                 }
@@ -587,7 +587,7 @@ fn handle_session(
                         RemoteResponse::failure(error.into())
                     }
                 };
-                session.send_json(FrameType::Response, frame.request_id, &response)?;
+                send_tool_response(&mut session, frame.request_id, &response)?;
             }
         }
     }
@@ -628,6 +628,31 @@ fn complete_transfer(
             Err(error.into())
         }
     }
+}
+
+fn send_tool_response(
+    session: &mut Session,
+    request_id: u64,
+    response: &RemoteResponse,
+) -> Result<(), ProtocolError> {
+    let payload = match remote_ops_protocol::encoding::to_vec_bounded(
+        response,
+        DEFAULT_MAX_CONTROL_BYTES,
+    ) {
+        Ok(payload) => payload,
+        Err(remote_ops_protocol::encoding::JsonEncodeError::Json(error)) => {
+            return Err(ProtocolError::Json(error));
+        }
+        Err(remote_ops_protocol::encoding::JsonEncodeError::TooLarge(_)) => {
+            let fallback=RemoteResponse::failure(RemoteError {
+                kind:"response_too_large".into(),
+                message:"operation finished but its encoded response exceeded 2 MiB; reduce requested output; a command may already have run, so do not replay it based on this error".into(),
+            });
+            remote_ops_protocol::encoding::to_vec_bounded(&fallback, DEFAULT_MAX_CONTROL_BYTES)
+                .expect("bounded static error")
+        }
+    };
+    session.send(FrameType::Response, request_id, &payload)
 }
 
 fn log_operation_started(peer: &str, request_id: u64, operation: &str) {
@@ -948,6 +973,47 @@ fn validate_sha256(value: &str) -> Result<(), AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_completed_response_reports_a_failure_without_losing_the_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut session = Session::accept(
+                stream,
+                BUILTIN_PSK,
+                SessionOptions::agent(),
+                DEFAULT_MAX_CONTROL_BYTES,
+            )
+            .unwrap();
+            send_tool_response(
+                &mut session,
+                1,
+                &RemoteResponse::success(serde_json::json!({"text":"\0".repeat(400_000)})),
+            )
+            .unwrap();
+            send_tool_response(
+                &mut session,
+                2,
+                &RemoteResponse::success(serde_json::json!({"ok":"next"})),
+            )
+            .unwrap();
+        });
+        let mut session = Session::connect(
+            address,
+            BUILTIN_PSK,
+            SessionOptions::proxy(Duration::from_secs(2)),
+            DEFAULT_MAX_CONTROL_BYTES,
+        )
+        .unwrap();
+        let response: RemoteResponse = session.receive_json(FrameType::Response, 1).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "response_too_large");
+        let next: RemoteResponse = session.receive_json(FrameType::Response, 2).unwrap();
+        assert!(next.ok);
+        server.join().unwrap();
+    }
     use std::io::{Error, ErrorKind};
 
     use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;

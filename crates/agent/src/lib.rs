@@ -12,6 +12,11 @@ use remote_ops_protocol::{
 };
 
 use error::{AgentError, AgentResult};
+use remote_ops_protocol::arguments::{
+    HashArgs, KillArgs, PathArgs, PidArgs, PidsArgs, ReadTextArgs, TailTextArgs, ValidateArguments,
+    WriteTextArgs,
+};
+use remote_ops_protocol::execution::ExecArgs;
 use tools::jobs::JobManager;
 
 pub fn dispatch(
@@ -22,7 +27,7 @@ pub fn dispatch(
 ) -> AgentResult<Value> {
     match operation {
         "read_text" => {
-            let args: ReadTextArgs = decode(arguments)?;
+            let args: ReadTextArgs = decode_validated(arguments)?;
             tools::files::read_text(&args.path, args.offset, args.max_bytes)
         }
         "read_file_lines" => {
@@ -35,11 +40,11 @@ pub fn dispatch(
             )
         }
         "tail_text" => {
-            let args: TailTextArgs = decode(arguments)?;
+            let args: TailTextArgs = decode_validated(arguments)?;
             tools::files::tail_text(&args.path, args.lines, args.max_bytes)
         }
         "write_text" => {
-            let args: WriteTextArgs = decode(arguments)?;
+            let args: WriteTextArgs = decode_validated(arguments)?;
             tools::files::write_text(&args.path, &args.content)
         }
         "apply_patch" => {
@@ -69,11 +74,11 @@ pub fn dispatch(
             )
         }
         "stat" => {
-            let args: PathArgs = decode(arguments)?;
+            let args: PathArgs = decode_validated(arguments)?;
             tools::files::stat(&args.path)
         }
         "file_hash" => {
-            let args: HashArgs = decode(arguments)?;
+            let args: HashArgs = decode_validated(arguments)?;
             tools::files::file_hash(&args.path, args.max_bytes)
         }
         "mkdir" => {
@@ -131,15 +136,15 @@ pub fn dispatch(
             tools::deployment::deploy_activate(args)
         }
         "pids" => {
-            let args: PidsArgs = decode(arguments)?;
+            let args: PidsArgs = decode_validated(arguments)?;
             tools::process::pids(args.filter.as_deref(), args.cursor.as_deref(), args.limit)
         }
         "process_info" => {
-            let args: PidArgs = decode(arguments)?;
+            let args: PidArgs = decode_validated(arguments)?;
             tools::process::process_info(args.pid)
         }
         "kill" => {
-            let args: KillArgs = decode(arguments)?;
+            let args: KillArgs = decode_validated(arguments)?;
             tools::process::kill(args.pid, args.signal)
         }
         "pkill" => {
@@ -147,11 +152,11 @@ pub fn dispatch(
             tools::process::pkill(&args.name, args.signal)
         }
         "sh_exec" => {
-            let args: ShArgs = decode(arguments)?;
-            tools::command::sh_exec(&args.command, args.timeout_ms)
+            let args: remote_ops_protocol::ShellArgs = decode(arguments)?;
+            tools::command::sh_exec(&args)
         }
         "exec" => {
-            let args: ExecArgs = decode(arguments)?;
+            let args: ExecArgs = decode_validated(arguments)?;
             tools::command::exec(
                 &args.program,
                 &args.args,
@@ -197,6 +202,10 @@ pub fn dispatch(
             let _: EmptyArgs = decode(arguments)?;
             tools::system::system_info()
         }
+        "environment" => {
+            let _: EmptyArgs = decode(arguments)?;
+            tools::environment::environment()
+        }
         "agent_info" => {
             let _: EmptyArgs = decode(arguments)?;
             Ok(tools::lifecycle::agent_info(max_transfer_bytes))
@@ -215,17 +224,16 @@ fn decode<T: for<'de> Deserialize<'de>>(value: Value) -> AgentResult<T> {
     serde_json::from_value(value).map_err(|err| AgentError::invalid(err.to_string()))
 }
 
-fn default_read_bytes() -> usize {
-    1024 * 1024
+fn decode_validated<T: for<'de> Deserialize<'de> + ValidateArguments>(
+    value: Value,
+) -> AgentResult<T> {
+    let args: T = decode(value)?;
+    args.validate().map_err(AgentError::invalid)?;
+    Ok(args)
 }
-fn default_tail_bytes() -> usize {
-    256 * 1024
-}
+
 fn default_line_bytes() -> usize {
     256 * 1024
-}
-fn default_lines() -> usize {
-    100
 }
 fn default_list_limit() -> usize {
     200
@@ -242,17 +250,8 @@ fn default_grep_file_bytes() -> u64 {
 fn default_true() -> bool {
     true
 }
-fn default_pid_limit() -> usize {
-    1024
-}
-fn default_timeout() -> u64 {
-    tools::command::DEFAULT_TIMEOUT_MS
-}
 fn default_signal() -> i32 {
     15
-}
-fn default_hash_bytes() -> u64 {
-    tools::files::FILE_HASH_MAX_BYTES
 }
 fn default_process_job_timeout() -> u64 {
     remote_ops_protocol::DEFAULT_PROCESS_JOB_TIMEOUT_MS
@@ -270,16 +269,6 @@ fn default_reboot_delay() -> u64 {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReadTextArgs {
-    path: String,
-    #[serde(default)]
-    offset: u64,
-    #[serde(default = "default_read_bytes")]
-    max_bytes: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadFileLinesArgs {
     path: String,
     #[serde(default = "default_start_line")]
@@ -291,23 +280,6 @@ struct ReadFileLinesArgs {
 
 fn default_start_line() -> u64 {
     1
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TailTextArgs {
-    path: String,
-    #[serde(default = "default_lines")]
-    lines: usize,
-    #[serde(default = "default_tail_bytes")]
-    max_bytes: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WriteTextArgs {
-    path: String,
-    content: String,
 }
 
 #[derive(Deserialize)]
@@ -344,20 +316,6 @@ struct GrepArgs {
     max_results: usize,
     #[serde(default = "default_grep_file_bytes")]
     max_file_bytes: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PathArgs {
-    path: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HashArgs {
-    path: String,
-    #[serde(default = "default_hash_bytes")]
-    max_bytes: u64,
 }
 
 #[derive(Deserialize)]
@@ -416,54 +374,10 @@ struct SymlinkArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PidsArgs {
-    filter: Option<String>,
-    cursor: Option<String>,
-    #[serde(default = "default_pid_limit")]
-    limit: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PidArgs {
-    pid: i32,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KillArgs {
-    pid: i32,
-    #[serde(default = "default_signal")]
-    signal: i32,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PkillArgs {
     name: String,
     #[serde(default = "default_signal")]
     signal: i32,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ShArgs {
-    command: String,
-    #[serde(default = "default_timeout")]
-    timeout_ms: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExecArgs {
-    program: String,
-    #[serde(default)]
-    args: Vec<String>,
-    cwd: Option<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    #[serde(default = "default_timeout")]
-    timeout_ms: u64,
 }
 
 #[derive(Deserialize)]
@@ -527,6 +441,74 @@ struct EmptyArgs {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basic_argument_validation_is_shared_and_precedes_remote_io() {
+        let jobs = JobManager::new();
+        for (operation, arguments) in [
+            ("read_text", json!({"path":"missing","max_bytes":1048577})),
+            ("tail_text", json!({"path":"missing","lines":10001})),
+            ("write_text", json!({"path":"","content":"must-not-write"})),
+            ("stat", json!({"path":"\u{0}"})),
+            ("file_hash", json!({"path":"missing","max_bytes":67108865})),
+            ("pids", json!({"limit":0})),
+            ("process_info", json!({"pid":0})),
+            ("kill", json!({"pid":1,"signal":0})),
+            (
+                "exec",
+                json!({"program":"must-not-execute","args":["\u{0}"]}),
+            ),
+            (
+                "exec",
+                json!({"program":"must-not-execute","env":{"A=B":"invalid"}}),
+            ),
+        ] {
+            assert_eq!(
+                dispatch(operation, arguments, &jobs, 1024)
+                    .unwrap_err()
+                    .kind,
+                "invalid_params"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_and_environment_arguments_are_validated_on_agent() {
+        let jobs = JobManager::new();
+        for arguments in [
+            json!({"command":"x","shell":"auto"}),
+            json!({"command":"bad\u{0}text"}),
+            json!({"command":"x","cwd":""}),
+            json!({"command":"x","env":{"A=B":"bad"}}),
+            json!({"command":"x","timeout_ms":300001}),
+            json!({"command":"x","extra":true}),
+        ] {
+            assert_eq!(
+                dispatch("sh_exec", arguments, &jobs, 1024)
+                    .unwrap_err()
+                    .kind,
+                "invalid_params"
+            );
+        }
+        assert_eq!(
+            dispatch("environment", json!({"extra":true}), &jobs, 1024)
+                .unwrap_err()
+                .kind,
+            "invalid_params"
+        );
+        let incompatible = if cfg!(windows) { "sh" } else { "cmd" };
+        assert_eq!(
+            dispatch(
+                "sh_exec",
+                json!({"shell":incompatible,"command":"echo should-not-run"}),
+                &jobs,
+                1024
+            )
+            .unwrap_err()
+            .kind,
+            "unsupported"
+        );
+    }
     use serde_json::json;
 
     #[test]
