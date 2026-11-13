@@ -4,7 +4,7 @@
 
 ## 本地开发
 
-需要支持当前 workspace 和 Cargo.lock 的 Rust 工具链。源码使用 edition 2024；2.0.1 Windows 发布采用 Rust 1.95，MIPS 使用 Nightly 和 rust-src。不要在开发验证时无意升级锁文件中的依赖。
+需要支持当前 workspace 和 Cargo.lock 的 Rust 工具链。源码使用 edition 2024；日常开发和常规目标发布使用 `stable`（当前 1.100.x，随 `rustup update` 前移），MIPS 使用 Nightly 和 rust-src。2.0.1 Windows 发布曾采用 Rust 1.95，属于历史事实，不再需要保留该工具链。不要在开发验证时无意升级锁文件中的依赖。
 
 ```sh
 cargo build --locked --workspace
@@ -91,7 +91,7 @@ python3 tools/verify_embedded_environment.py \
 
 ```sh
 cargo install --locked cargo-zigbuild
-rustup target add --toolchain 1.95 x86_64-unknown-linux-musl
+rustup target add --toolchain stable x86_64-unknown-linux-musl
 rustup toolchain install nightly --component rust-src
 python3 tools/build_release.py --list-targets
 ```
@@ -105,7 +105,7 @@ python3 tools/build_release.py --list-targets
 python3 tools/build_release.py
 
 # 指定工具链和部分目标，每个 --target 可重复。
-python3 tools/build_release.py --toolchain 1.95 \
+python3 tools/build_release.py --toolchain stable \
   --target aarch64-apple-darwin --target x86_64-unknown-linux-musl \
   --output Releases/test-build
 
@@ -116,8 +116,8 @@ python3 tools/build_release.py --native --target aarch64-apple-darwin --output R
 Windows：
 
 ```powershell
-pwsh -File ./buildAll.ps1 -Toolchain 1.95
-./buildAll.ps1 -Target aarch64-apple-darwin,x86_64-unknown-linux-musl -Toolchain 1.95 -Output Releases/test-build
+pwsh -File ./buildAll.ps1 -Toolchain stable
+./buildAll.ps1 -Target aarch64-apple-darwin,x86_64-unknown-linux-musl -Toolchain stable -Output Releases/test-build
 ```
 
 要直接交付到 Releases 根目录，先将整个旧 Releases 移到 `target/validation/` 下唯一命名的备份，确认源/目标绝对路径，再用 `-Output Releases` 或 `--output Releases`。已有目录不会覆盖，也不逐项混入旧文件；构建失败检查日志后重试全新输出。
