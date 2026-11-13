@@ -87,6 +87,12 @@ def compile_target(root, target, toolchain, native, env):
     command += ["--locked", "--release", "--message-format=json-render-diagnostics"]
     for name in bins:
         command += ["-p", name]
+    if not native and target["target"].endswith("-pc-windows-gnullvm"):
+        # Zig's `cc` drops the gnullvm target spec's `--unwindlib=libunwind`
+        # pre-link argument, leaving `_Unwind_*` undefined; request it explicitly.
+        env = dict(env)
+        env["CARGO_TARGET_" + target["target"].upper().replace("-", "_") + "_RUSTFLAGS"] = \
+            "-C link-arg=-lunwind"
     print("Building " + target["target"], flush=True)
     artifacts = {}
     try:

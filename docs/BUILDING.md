@@ -96,7 +96,7 @@ rustup toolchain install nightly --component rust-src
 python3 tools/build_release.py --list-targets
 ```
 
-全矩阵需要为矩阵中所有非自定义目标安装 rust-std；不要对 MIPS 自定义 JSON target 执行 rustup target add。Zig 的安装方式按宿主系统选择，并记录实际 `zig version`。macOS 交叉链接可能受 SDK 和工具链版本影响，构建成功后仍应真机验证。
+全矩阵需要为矩阵中所有非自定义目标安装 rust-std；不要对 MIPS 自定义 JSON target 执行 rustup target add。Zig 的安装方式按宿主系统选择，并记录实际 `zig version`。Zig 0.17.x 的 `zig cc` 不透传 gnullvm 目标规格中的 `--unwindlib=libunwind`，构建器会为两个 `*-pc-windows-gnullvm` 目标注入 `-C link-arg=-lunwind`；直接手动执行 `cargo zigbuild` 时需自行提供该参数。macOS 交叉链接可能受 SDK 和工具链版本影响，构建成功后仍应真机验证。
 
 先提交固定源码，确认工作区干净，再构建至**全新目录**：
 
