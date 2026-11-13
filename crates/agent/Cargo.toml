@@ -8,7 +8,6 @@ license.workspace = true
 globset.workspace = true
 getrandom.workspace = true
 if-addrs.workspace = true
-libc.workspace = true
 regex.workspace = true
 remote-ops-protocol = { path = "../protocol" }
 remote-ops-version = { path = "../version" }
@@ -16,6 +15,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

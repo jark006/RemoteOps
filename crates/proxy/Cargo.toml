@@ -12,7 +12,6 @@ remote-ops-version = { path = "../version" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tempfile.workspace = true
 
 [dev-dependencies]
 jsonschema = { version = "0.61", default-features = false }
