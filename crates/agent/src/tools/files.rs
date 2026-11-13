@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use remote_ops_protocol::{
-    APPLY_PATCH_MAX_FILE_BYTES, APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES,
+    APPLY_PATCH_MAX_FILE_BYTES, APPLY_PATCH_MAX_HUNKS, APPLY_PATCH_MAX_PATCH_BYTES, hex_lower,
 };
 
 use crate::error::{AgentError, AgentResult};
@@ -567,7 +567,7 @@ fn normalize_line_endings(lines: &mut [TextLine], default_ending: &str, had_fina
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex_lower(Sha256::digest(bytes))
 }
 
 pub fn grep(
@@ -1055,7 +1055,7 @@ pub fn file_hash(path: &str, max_bytes: u64) -> AgentResult<Value> {
         total += read as u64;
     }
     Ok(
-        json!({"algorithm": "sha256", "digest": format!("{:x}", digest.finalize()), "bytes_hashed": total}),
+        json!({"algorithm": "sha256", "digest": hex_lower(digest.finalize()), "bytes_hashed": total}),
     )
 }
 

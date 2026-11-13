@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use remote_ops_protocol::CommandSpec;
 use remote_ops_protocol::{
     DeployActivateRequest, DeployPreflightRequest, MAX_SYNC_DEPTH, MAX_SYNC_FILES, MAX_UNIX_MODE,
-    SyncEntry, SyncFinishRequest, SyncPrepareRequest,
+    SyncEntry, SyncFinishRequest, SyncPrepareRequest, hex_lower,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -868,7 +868,7 @@ fn join_entry(root: &Path, relative: &str) -> PathBuf {
 fn manifest_sha256(root_mode: Option<u32>, entries: &[SyncEntry]) -> AgentResult<String> {
     let encoded = serde_json::to_vec(&(root_mode, entries))
         .map_err(|error| AgentError::command(format!("serialize manifest: {error}")))?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    Ok(hex_lower(Sha256::digest(encoded)))
 }
 
 fn apply_directory_modes(
@@ -1275,7 +1275,7 @@ mod tests {
             path: path.to_string(),
             kind: "file".to_string(),
             size: contents.len() as u64,
-            sha256: Some(format!("{:x}", Sha256::digest(contents))),
+            sha256: Some(hex_lower(Sha256::digest(contents))),
             mode: Some(0o644),
         }
     }

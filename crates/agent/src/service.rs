@@ -11,7 +11,7 @@ use remote_ops_protocol::{
     BUILTIN_PSK, DEFAULT_CHUNK_BYTES, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_CONTROL_BYTES,
     DEFAULT_TRANSFER_IDLE_TIMEOUT, DownloadRequest, FrameType, INTERNAL_PING_OPERATION,
     ProtocolError, RemoteError, RemoteRequest, RemoteResponse, Session, SessionOptions,
-    TransferEnd, TransferMetadata, UploadRequest,
+    TransferEnd, TransferMetadata, UploadRequest, hex_lower,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -767,7 +767,7 @@ fn receive_upload(
             FrameType::End => {
                 let end: TransferEnd = serde_json::from_slice(&frame.payload)
                     .map_err(|error| AgentError::invalid(error.to_string()))?;
-                let actual = format!("{:x}", digest.finalize());
+                let actual = hex_lower(digest.finalize());
                 if total != args.size
                     || end.size != total
                     || !end.sha256.eq_ignore_ascii_case(&actual)
@@ -893,7 +893,7 @@ fn send_download(
     }
     let end = TransferEnd {
         size: total,
-        sha256: format!("{:x}", digest.finalize()),
+        sha256: hex_lower(digest.finalize()),
     };
     session
         .send_json(FrameType::End, request_id, &end)
@@ -956,7 +956,7 @@ fn hash_prefix(file: &mut File, length: u64) -> Result<(Sha256, String), AgentEr
         digest.update(&buffer[..read]);
         remaining -= read as u64;
     }
-    let prefix = format!("{:x}", digest.clone().finalize());
+    let prefix = hex_lower(digest.clone().finalize());
     Ok((digest, prefix))
 }
 

@@ -10,6 +10,7 @@ use remote_ops_protocol::{
     DEFAULT_HEALTH_CHECK_TIMEOUT, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_TRANSFER_IDLE_TIMEOUT,
     DownloadRequest, FrameType, INTERNAL_PING_OPERATION, RemoteError, RemoteRequest,
     RemoteResponse, Session, SessionOptions, TransferEnd, TransferMetadata, UploadRequest,
+    hex_lower,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -568,7 +569,7 @@ impl RemoteClient {
                 digest.update(&buffer[..read]);
                 total += read as u64;
             }
-            let actual_sha256 = format!("{:x}", digest.finalize());
+            let actual_sha256 = hex_lower(digest.finalize());
             if !actual_sha256.eq_ignore_ascii_case(&sha256) {
                 return Err(ClientError::local(
                     "invalid_params",
@@ -742,7 +743,7 @@ impl RemoteClient {
                     FrameType::End => {
                         let end: TransferEnd = serde_json::from_slice(&frame.payload)
                             .map_err(|error| ClientError::local("protocol", error.to_string()))?;
-                        let sha256 = format!("{:x}", digest.finalize());
+                        let sha256 = hex_lower(digest.finalize());
                         if total != metadata.size || end.size != total || end.sha256 != sha256 {
                             return Err(ClientError::local(
                                 "protocol",
@@ -1309,7 +1310,7 @@ impl Drop for DownloadPartialCleanup {
 
 fn hash_file(file: &mut File, display: &str, expected_size: u64) -> Result<String, ClientError> {
     let (digest, _) = hash_local_prefix(file, expected_size, display)?;
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_lower(digest.finalize()))
 }
 
 fn hash_local_prefix(
@@ -1336,7 +1337,7 @@ fn hash_local_prefix(
         digest.update(&buffer[..read]);
         remaining -= read as u64;
     }
-    let sha256 = format!("{:x}", digest.clone().finalize());
+    let sha256 = hex_lower(digest.clone().finalize());
     Ok((digest, sha256))
 }
 

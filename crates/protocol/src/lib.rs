@@ -14,6 +14,18 @@ pub mod encoding;
 pub mod execution;
 pub use execution::{ShellArgs, ShellKind};
 
+/// Lowercase hexadecimal encoding for digest output and similar byte strings.
+pub fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 pub const PROTOCOL_VERSION: u8 = 4;
 pub const BUILTIN_PSK: &[u8] = b"JARK006_PSK";
 pub const DEFAULT_MAX_CONTROL_BYTES: usize = 2 * 1024 * 1024;

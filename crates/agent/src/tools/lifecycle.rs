@@ -14,7 +14,7 @@ use remote_ops_protocol::{
     DEFAULT_CHUNK_BYTES, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_PROCESS_JOB_TIMEOUT_MS,
     DEFAULT_PROCESS_OUTPUT_BYTES, DEFAULT_PROCESS_WAIT_MS, MAX_PROCESS_JOB_TIMEOUT_MS,
     MAX_PROCESS_JOBS, MAX_PROCESS_OUTPUT_BYTES, MAX_PROCESS_WAIT_MS, MAX_REBOOT_DELAY_MS,
-    MIN_REBOOT_DELAY_MS, PROCESS_OUTPUT_BUFFER_BYTES, PROTOCOL_VERSION,
+    MIN_REBOOT_DELAY_MS, PROCESS_OUTPUT_BUFFER_BYTES, PROTOCOL_VERSION, hex_lower,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -888,7 +888,7 @@ fn sha256_file(path: &Path, max_bytes: u64) -> AgentResult<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_lower(digest.finalize()))
 }
 
 fn validate_sha256(value: &str) -> AgentResult<()> {

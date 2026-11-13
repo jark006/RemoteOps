@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use remote_ops_protocol::{
     CommandSpec, DeployActivateRequest, DeployPreflightRequest, MAX_RELEASE_ID_BYTES, SyncEntry,
-    SyncFinishRequest, SyncPrepareRequest,
+    SyncFinishRequest, SyncPrepareRequest, hex_lower,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -321,7 +321,7 @@ fn build_manifest(
     let root_mode = manifest_mode(include_modes, &metadata);
     let encoded = serde_json::to_vec(&(root_mode, &entries))
         .map_err(|error| ClientError::local("invalid_params", error.to_string()))?;
-    let sha256 = format!("{:x}", Sha256::digest(encoded));
+    let sha256 = hex_lower(Sha256::digest(encoded));
     Ok(LocalManifest {
         root,
         entries,
@@ -439,7 +439,7 @@ fn hash_local_file(path: &Path, expected_size: u64) -> Result<String, ClientErro
             format!("local file changed while hashing: {}", path.display()),
         ));
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_lower(digest.finalize()))
 }
 
 fn validate_local_path(path: &str) -> Result<(), ClientError> {

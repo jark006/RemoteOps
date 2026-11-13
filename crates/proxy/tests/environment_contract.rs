@@ -4,7 +4,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 
 use remote_ops_agent::{service::handle_connection, tools::jobs::JobManager};
-use remote_ops_protocol::DEFAULT_MAX_TRANSFER_BYTES;
+use remote_ops_protocol::{DEFAULT_MAX_TRANSFER_BYTES, hex_lower};
 use remote_ops_proxy::mcp::tool_definitions;
 use serde_json::{Value, json};
 
@@ -156,7 +156,7 @@ fn live_unix_agent_round_trip() {
     let patch = format!(
         "*** Begin Patch\n*** Update File: {text_path}\n@@\n-enabled=false\n+enabled=true\n 名称=设备\n*** End Patch"
     );
-    let expected = format!("{:x}", Sha256::digest(before.as_bytes()));
+    let expected = hex_lower(Sha256::digest(before.as_bytes()));
     proxy.call(
         "apply_patch",
         json!({"path":text_path,"patch":patch,"expected_sha256":expected}),

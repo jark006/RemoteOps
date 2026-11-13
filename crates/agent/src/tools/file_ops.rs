@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path};
 
-use remote_ops_protocol::{MAX_FILE_OPERATION_ENTRIES, MAX_UNIX_MODE};
+use remote_ops_protocol::{MAX_FILE_OPERATION_ENTRIES, MAX_UNIX_MODE, hex_lower};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
@@ -425,7 +425,7 @@ fn hash_file(path: &Path) -> AgentResult<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_lower(digest.finalize()))
 }
 
 pub(crate) fn verify_regular_file(

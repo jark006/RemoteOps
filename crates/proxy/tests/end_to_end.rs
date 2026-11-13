@@ -11,7 +11,7 @@ use remote_ops_agent::tools::jobs::JobManager;
 use remote_ops_protocol::{
     BUILTIN_PSK, DEFAULT_MAX_CONTROL_BYTES, DEFAULT_MAX_TRANSFER_BYTES, FrameType,
     INTERNAL_PING_OPERATION, PROTOCOL_VERSION, RemoteRequest, RemoteResponse, Session,
-    SessionOptions,
+    SessionOptions, hex_lower,
 };
 use remote_ops_proxy::client::RemoteClient;
 use remote_ops_proxy::deployment::{self, SyncOptions};
@@ -227,7 +227,7 @@ fn resumable_transfers_verify_existing_prefixes() {
     let downloaded = local.path().join("downloaded.bin");
     let bytes: Vec<u8> = (0..180_000).map(|index| (index % 239) as u8).collect();
     fs::write(&source, &bytes).unwrap();
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let sha256 = hex_lower(Sha256::digest(&bytes));
     let upload_partial = remote.path().join(format!(
         ".remoteops-upload-remote.bin-{}.part",
         &sha256[..16]
